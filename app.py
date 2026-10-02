@@ -1,331 +1,309 @@
 from flask import Flask, request, abort
-
 import os
-
 import hmac
-
 import hashlib
-
 import base64
-
 import re
-
 import time
-
 import json
-
+import math
 import urllib.request
-
 import urllib.error
 
 app = Flask(__name__)
 
-# =========================================================
 
+# =========================================================
 # Environment Variables
-
 # =========================================================
 
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_SECRET = os.environ.get(
+    "LINE_CHANNEL_SECRET",
+    ""
+)
 
-BINGX_API_KEY = os.environ.get("BINGX_API_KEY", "")
+BINGX_API_KEY = os.environ.get(
+    "BINGX_API_KEY",
+    ""
+)
 
-BINGX_SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "")
+BINGX_SECRET_KEY = os.environ.get(
+    "BINGX_SECRET_KEY",
+    ""
+)
 
 LIVE_TRADING = (
-
-    os.environ.get("LIVE_TRADING", "false")
-
-    .strip()
-
-    .lower()
-
+    os.environ.get(
+        "LIVE_TRADING",
+        "false"
+    ).strip().lower()
     == "true"
-
 )
 
-ORDER_USDT_RAW = os.environ.get("ORDER_USDT", "5")
+ORDER_USDT = float(
+    os.environ.get(
+        "ORDER_USDT",
+        "5"
+    )
+)
+
+MAX_LIVE_ORDER_USDT = float(
+    os.environ.get(
+        "MAX_LIVE_ORDER_USDT",
+        "5"
+    )
+)
+
+TP1_PCT = float(
+    os.environ.get(
+        "TP1_PCT",
+        "30"
+    )
+)
+
+TP2_PCT = float(
+    os.environ.get(
+        "TP2_PCT",
+        "40"
+    )
+)
+
+TP3_PCT = float(
+    os.environ.get(
+        "TP3_PCT",
+        "30"
+    )
+)
 
 BINGX_POSITION_MODE = (
-
-    os.environ.get("BINGX_POSITION_MODE", "HEDGE")
-
+    os.environ.get(
+        "BINGX_POSITION_MODE",
+        "HEDGE"
+    )
     .strip()
-
     .upper()
-
 )
 
-BINGX_BASE_URLS = [
+BINGX_BASE_URL = (
+    "https://open-api.bingx.com"
+)
 
-    "https://open-api.bingx.com",
-
-    "https://open-api.bingx.pro",
-
-]
 
 # =========================================================
-
-# Parse LINE Trading Signal
-
+# Signal Parser
 # =========================================================
 
 def parse_signal(text):
 
     result = {
-
         "symbol": None,
-
         "side": None,
-
         "entry": None,
-
         "tp1": None,
-
         "tp2": None,
-
         "tp3": None,
-
         "sl": None,
-
     }
 
     symbol = re.search(
-
         r"幣種\s*[:：]\s*([A-Za-z0-9]+)",
-
         text
-
     )
 
     side = re.search(
-
         r"方向\s*[:：]\s*(多|空|LONG|SHORT|Long|Short)",
-
         text
-
     )
 
     entry = re.search(
-
         r"進場(?:價位)?\s*[:：]\s*([0-9.]+)",
-
         text
-
     )
 
     tp1 = re.search(
-
         r"TP1\s*[:：]\s*([0-9.]+)",
-
         text,
-
         re.I
-
     )
 
     tp2 = re.search(
-
         r"TP2\s*[:：]\s*([0-9.]+)",
-
         text,
-
         re.I
-
     )
 
     tp3 = re.search(
-
         r"TP3\s*[:：]\s*([0-9.]+)",
-
         text,
-
         re.I
-
     )
 
     sl = re.search(
-
         r"(?:SL|止損)\s*[:：]\s*([0-9.]+)",
-
         text,
-
         re.I
-
     )
 
     if symbol:
-
-        result["symbol"] = symbol.group(1).upper()
+        result["symbol"] = (
+            symbol.group(1).upper()
+        )
 
     if side:
-
         s = side.group(1).upper()
 
-        if s in ["多", "LONG"]:
-
-            result["side"] = "LONG"
-
-        else:
-
-            result["side"] = "SHORT"
+        result["side"] = (
+            "LONG"
+            if s in ["多", "LONG"]
+            else "SHORT"
+        )
 
     if entry:
-
-        result["entry"] = entry.group(1)
+        result["entry"] = (
+            entry.group(1)
+        )
 
     if tp1:
-
-        result["tp1"] = tp1.group(1)
+        result["tp1"] = (
+            tp1.group(1)
+        )
 
     if tp2:
-
-        result["tp2"] = tp2.group(1)
+        result["tp2"] = (
+            tp2.group(1)
+        )
 
     if tp3:
-
-        result["tp3"] = tp3.group(1)
+        result["tp3"] = (
+            tp3.group(1)
+        )
 
     if sl:
-
-        result["sl"] = sl.group(1)
+        result["sl"] = (
+            sl.group(1)
+        )
 
     return result
 
+
 # =========================================================
-
-# Validate Signal
-
+# Validation
 # =========================================================
 
 def validate_signal(signal):
 
     required = [
-
         "symbol",
-
         "side",
-
         "entry",
-
+        "tp1",
+        "tp2",
+        "tp3",
         "sl",
-
     ]
 
-    for field in required:
+    for key in required:
 
-        if not signal.get(field):
+        if not signal.get(key):
 
-            return False, f"Missing field: {field}"
-
-    try:
-
-        entry = float(signal["entry"])
-
-        sl = float(signal["sl"])
-
-        if entry <= 0:
-
-            return False, "Entry must be > 0"
-
-        if sl <= 0:
-
-            return False, "SL must be > 0"
-
-        for name in ["tp1", "tp2", "tp3"]:
-
-            if signal.get(name):
-
-                if float(signal[name]) <= 0:
-
-                    return False, f"{name} must be > 0"
-
-    except ValueError:
-
-        return False, "Invalid numeric value"
-
-    return True, None
-
-# =========================================================
-
-# Order Amount
-
-# =========================================================
-
-def get_order_usdt():
+            return (
+                False,
+                f"Missing field: {key}"
+            )
 
     try:
 
-        value = float(ORDER_USDT_RAW)
+        entry = float(
+            signal["entry"]
+        )
+
+        sl = float(
+            signal["sl"]
+        )
+
+        tp1 = float(
+            signal["tp1"]
+        )
+
+        tp2 = float(
+            signal["tp2"]
+        )
+
+        tp3 = float(
+            signal["tp3"]
+        )
 
     except ValueError:
 
-        raise RuntimeError(
-
-            "ORDER_USDT must be a number"
-
+        return (
+            False,
+            "Invalid number"
         )
 
-    if value <= 0:
+    if min(
+        entry,
+        sl,
+        tp1,
+        tp2,
+        tp3
+    ) <= 0:
 
-        raise RuntimeError(
-
-            "ORDER_USDT must be > 0"
-
+        return (
+            False,
+            "Prices must be > 0"
         )
 
-    return value
+    if (
+        TP1_PCT
+        + TP2_PCT
+        + TP3_PCT
+    ) != 100:
+
+        return (
+            False,
+            "TP percentages must total 100"
+        )
+
+    return (
+        True,
+        None
+    )
+
 
 # =========================================================
-
-# BingX Canonical Signing String
-
+# BingX Signing
 # =========================================================
 
 def build_canonical(params):
 
     items = sorted(
-
         params.items(),
-
         key=lambda x: x[0]
-
     )
 
     return "&".join(
-
-        f"{key}={value}"
-
-        for key, value in items
-
+        f"{k}={v}"
+        for k, v in items
     )
 
-# =========================================================
 
-# BingX Private Request
-
-# =========================================================
-
-def bingx_private_request(method, path, params=None):
+def bingx_private_request(
+    method,
+    path,
+    params=None
+):
 
     if not BINGX_API_KEY:
-
         raise RuntimeError(
-
             "BINGX_API_KEY not set"
-
         )
 
     if not BINGX_SECRET_KEY:
-
         raise RuntimeError(
-
             "BINGX_SECRET_KEY not set"
-
         )
 
     if params is None:
-
         params = {}
 
     params = dict(params)
@@ -333,785 +311,797 @@ def bingx_private_request(method, path, params=None):
     params["recvWindow"] = 5000
 
     params["timestamp"] = int(
-
         time.time() * 1000
-
     )
 
     canonical = build_canonical(
-
         params
-
     )
 
     signature = hmac.new(
-
-        BINGX_SECRET_KEY.encode("utf-8"),
-
-        canonical.encode("utf-8"),
-
+        BINGX_SECRET_KEY.encode(
+            "utf-8"
+        ),
+        canonical.encode(
+            "utf-8"
+        ),
         hashlib.sha256
-
     ).hexdigest()
 
-    signed_string = (
-
+    signed = (
         canonical
-
         + "&signature="
-
         + signature
-
     )
 
     headers = {
+        "X-BX-APIKEY":
+        BINGX_API_KEY,
 
-        "X-BX-APIKEY": BINGX_API_KEY,
-
-        "X-SOURCE-KEY": "BX-AI-SKILL",
-
+        "Content-Type":
+        "application/x-www-form-urlencoded"
     }
 
-    last_error = None
+    if method == "GET":
 
-    for base_url in BINGX_BASE_URLS:
+        url = (
+            BINGX_BASE_URL
+            + path
+            + "?"
+            + signed
+        )
 
-        try:
+        data = None
 
-            if method == "GET":
+    else:
 
-                url = (
+        url = (
+            BINGX_BASE_URL
+            + path
+        )
 
-                    base_url
+        data = signed.encode(
+            "utf-8"
+        )
 
-                    + path
+    req = urllib.request.Request(
+        url,
+        headers=headers,
+        data=data,
+        method=method
+    )
 
-                    + "?"
+    try:
 
-                    + signed_string
-
-                )
-
-                req = urllib.request.Request(
-
-                    url,
-
-                    headers=headers,
-
-                    method="GET"
-
-                )
-
-            elif method == "POST":
-
-                url = (
-
-                    base_url
-
-                    + path
-
-                )
-
-                post_headers = dict(headers)
-
-                post_headers[
-
-                    "Content-Type"
-
-                ] = "application/x-www-form-urlencoded"
-
-                req = urllib.request.Request(
-
-                    url,
-
-                    headers=post_headers,
-
-                    data=signed_string.encode(
-
-                        "utf-8"
-
-                    ),
-
-                    method="POST"
-
-                )
-
-            else:
-
-                raise RuntimeError(
-
-                    f"Unsupported method: {method}"
-
-                )
-
-            with urllib.request.urlopen(
-
-                req,
-
-                timeout=15
-
-            ) as response:
-
-                body = (
-
-                    response
-
-                    .read()
-
-                    .decode("utf-8")
-
-                )
-
-                return json.loads(body)
-
-        except urllib.error.HTTPError as e:
+        with urllib.request.urlopen(
+            req,
+            timeout=15
+        ) as response:
 
             body = (
-
-                e.read()
-
-                .decode(
-
-                    "utf-8",
-
-                    errors="replace"
-
-                )
-
+                response
+                .read()
+                .decode("utf-8")
             )
 
-            raise RuntimeError(
+            return json.loads(body)
 
-                f"BingX HTTP {e.code}: {body}"
+    except urllib.error.HTTPError as e:
 
+        body = (
+            e.read()
+            .decode(
+                "utf-8",
+                errors="replace"
             )
+        )
 
-        except Exception as e:
+        raise RuntimeError(
+            f"BingX HTTP {e.code}: {body}"
+        )
 
-            last_error = e
 
-            continue
+# =========================================================
+# Public Contract Info
+# =========================================================
+
+def get_contract_info(symbol):
+
+    params = {
+        "symbol": symbol,
+        "timestamp": int(
+            time.time() * 1000
+        ),
+    }
+
+    canonical = build_canonical(
+        params
+    )
+
+    signature = hmac.new(
+        BINGX_SECRET_KEY.encode(
+            "utf-8"
+        ),
+        canonical.encode(
+            "utf-8"
+        ),
+        hashlib.sha256
+    ).hexdigest()
+
+    url = (
+        BINGX_BASE_URL
+        + "/openApi/swap/v2/quote/contracts?"
+        + canonical
+        + "&signature="
+        + signature
+    )
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "X-BX-APIKEY":
+            BINGX_API_KEY
+        },
+        method="GET"
+    )
+
+    with urllib.request.urlopen(
+        req,
+        timeout=15
+    ) as response:
+
+        data = json.loads(
+            response
+            .read()
+            .decode("utf-8")
+        )
+
+    if data.get("code") != 0:
+
+        raise RuntimeError(
+            str(data)
+        )
+
+    contracts = data.get(
+        "data",
+        []
+    )
+
+    for item in contracts:
+
+        if (
+            item.get("symbol")
+            == symbol
+        ):
+
+            return item
 
     raise RuntimeError(
-
-        f"BingX request failed: {last_error}"
-
+        f"Contract not found: {symbol}"
     )
 
-# =========================================================
-
-# BingX Balance Test
 
 # =========================================================
-
-def bingx_get_balance():
-
-    return bingx_private_request(
-
-        "GET",
-
-        "/openApi/swap/v2/user/balance",
-
-        {}
-
-    )
-
+# Quantity Precision
 # =========================================================
 
-# Unique Client Order ID
-
-# =========================================================
-
-def make_client_order_id(
-
-    event_id,
-
-    signal
-
+def floor_quantity(
+    quantity,
+    precision
 ):
 
-    source = (
+    factor = 10 ** precision
 
+    return (
+        math.floor(
+            quantity * factor
+        )
+        / factor
+    )
+
+
+# =========================================================
+# Order IDs
+# =========================================================
+
+def client_id(
+    event_id,
+    suffix
+):
+
+    raw = (
         str(event_id)
-
-        + "|"
-
-        + str(signal["symbol"])
-
-        + "|"
-
-        + str(signal["side"])
-
-        + "|"
-
-        + str(signal["entry"])
-
+        + str(suffix)
     )
 
     digest = hashlib.sha256(
-
-        source.encode("utf-8")
-
+        raw.encode("utf-8")
     ).hexdigest()
 
     return (
-
         "line"
-
-        + digest[:28]
-
+        + digest[:25]
+        + suffix
     )
 
-# =========================================================
-
-# Build BingX Order Parameters
 
 # =========================================================
+# Main Entry Order
+# =========================================================
 
-def build_order_params(
-
+def place_entry(
     signal,
-
     event_id
-
 ):
 
-    order_usdt = get_order_usdt()
-
     symbol = (
-
-        f"{signal['symbol']}-USDT"
-
+        signal["symbol"]
+        + "-USDT"
     )
 
-    if signal["side"] == "LONG":
+    side = (
+        "BUY"
+        if signal["side"] == "LONG"
+        else "SELL"
+    )
 
-        side = "BUY"
-
-    else:
-
-        side = "SELL"
-
-    if BINGX_POSITION_MODE == "ONEWAY":
-
-        position_side = "BOTH"
-
-    else:
-
-        position_side = signal["side"]
+    position_side = (
+        signal["side"]
+        if BINGX_POSITION_MODE
+        == "HEDGE"
+        else "BOTH"
+    )
 
     params = {
-
         "symbol": symbol,
-
         "side": side,
-
-        "positionSide": position_side,
+        "positionSide":
+        position_side,
 
         "type": "MARKET",
 
-        "quoteOrderQty": order_usdt,
+        "quoteOrderQty":
+        ORDER_USDT,
 
-        "clientOrderId": (
-
-            make_client_order_id(
-
-                event_id,
-
-                signal
-
-            )
-
+        "clientOrderId":
+        client_id(
+            event_id,
+            "entry"
         ),
-
     }
 
-    # Stop Loss
+    if LIVE_TRADING:
 
-    if signal.get("sl"):
+        if (
+            ORDER_USDT
+            > MAX_LIVE_ORDER_USDT
+        ):
 
-        stop_loss = {
+            raise RuntimeError(
+                "LIVE ORDER BLOCKED: "
+                f"{ORDER_USDT} USDT exceeds "
+                f"MAX_LIVE_ORDER_USDT="
+                f"{MAX_LIVE_ORDER_USDT}"
+            )
 
-            "type": "STOP_MARKET",
-
-            "stopPrice": float(
-
-                signal["sl"]
-
-            ),
-
-            "workingType": "MARK_PRICE",
-
-            "stopGuaranteed": False,
-
-        }
-
-        params["stopLoss"] = json.dumps(
-
-            stop_loss,
-
-            separators=(",", ":")
-
+        path = (
+            "/openApi/swap/v2/trade/order"
         )
 
-    # TP1 only for now
+    else:
 
-    if signal.get("tp1"):
-
-        take_profit = {
-
-            "type": "TAKE_PROFIT_MARKET",
-
-            "stopPrice": float(
-
-                signal["tp1"]
-
-            ),
-
-            "workingType": "MARK_PRICE",
-
-            "stopGuaranteed": False,
-
-        }
-
-        params["takeProfit"] = json.dumps(
-
-            take_profit,
-
-            separators=(",", ":")
-
+        path = (
+            "/openApi/swap/v2/trade/order/test"
         )
+
+    print(
+        "ENTRY ORDER:",
+        params,
+        flush=True
+    )
+
+    return (
+        bingx_private_request(
+            "POST",
+            path,
+            params
+        )
+    )
+
+
+# =========================================================
+# Exit Order Builder
+# =========================================================
+
+def build_exit_order(
+    symbol,
+    position_side,
+    quantity,
+    stop_price,
+    order_type,
+    event_id,
+    suffix
+):
+
+    close_side = (
+        "SELL"
+        if position_side == "LONG"
+        else "BUY"
+    )
+
+    params = {
+        "symbol": symbol,
+
+        "side": close_side,
+
+        "positionSide":
+        (
+            position_side
+            if BINGX_POSITION_MODE
+            == "HEDGE"
+            else "BOTH"
+        ),
+
+        "type": order_type,
+
+        "quantity": quantity,
+
+        "stopPrice":
+        stop_price,
+
+        "workingType":
+        "MARK_PRICE",
+
+        "clientOrderId":
+        client_id(
+            event_id,
+            suffix
+        ),
+    }
+
+    if (
+        BINGX_POSITION_MODE
+        == "ONEWAY"
+    ):
+
+        params[
+            "reduceOnly"
+        ] = "true"
 
     return params
 
-# =========================================================
-
-# Submit Test / Live Order
 
 # =========================================================
+# Split TP + SL
+# =========================================================
 
-def submit_order(
-
+def place_tp_sl(
     signal,
-
-    event_id
-
+    event_id,
+    filled_qty
 ):
 
-    params = build_order_params(
+    symbol = (
+        signal["symbol"]
+        + "-USDT"
+    )
 
-        signal,
+    contract = (
+        get_contract_info(
+            symbol
+        )
+    )
 
-        event_id
+    precision = int(
+        contract.get(
+            "quantityPrecision",
+            0
+        )
+    )
 
+    min_qty = float(
+        contract.get(
+            "tradeMinQuantity",
+            0
+        )
+    )
+
+    q1 = floor_quantity(
+        filled_qty
+        * TP1_PCT
+        / 100,
+        precision
+    )
+
+    q2 = floor_quantity(
+        filled_qty
+        * TP2_PCT
+        / 100,
+        precision
+    )
+
+    # Remainder goes to TP3
+    q3 = floor_quantity(
+        filled_qty
+        - q1
+        - q2,
+        precision
+    )
+
+    for name, qty in [
+        ("TP1", q1),
+        ("TP2", q2),
+        ("TP3", q3),
+    ]:
+
+        if qty <= 0:
+
+            raise RuntimeError(
+                f"{name} quantity "
+                f"became zero"
+            )
+
+        if (
+            min_qty > 0
+            and qty < min_qty
+        ):
+
+            raise RuntimeError(
+                f"{name} quantity "
+                f"{qty} below minimum "
+                f"{min_qty}"
+            )
+
+    tp_orders = [
+        (
+            q1,
+            float(
+                signal["tp1"]
+            ),
+            "tp1"
+        ),
+
+        (
+            q2,
+            float(
+                signal["tp2"]
+            ),
+            "tp2"
+        ),
+
+        (
+            q3,
+            float(
+                signal["tp3"]
+            ),
+            "tp3"
+        ),
+    ]
+
+    results = []
+
+    for (
+        qty,
+        price,
+        suffix
+    ) in tp_orders:
+
+        params = (
+            build_exit_order(
+                symbol,
+                signal["side"],
+                qty,
+                price,
+                "TAKE_PROFIT_MARKET",
+                event_id,
+                suffix
+            )
+        )
+
+        print(
+            f"{suffix.upper()} ORDER:",
+            params,
+            flush=True
+        )
+
+        result = (
+            bingx_private_request(
+                "POST",
+                "/openApi/swap/v2/trade/order",
+                params
+            )
+        )
+
+        results.append(
+            result
+        )
+
+    # Full-position SL
+    sl_params = (
+        build_exit_order(
+            symbol,
+            signal["side"],
+            filled_qty,
+            float(
+                signal["sl"]
+            ),
+            "STOP_MARKET",
+            event_id,
+            "sl"
+        )
     )
 
     print(
-
-        "ORDER PARAMETERS:",
-
-        json.dumps(
-
-            params,
-
-            ensure_ascii=False
-
-        ),
-
+        "SL ORDER:",
+        sl_params,
         flush=True
-
     )
 
-    if LIVE_TRADING:
-
-        print(
-
-            "!!! LIVE TRADING ENABLED !!!",
-
-            flush=True
-
+    sl_result = (
+        bingx_private_request(
+            "POST",
+            "/openApi/swap/v2/trade/order",
+            sl_params
         )
-
-        path = (
-
-            "/openApi/swap/v2/trade/order"
-
-        )
-
-    else:
-
-        print(
-
-            "TEST ORDER ONLY - NO REAL TRADE",
-
-            flush=True
-
-        )
-
-        path = (
-
-            "/openApi/swap/v2/trade/order/test"
-
-        )
-
-    result = bingx_private_request(
-
-        "POST",
-
-        path,
-
-        params
-
     )
 
-    return result
+    return {
+        "tp_results":
+        results,
+
+        "sl_result":
+        sl_result
+    }
+
 
 # =========================================================
-
 # Home
-
-# =========================================================
-
-@app.route("/", methods=["GET"])
-
-def home():
-
-    if LIVE_TRADING:
-
-        mode = "LIVE"
-
-    else:
-
-        mode = "TEST"
-
-    return (
-
-        f"LINE BingX Bot running - {mode} mode",
-
-        200
-
-    )
-
-# =========================================================
-
-# LINE Webhook
-
 # =========================================================
 
 @app.route(
-
-    "/webhook",
-
-    methods=["POST"]
-
+    "/",
+    methods=["GET"]
 )
+def home():
 
+    mode = (
+        "LIVE"
+        if LIVE_TRADING
+        else "TEST"
+    )
+
+    return (
+        f"LINE BingX Bot "
+        f"{mode} mode",
+        200
+    )
+
+
+# =========================================================
+# LINE Webhook
+# =========================================================
+
+@app.route(
+    "/webhook",
+    methods=["POST"]
+)
 def webhook():
 
     body = request.get_data(
-
         as_text=True
-
     )
 
-    signature = request.headers.get(
-
-        "X-Line-Signature",
-
-        ""
-
+    signature = (
+        request.headers.get(
+            "X-Line-Signature",
+            ""
+        )
     )
 
     if not LINE_CHANNEL_SECRET:
 
         return (
-
             "LINE_CHANNEL_SECRET not set",
-
             500
-
         )
 
-    # Verify LINE signature
-
     digest = hmac.new(
-
-        LINE_CHANNEL_SECRET.encode(
-
-            "utf-8"
-
-        ),
+        LINE_CHANNEL_SECRET
+        .encode("utf-8"),
 
         body.encode("utf-8"),
 
         hashlib.sha256
-
     ).digest()
 
     expected_signature = (
-
         base64
-
         .b64encode(digest)
-
         .decode("utf-8")
-
     )
 
     if not hmac.compare_digest(
-
         signature,
-
         expected_signature
-
     ):
 
         abort(400)
 
     data = request.get_json(
-
         silent=True
-
     ) or {}
 
     for event in data.get(
-
         "events",
-
         []
-
     ):
 
         if (
-
             event.get("type")
-
             != "message"
-
         ):
 
             continue
 
         message = event.get(
-
             "message",
-
             {}
-
         )
 
         if (
-
             message.get("type")
-
             != "text"
-
         ):
 
             continue
 
         text = message.get(
-
             "text",
-
             ""
-
         )
 
         event_id = event.get(
-
             "webhookEventId",
-
-            str(time.time_ns())
-
+            str(
+                time.time_ns()
+            )
         )
 
         print(
-
             "LINE MESSAGE:",
-
             text,
-
             flush=True
-
         )
-
-        # =================================================
-
-        # BingX connection test
-
-        # =================================================
-
-        if (
-
-            text.strip().upper()
-
-            == "BINGX TEST"
-
-        ):
-
-            try:
-
-                result = (
-
-                    bingx_get_balance()
-
-                )
-
-                print(
-
-                    "BINGX TEST RESULT:",
-
-                    json.dumps(
-
-                        result,
-
-                        ensure_ascii=False
-
-                    ),
-
-                    flush=True
-
-                )
-
-            except Exception as e:
-
-                print(
-
-                    "BINGX TEST ERROR:",
-
-                    str(e),
-
-                    flush=True
-
-                )
-
-            continue
-
-        # =================================================
-
-        # Parse Trading Signal
-
-        # =================================================
 
         signal = parse_signal(
-
             text
-
         )
 
         print(
-
             "PARSED SIGNAL:",
-
             signal,
-
             flush=True
-
         )
 
-        if not signal["symbol"]:
+        if not signal[
+            "symbol"
+        ]:
 
             print(
-
-                "NOT A TRADING SIGNAL",
-
+                "NOT A SIGNAL",
                 flush=True
-
             )
 
             continue
 
         valid, error = (
-
             validate_signal(
-
                 signal
-
             )
-
         )
 
         if not valid:
 
             print(
-
                 "SIGNAL REJECTED:",
-
                 error,
-
                 flush=True
-
             )
 
             continue
 
-        # =================================================
-
-        # BingX Test / Live Order
-
-        # =================================================
-
         try:
 
-            result = submit_order(
-
-                signal,
-
-                event_id
-
+            entry_result = (
+                place_entry(
+                    signal,
+                    event_id
+                )
             )
 
             print(
-
-                "BINGX ORDER RESULT:",
-
+                "ENTRY RESULT:",
                 json.dumps(
-
-                    result,
-
+                    entry_result,
                     ensure_ascii=False
-
                 ),
-
                 flush=True
-
             )
 
-            if signal.get("tp2"):
+            # TEST MODE stops here
+            if not LIVE_TRADING:
 
                 print(
-
-                    "TP2 SAVED ONLY:",
-
-                    signal["tp2"],
-
+                    "TEST MODE: "
+                    "NO REAL TP/SL ORDERS SENT",
                     flush=True
-
                 )
 
-            if signal.get("tp3"):
+                continue
 
-                print(
-
-                    "TP3 SAVED ONLY:",
-
-                    signal["tp3"],
-
-                    flush=True
-
+            if (
+                entry_result.get(
+                    "code"
                 )
+                != 0
+            ):
+
+                raise RuntimeError(
+                    "Entry order failed"
+                )
+
+            order_data = (
+                entry_result
+                .get(
+                    "data",
+                    {}
+                )
+                .get(
+                    "order",
+                    {}
+                )
+            )
+
+            filled_qty = float(
+                order_data.get(
+                    "executedQty",
+                    0
+                )
+            )
+
+            if filled_qty <= 0:
+
+                raise RuntimeError(
+                    "Entry filled quantity "
+                    "not available"
+                )
+
+            exit_results = (
+                place_tp_sl(
+                    signal,
+                    event_id,
+                    filled_qty
+                )
+            )
+
+            print(
+                "EXIT ORDERS RESULT:",
+                json.dumps(
+                    exit_results,
+                    ensure_ascii=False
+                ),
+                flush=True
+            )
 
         except Exception as e:
 
             print(
-
-                "BINGX ORDER ERROR:",
-
+                "TRADING ERROR:",
                 str(e),
-
                 flush=True
-
             )
 
-    return "OK", 200
+    return (
+        "OK",
+        200
+    )
