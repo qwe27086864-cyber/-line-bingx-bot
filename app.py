@@ -7,6 +7,7 @@ import re
 import time
 import json
 import math
+import threading
 import urllib.request
 import urllib.error
 
@@ -15,48 +16,98 @@ app = Flask(__name__)
 
 
 # =========================================================
-# ENV
+# ENVIRONMENT VARIABLES
 # =========================================================
 
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_SECRET = os.environ.get(
+    "LINE_CHANNEL_SECRET",
+    ""
+)
 
-BINGX_API_KEY = os.environ.get("BINGX_API_KEY", "")
-BINGX_SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "")
+BINGX_API_KEY = os.environ.get(
+    "BINGX_API_KEY",
+    ""
+)
+
+BINGX_SECRET_KEY = os.environ.get(
+    "BINGX_SECRET_KEY",
+    ""
+)
 
 LIVE_TRADING = (
-    os.environ.get("LIVE_TRADING", "false")
-    .strip()
-    .lower()
+    os.environ.get(
+        "LIVE_TRADING",
+        "false"
+    ).strip().lower()
     == "true"
 )
 
 ORDER_USDT = float(
-    os.environ.get("ORDER_USDT", "5")
+    os.environ.get(
+        "ORDER_USDT",
+        "10"
+    )
 )
 
 MAX_LIVE_ORDER_USDT = float(
-    os.environ.get("MAX_LIVE_ORDER_USDT", "5")
+    os.environ.get(
+        "MAX_LIVE_ORDER_USDT",
+        "10"
+    )
 )
 
 TP1_PCT = float(
-    os.environ.get("TP1_PCT", "30")
+    os.environ.get(
+        "TP1_PCT",
+        "30"
+    )
 )
 
 TP2_PCT = float(
-    os.environ.get("TP2_PCT", "40")
+    os.environ.get(
+        "TP2_PCT",
+        "40"
+    )
 )
 
 TP3_PCT = float(
-    os.environ.get("TP3_PCT", "30")
+    os.environ.get(
+        "TP3_PCT",
+        "30"
+    )
+)
+
+LEVERAGE = int(
+    os.environ.get(
+        "LEVERAGE",
+        "8"
+    )
 )
 
 BINGX_POSITION_MODE = (
-    os.environ.get("BINGX_POSITION_MODE", "HEDGE")
-    .strip()
-    .upper()
+    os.environ.get(
+        "BINGX_POSITION_MODE",
+        "HEDGE"
+    ).strip().upper()
 )
 
-BINGX_BASE_URL = "https://open-api.bingx.com"
+ENTRY_TIMEOUT_SEC = int(
+    os.environ.get(
+        "ENTRY_TIMEOUT_SEC",
+        "600"
+    )
+)
+
+ORDER_POLL_SEC = float(
+    os.environ.get(
+        "ORDER_POLL_SEC",
+        "2"
+    )
+)
+
+BINGX_BASE_URL = (
+    "https://open-api.bingx.com"
+)
 
 
 # =========================================================
@@ -64,6 +115,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 # =========================================================
 
 def parse_signal(text):
+
     result = {
         "symbol": None,
         "side": None,
@@ -114,36 +166,54 @@ def parse_signal(text):
     )
 
     if symbol:
-        result["symbol"] = symbol.group(1).upper()
+        result["symbol"] = (
+            symbol.group(1).upper()
+        )
 
     if side:
         s = side.group(1).upper()
-        result["side"] = "LONG" if s in ["多", "LONG"] else "SHORT"
+
+        result["side"] = (
+            "LONG"
+            if s in ["多", "LONG"]
+            else "SHORT"
+        )
 
     if entry:
-        result["entry"] = entry.group(1)
+        result["entry"] = (
+            entry.group(1)
+        )
 
     if tp1:
-        result["tp1"] = tp1.group(1)
+        result["tp1"] = (
+            tp1.group(1)
+        )
 
     if tp2:
-        result["tp2"] = tp2.group(1)
+        result["tp2"] = (
+            tp2.group(1)
+        )
 
     if tp3:
-        result["tp3"] = tp3.group(1)
+        result["tp3"] = (
+            tp3.group(1)
+        )
 
     if sl:
-        result["sl"] = sl.group(1)
+        result["sl"] = (
+            sl.group(1)
+        )
 
     return result
 
 
 # =========================================================
-# VALIDATION
+# SIGNAL VALIDATION
 # =========================================================
 
 def validate_signal(signal):
-    for key in [
+
+    required = [
         "symbol",
         "side",
         "entry",
@@ -151,41 +221,90 @@ def validate_signal(signal):
         "tp2",
         "tp3",
         "sl",
-    ]:
+    ]
+
+    for key in required:
+
         if not signal.get(key):
-            return False, f"Missing field: {key}"
+
+            return (
+                False,
+                f"Missing field: {key}"
+            )
 
     try:
-        values = [
-            float(signal["entry"]),
-            float(signal["tp1"]),
-            float(signal["tp2"]),
-            float(signal["tp3"]),
-            float(signal["sl"]),
-        ]
+
+        entry = float(
+            signal["entry"]
+        )
+
+        tp1 = float(
+            signal["tp1"]
+        )
+
+        tp2 = float(
+            signal["tp2"]
+        )
+
+        tp3 = float(
+            signal["tp3"]
+        )
+
+        sl = float(
+            signal["sl"]
+        )
 
     except ValueError:
-        return False, "Invalid price"
 
-    if min(values) <= 0:
-        return False, "Prices must be > 0"
+        return (
+            False,
+            "Invalid price"
+        )
+
+    if min(
+        entry,
+        tp1,
+        tp2,
+        tp3,
+        sl
+    ) <= 0:
+
+        return (
+            False,
+            "Prices must be > 0"
+        )
 
     if abs(
-        (TP1_PCT + TP2_PCT + TP3_PCT) - 100
+        (
+            TP1_PCT
+            + TP2_PCT
+            + TP3_PCT
+        )
+        - 100
     ) > 0.0001:
-        return False, "TP percentages must total 100"
 
-    return True, None
+        return (
+            False,
+            "TP percentages must total 100"
+        )
+
+    return (
+        True,
+        None
+    )
 
 
 # =========================================================
-# SIGNING
+# BINGX SIGNING
 # =========================================================
 
 def build_canonical(params):
+
     return "&".join(
         f"{k}={v}"
-        for k, v in sorted(params.items())
+        for k, v in sorted(
+            params.items()
+        )
     )
 
 
@@ -194,39 +313,79 @@ def bingx_private_request(
     path,
     params=None
 ):
+
     if not BINGX_API_KEY:
-        raise RuntimeError("BINGX_API_KEY not set")
+
+        raise RuntimeError(
+            "BINGX_API_KEY not set"
+        )
 
     if not BINGX_SECRET_KEY:
-        raise RuntimeError("BINGX_SECRET_KEY not set")
 
-    params = dict(params or {})
+        raise RuntimeError(
+            "BINGX_SECRET_KEY not set"
+        )
+
+    params = dict(
+        params or {}
+    )
 
     params["recvWindow"] = 5000
-    params["timestamp"] = int(time.time() * 1000)
 
-    canonical = build_canonical(params)
+    params["timestamp"] = int(
+        time.time()
+        * 1000
+    )
+
+    canonical = build_canonical(
+        params
+    )
 
     signature = hmac.new(
-        BINGX_SECRET_KEY.encode("utf-8"),
-        canonical.encode("utf-8"),
+        BINGX_SECRET_KEY.encode(
+            "utf-8"
+        ),
+        canonical.encode(
+            "utf-8"
+        ),
         hashlib.sha256
     ).hexdigest()
 
-    signed = canonical + "&signature=" + signature
+    signed = (
+        canonical
+        + "&signature="
+        + signature
+    )
 
     headers = {
-        "X-BX-APIKEY": BINGX_API_KEY,
-        "Content-Type": "application/x-www-form-urlencoded"
+        "X-BX-APIKEY":
+            BINGX_API_KEY,
+
+        "Content-Type":
+            "application/x-www-form-urlencoded"
     }
 
     if method == "GET":
-        url = BINGX_BASE_URL + path + "?" + signed
+
+        url = (
+            BINGX_BASE_URL
+            + path
+            + "?"
+            + signed
+        )
+
         data = None
 
     else:
-        url = BINGX_BASE_URL + path
-        data = signed.encode("utf-8")
+
+        url = (
+            BINGX_BASE_URL
+            + path
+        )
+
+        data = signed.encode(
+            "utf-8"
+        )
 
     req = urllib.request.Request(
         url,
@@ -236,24 +395,97 @@ def bingx_private_request(
     )
 
     try:
+
         with urllib.request.urlopen(
             req,
             timeout=15
         ) as response:
 
-            body = response.read().decode("utf-8")
+            body = (
+                response
+                .read()
+                .decode("utf-8")
+            )
 
-            return json.loads(body)
+            return json.loads(
+                body
+            )
 
     except urllib.error.HTTPError as e:
-        body = e.read().decode(
-            "utf-8",
-            errors="replace"
+
+        body = (
+            e.read()
+            .decode(
+                "utf-8",
+                errors="replace"
+            )
         )
 
         raise RuntimeError(
-            f"BingX HTTP {e.code}: {body}"
+            f"BingX HTTP "
+            f"{e.code}: "
+            f"{body}"
         )
+
+
+# =========================================================
+# SET LEVERAGE
+# =========================================================
+
+def set_leverage(
+    symbol,
+    position_side
+):
+
+    if BINGX_POSITION_MODE == "HEDGE":
+
+        leverage_side = (
+            position_side
+        )
+
+    else:
+
+        leverage_side = (
+            "BOTH"
+        )
+
+    params = {
+        "symbol": symbol,
+        "side": leverage_side,
+        "leverage": LEVERAGE,
+    }
+
+    print(
+        "SETTING LEVERAGE:",
+        params,
+        flush=True
+    )
+
+    result = (
+        bingx_private_request(
+            "POST",
+            "/openApi/swap/v2/trade/leverage",
+            params
+        )
+    )
+
+    print(
+        "LEVERAGE RESULT:",
+        json.dumps(
+            result,
+            ensure_ascii=False
+        ),
+        flush=True
+    )
+
+    if result.get("code") != 0:
+
+        raise RuntimeError(
+            f"Set leverage failed: "
+            f"{result}"
+        )
+
+    return result
 
 
 # =========================================================
@@ -261,6 +493,7 @@ def bingx_private_request(
 # =========================================================
 
 def get_contract_info(symbol):
+
     url = (
         BINGX_BASE_URL
         + "/openApi/swap/v2/quote/contracts"
@@ -271,185 +504,429 @@ def get_contract_info(symbol):
         timeout=15
     ) as response:
 
-        data = json.loads(
-            response.read().decode("utf-8")
+        result = json.loads(
+            response
+            .read()
+            .decode("utf-8")
         )
 
-    if data.get("code") != 0:
-        raise RuntimeError(str(data))
+    if result.get("code") != 0:
 
-    for item in data.get("data", []):
-        if item.get("symbol") == symbol:
+        raise RuntimeError(
+            f"Contract query failed: "
+            f"{result}"
+        )
+
+    for item in result.get(
+        "data",
+        []
+    ):
+
+        if item.get(
+            "symbol"
+        ) == symbol:
+
             return item
 
     raise RuntimeError(
-        f"Contract not found: {symbol}"
+        f"Contract not found: "
+        f"{symbol}"
     )
 
 
 # =========================================================
-# QUANTITY HELPERS
+# PRECISION HELPERS
 # =========================================================
 
-def floor_quantity(quantity, precision):
-    factor = 10 ** precision
+def floor_number(
+    value,
+    precision
+):
 
-    return math.floor(
-        quantity * factor
-    ) / factor
+    factor = (
+        10 ** precision
+    )
+
+    return (
+        math.floor(
+            value * factor
+        )
+        / factor
+    )
+
+
+def format_number(
+    value,
+    precision
+):
+
+    return (
+        f"{value:.{precision}f}"
+    )
 
 
 # =========================================================
-# IDS
+# CLIENT ORDER ID
 # =========================================================
 
-def client_id(event_id, suffix):
-    raw = f"{event_id}|{suffix}"
+def client_id(
+    event_id,
+    suffix
+):
 
-    digest = hashlib.sha256(
-        raw.encode("utf-8")
-    ).hexdigest()
+    raw = (
+        str(event_id)
+        + "|"
+        + str(suffix)
+    )
 
-    return "line" + digest[:24] + suffix
+    digest = (
+        hashlib
+        .sha256(
+            raw.encode(
+                "utf-8"
+            )
+        )
+        .hexdigest()
+    )
+
+    return (
+        "line"
+        + digest[:24]
+        + suffix
+    )
 
 
 # =========================================================
-# ENTRY
+# BUILD LIMIT ENTRY
 # =========================================================
 
-def place_entry(signal, event_id):
-    symbol = f"{signal['symbol']}-USDT"
+def build_limit_entry(
+    signal,
+    event_id
+):
+
+    symbol = (
+        signal["symbol"]
+        + "-USDT"
+    )
+
+    contract = (
+        get_contract_info(
+            symbol
+        )
+    )
+
+    quantity_precision = int(
+        contract.get(
+            "quantityPrecision",
+            0
+        )
+    )
+
+    price_precision = int(
+        contract.get(
+            "pricePrecision",
+            8
+        )
+    )
+
+    min_qty = float(
+        contract.get(
+            "tradeMinQuantity",
+            0
+        )
+    )
+
+    min_usdt = float(
+        contract.get(
+            "tradeMinUSDT",
+            0
+        )
+    )
+
+    entry_price = float(
+        signal["entry"]
+    )
+
+    entry_price = floor_number(
+        entry_price,
+        price_precision
+    )
+
+    if entry_price <= 0:
+
+        raise RuntimeError(
+            "Invalid entry price"
+        )
+
+    raw_quantity = (
+        ORDER_USDT
+        / entry_price
+    )
+
+    quantity = floor_number(
+        raw_quantity,
+        quantity_precision
+    )
+
+    if quantity <= 0:
+
+        raise RuntimeError(
+            "Entry quantity became zero"
+        )
+
+    if (
+        min_qty > 0
+        and quantity < min_qty
+    ):
+
+        raise RuntimeError(
+            f"Entry quantity "
+            f"{quantity} below "
+            f"minimum {min_qty}"
+        )
+
+    notional = (
+        quantity
+        * entry_price
+    )
+
+    if (
+        min_usdt > 0
+        and notional < min_usdt
+    ):
+
+        raise RuntimeError(
+            f"Entry value "
+            f"{notional} USDT "
+            f"below minimum "
+            f"{min_usdt}"
+        )
+
+    if (
+        LIVE_TRADING
+        and ORDER_USDT
+        > MAX_LIVE_ORDER_USDT
+    ):
+
+        raise RuntimeError(
+            "LIVE ORDER BLOCKED: "
+            f"ORDER_USDT="
+            f"{ORDER_USDT} "
+            f"> MAX="
+            f"{MAX_LIVE_ORDER_USDT}"
+        )
 
     side = (
         "BUY"
-        if signal["side"] == "LONG"
+        if signal["side"]
+        == "LONG"
         else "SELL"
     )
 
     position_side = (
         signal["side"]
-        if BINGX_POSITION_MODE == "HEDGE"
+        if BINGX_POSITION_MODE
+        == "HEDGE"
         else "BOTH"
     )
 
     params = {
-        "symbol": symbol,
-        "side": side,
-        "positionSide": position_side,
-        "type": "MARKET",
-        "quoteOrderQty": ORDER_USDT,
-        "clientOrderId": client_id(
-            event_id,
-            "entry"
-        ),
+        "symbol":
+            symbol,
+
+        "side":
+            side,
+
+        "positionSide":
+            position_side,
+
+        "type":
+            "LIMIT",
+
+        "quantity":
+            format_number(
+                quantity,
+                quantity_precision
+            ),
+
+        "price":
+            format_number(
+                entry_price,
+                price_precision
+            ),
+
+        "timeInForce":
+            "GTC",
+
+        "clientOrderId":
+            client_id(
+                event_id,
+                "entry"
+            ),
     }
 
+    return (
+        params,
+        contract,
+        quantity
+    )
+
+
+# =========================================================
+# PLACE LIMIT ENTRY
+# =========================================================
+
+def place_limit_entry(
+    signal,
+    event_id
+):
+
+    (
+        params,
+        contract,
+        quantity
+    ) = build_limit_entry(
+        signal,
+        event_id
+    )
+
+    symbol = (
+        params["symbol"]
+    )
+
+    # Only change leverage when LIVE
+    if LIVE_TRADING:
+
+        set_leverage(
+            symbol,
+            signal["side"]
+        )
+
+    else:
+
+        print(
+            "TEST MODE LEVERAGE:",
+            f"{LEVERAGE}x",
+            signal["side"],
+            flush=True
+        )
+
     print(
-        "ENTRY ORDER:",
+        "LIMIT ENTRY ORDER:",
         params,
         flush=True
     )
 
     if LIVE_TRADING:
-        if ORDER_USDT > MAX_LIVE_ORDER_USDT:
-            raise RuntimeError(
-                f"LIVE ORDER BLOCKED: "
-                f"{ORDER_USDT} > "
-                f"{MAX_LIVE_ORDER_USDT}"
-            )
 
-        path = "/openApi/swap/v2/trade/order"
+        path = (
+            "/openApi/swap/v2/trade/order"
+        )
 
     else:
-        path = "/openApi/swap/v2/trade/order/test"
 
-    return bingx_private_request(
-        "POST",
-        path,
-        params
+        path = (
+            "/openApi/swap/v2/trade/order/test"
+        )
+
+    result = (
+        bingx_private_request(
+            "POST",
+            path,
+            params
+        )
+    )
+
+    return (
+        result,
+        params,
+        contract,
+        quantity
     )
 
 
 # =========================================================
-# POSITION QUERY
+# QUERY ORDER
 # =========================================================
 
-def get_position_amount(
+def query_order(
     symbol,
-    position_side
+    order_id=None,
+    client_order_id=None
 ):
-    result = bingx_private_request(
-        "GET",
-        "/openApi/swap/v2/user/positions",
-        {
-            "symbol": symbol
-        }
-    )
 
-    if result.get("code") != 0:
+    params = {
+        "symbol":
+            symbol
+    }
+
+    if order_id:
+
+        params[
+            "orderId"
+        ] = order_id
+
+    elif client_order_id:
+
+        params[
+            "clientOrderId"
+        ] = client_order_id
+
+    else:
+
         raise RuntimeError(
-            f"Position query failed: {result}"
+            "Missing order ID"
         )
 
-    positions = result.get("data", [])
-
-    for pos in positions:
-        if pos.get("symbol") != symbol:
-            continue
-
-        if BINGX_POSITION_MODE == "HEDGE":
-            if (
-                pos.get("positionSide")
-                != position_side
-            ):
-                continue
-
-        try:
-            amount = abs(
-                float(
-                    pos.get(
-                        "positionAmt",
-                        0
-                    )
-                )
-            )
-
-        except Exception:
-            amount = 0
-
-        if amount > 0:
-            return amount
-
-    return 0
+    return (
+        bingx_private_request(
+            "GET",
+            "/openApi/swap/v2/trade/order",
+            params
+        )
+    )
 
 
 # =========================================================
-# WAIT FOR POSITION
+# CANCEL ORDER
 # =========================================================
 
-def wait_for_position(
+def cancel_order(
     symbol,
-    position_side,
-    attempts=8,
-    delay=0.5
+    order_id=None,
+    client_order_id=None
 ):
-    for _ in range(attempts):
 
-        qty = get_position_amount(
-            symbol,
-            position_side
+    params = {
+        "symbol":
+            symbol
+    }
+
+    if order_id:
+
+        params[
+            "orderId"
+        ] = order_id
+
+    else:
+
+        params[
+            "clientOrderId"
+        ] = client_order_id
+
+    return (
+        bingx_private_request(
+            "DELETE",
+            "/openApi/swap/v2/trade/order",
+            params
         )
-
-        if qty > 0:
-            return qty
-
-        time.sleep(delay)
-
-    return 0
+    )
 
 
 # =========================================================
-# EXIT ORDER
+# BUILD EXIT ORDER
 # =========================================================
 
 def build_exit_order(
@@ -459,34 +936,60 @@ def build_exit_order(
     stop_price,
     order_type,
     event_id,
-    suffix
+    suffix,
+    quantity_precision,
+    price_precision
 ):
+
     close_side = (
         "SELL"
-        if position_side == "LONG"
+        if position_side
+        == "LONG"
         else "BUY"
     )
 
     params = {
-        "symbol": symbol,
-        "side": close_side,
-        "positionSide": (
-            position_side
-            if BINGX_POSITION_MODE == "HEDGE"
-            else "BOTH"
-        ),
-        "type": order_type,
-        "quantity": quantity,
-        "stopPrice": stop_price,
-        "workingType": "MARK_PRICE",
-        "clientOrderId": client_id(
-            event_id,
-            suffix
-        ),
+        "symbol":
+            symbol,
+
+        "side":
+            close_side,
+
+        "positionSide":
+            (
+                position_side
+                if BINGX_POSITION_MODE
+                == "HEDGE"
+                else "BOTH"
+            ),
+
+        "type":
+            order_type,
+
+        "quantity":
+            format_number(
+                quantity,
+                quantity_precision
+            ),
+
+        "stopPrice":
+            format_number(
+                stop_price,
+                price_precision
+            ),
+
+        "workingType":
+            "MARK_PRICE",
     }
 
-    if BINGX_POSITION_MODE == "ONEWAY":
-        params["reduceOnly"] = "true"
+    if (
+        BINGX_POSITION_MODE
+        == "ONEWAY"
+    ):
+
+        params[
+            "reduceOnly"
+        ] = "true"
 
     return params
 
@@ -498,16 +1001,26 @@ def build_exit_order(
 def place_tp_sl(
     signal,
     event_id,
-    filled_qty
+    filled_qty,
+    contract
 ):
-    symbol = f"{signal['symbol']}-USDT"
 
-    contract = get_contract_info(symbol)
+    symbol = (
+        signal["symbol"]
+        + "-USDT"
+    )
 
-    precision = int(
+    quantity_precision = int(
         contract.get(
             "quantityPrecision",
             0
+        )
+    )
+
+    price_precision = int(
+        contract.get(
+            "pricePrecision",
+            8
         )
     )
 
@@ -518,23 +1031,36 @@ def place_tp_sl(
         )
     )
 
-    q1 = floor_quantity(
-        filled_qty * TP1_PCT / 100,
-        precision
+    min_usdt = float(
+        contract.get(
+            "tradeMinUSDT",
+            0
+        )
     )
 
-    q2 = floor_quantity(
-        filled_qty * TP2_PCT / 100,
-        precision
+    q1 = floor_number(
+        filled_qty
+        * TP1_PCT
+        / 100,
+        quantity_precision
     )
 
-    q3 = floor_quantity(
-        filled_qty - q1 - q2,
-        precision
+    q2 = floor_number(
+        filled_qty
+        * TP2_PCT
+        / 100,
+        quantity_precision
+    )
+
+    q3 = floor_number(
+        filled_qty
+        - q1
+        - q2,
+        quantity_precision
     )
 
     print(
-        "POSITION QTY:",
+        "FILLED QTY:",
         filled_qty,
         flush=True
     )
@@ -542,94 +1068,146 @@ def place_tp_sl(
     print(
         "TP SPLIT:",
         {
-            "tp1_qty": q1,
-            "tp2_qty": q2,
-            "tp3_qty": q3,
+            "TP1": q1,
+            "TP2": q2,
+            "TP3": q3,
         },
         flush=True
     )
 
-    for name, qty in [
-        ("TP1", q1),
-        ("TP2", q2),
-        ("TP3", q3),
-    ]:
+    checks = [
+        (
+            "TP1",
+            q1,
+            float(
+                signal["tp1"]
+            )
+        ),
+
+        (
+            "TP2",
+            q2,
+            float(
+                signal["tp2"]
+            )
+        ),
+
+        (
+            "TP3",
+            q3,
+            float(
+                signal["tp3"]
+            )
+        ),
+    ]
+
+    for (
+        name,
+        qty,
+        trigger_price
+    ) in checks:
+
         if qty <= 0:
+
             raise RuntimeError(
-                f"{name} quantity became zero"
+                f"{name} qty "
+                f"became zero"
             )
 
         if (
             min_qty > 0
             and qty < min_qty
         ):
+
             raise RuntimeError(
-                f"{name} quantity "
-                f"{qty} below minimum "
+                f"{name} qty "
+                f"{qty} below "
+                f"minimum "
                 f"{min_qty}"
             )
 
-    tp_specs = [
-        (
-            q1,
-            float(signal["tp1"]),
-            "tp1"
-        ),
-        (
-            q2,
-            float(signal["tp2"]),
-            "tp2"
-        ),
-        (
-            q3,
-            float(signal["tp3"]),
-            "tp3"
-        ),
-    ]
+        value = (
+            qty
+            * trigger_price
+        )
+
+        if (
+            min_usdt > 0
+            and value < min_usdt
+        ):
+
+            raise RuntimeError(
+                f"{name} value "
+                f"{value} USDT "
+                f"below minimum "
+                f"{min_usdt}"
+            )
 
     tp_results = []
 
-    for qty, price, suffix in tp_specs:
+    for (
+        name,
+        qty,
+        trigger_price
+    ) in checks:
 
-        params = build_exit_order(
-            symbol,
-            signal["side"],
-            qty,
-            price,
-            "TAKE_PROFIT_MARKET",
-            event_id,
-            suffix
+        params = (
+            build_exit_order(
+                symbol,
+                signal["side"],
+                qty,
+                trigger_price,
+                "TAKE_PROFIT_MARKET",
+                event_id,
+                name.lower(),
+                quantity_precision,
+                price_precision
+            )
         )
 
         print(
-            f"{suffix.upper()} ORDER:",
+            name + " ORDER:",
             params,
             flush=True
         )
 
-        result = bingx_private_request(
-            "POST",
-            "/openApi/swap/v2/trade/order",
-            params
+        result = (
+            bingx_private_request(
+                "POST",
+                "/openApi/swap/v2/trade/order",
+                params
+            )
         )
 
-        if result.get("code") != 0:
+        if (
+            result.get("code")
+            != 0
+        ):
+
             raise RuntimeError(
-                f"{suffix.upper()} failed: "
+                f"{name} failed: "
                 f"{result}"
             )
 
-        tp_results.append(result)
+        tp_results.append(
+            result
+        )
 
-    # SL for full original position quantity
-    sl_params = build_exit_order(
-        symbol,
-        signal["side"],
-        filled_qty,
-        float(signal["sl"]),
-        "STOP_MARKET",
-        event_id,
-        "sl"
+    # Full-position SL
+    sl_params = (
+        build_exit_order(
+            symbol,
+            signal["side"],
+            filled_qty,
+            float(
+                signal["sl"]
+            ),
+            "STOP_MARKET",
+            event_id,
+            "sl",
+            quantity_precision,
+            price_precision
+        )
     )
 
     print(
@@ -638,21 +1216,221 @@ def place_tp_sl(
         flush=True
     )
 
-    sl_result = bingx_private_request(
-        "POST",
-        "/openApi/swap/v2/trade/order",
-        sl_params
+    sl_result = (
+        bingx_private_request(
+            "POST",
+            "/openApi/swap/v2/trade/order",
+            sl_params
+        )
     )
 
-    if sl_result.get("code") != 0:
+    if (
+        sl_result.get("code")
+        != 0
+    ):
+
         raise RuntimeError(
-            f"SL failed: {sl_result}"
+            f"SL failed: "
+            f"{sl_result}"
         )
 
     return {
-        "tp_results": tp_results,
-        "sl_result": sl_result
+        "tp":
+            tp_results,
+
+        "sl":
+            sl_result
     }
+
+
+# =========================================================
+# MONITOR LIMIT ORDER
+# =========================================================
+
+def monitor_limit_order(
+    signal,
+    event_id,
+    order_id,
+    client_order_id,
+    contract
+):
+
+    symbol = (
+        signal["symbol"]
+        + "-USDT"
+    )
+
+    start = time.time()
+
+    print(
+        "MONITORING LIMIT ORDER:",
+        order_id,
+        flush=True
+    )
+
+    while True:
+
+        try:
+
+            result = (
+                query_order(
+                    symbol,
+                    order_id,
+                    client_order_id
+                )
+            )
+
+            print(
+                "ORDER STATUS RESULT:",
+                json.dumps(
+                    result,
+                    ensure_ascii=False
+                ),
+                flush=True
+            )
+
+            if (
+                result.get("code")
+                != 0
+            ):
+
+                raise RuntimeError(
+                    str(result)
+                )
+
+            order = (
+                result.get(
+                    "data",
+                    {}
+                )
+            )
+
+            if (
+                isinstance(
+                    order,
+                    dict
+                )
+                and "order"
+                in order
+            ):
+
+                order = (
+                    order["order"]
+                )
+
+            status = str(
+                order.get(
+                    "status",
+                    ""
+                )
+            ).upper()
+
+            executed_qty = float(
+                order.get(
+                    "executedQty",
+                    0
+                )
+                or 0
+            )
+
+            print(
+                "LIMIT STATUS:",
+                status,
+                "EXECUTED:",
+                executed_qty,
+                flush=True
+            )
+
+            if status == "FILLED":
+
+                if (
+                    executed_qty
+                    <= 0
+                ):
+
+                    raise RuntimeError(
+                        "FILLED but "
+                        "executedQty=0"
+                    )
+
+                print(
+                    "LIMIT FILLED",
+                    flush=True
+                )
+
+                exits = place_tp_sl(
+                    signal,
+                    event_id,
+                    executed_qty,
+                    contract
+                )
+
+                print(
+                    "EXIT RESULT:",
+                    json.dumps(
+                        exits,
+                        ensure_ascii=False
+                    ),
+                    flush=True
+                )
+
+                return
+
+            if status in [
+                "CANCELED",
+                "EXPIRED"
+            ]:
+
+                print(
+                    "ENTRY NO LONGER ACTIVE:",
+                    status,
+                    flush=True
+                )
+
+                return
+
+            if (
+                time.time()
+                - start
+                >= ENTRY_TIMEOUT_SEC
+            ):
+
+                print(
+                    "ENTRY TIMEOUT - "
+                    "CANCELLING LIMIT ORDER",
+                    flush=True
+                )
+
+                cancel_result = (
+                    cancel_order(
+                        symbol,
+                        order_id,
+                        client_order_id
+                    )
+                )
+
+                print(
+                    "CANCEL RESULT:",
+                    json.dumps(
+                        cancel_result,
+                        ensure_ascii=False
+                    ),
+                    flush=True
+                )
+
+                return
+
+        except Exception as e:
+
+            print(
+                "MONITOR ERROR:",
+                str(e),
+                flush=True
+            )
+
+        time.sleep(
+            ORDER_POLL_SEC
+        )
 
 
 # =========================================================
@@ -664,6 +1442,7 @@ def place_tp_sl(
     methods=["GET"]
 )
 def home():
+
     mode = (
         "LIVE"
         if LIVE_TRADING
@@ -671,13 +1450,15 @@ def home():
     )
 
     return (
-        f"LINE BingX Bot {mode} mode",
+        f"LINE BingX LIMIT Bot "
+        f"{mode} mode | "
+        f"{LEVERAGE}x",
         200
     )
 
 
 # =========================================================
-# WEBHOOK
+# LINE WEBHOOK
 # =========================================================
 
 @app.route(
@@ -685,66 +1466,100 @@ def home():
     methods=["POST"]
 )
 def webhook():
+
     body = request.get_data(
         as_text=True
     )
 
-    signature = request.headers.get(
-        "X-Line-Signature",
-        ""
+    signature = (
+        request.headers.get(
+            "X-Line-Signature",
+            ""
+        )
     )
 
     if not LINE_CHANNEL_SECRET:
+
         return (
-            "LINE_CHANNEL_SECRET not set",
+            "LINE_CHANNEL_SECRET "
+            "not set",
             500
         )
 
     digest = hmac.new(
-        LINE_CHANNEL_SECRET.encode("utf-8"),
-        body.encode("utf-8"),
+        LINE_CHANNEL_SECRET.encode(
+            "utf-8"
+        ),
+        body.encode(
+            "utf-8"
+        ),
         hashlib.sha256
     ).digest()
 
     expected_signature = (
         base64
-        .b64encode(digest)
-        .decode("utf-8")
+        .b64encode(
+            digest
+        )
+        .decode(
+            "utf-8"
+        )
     )
 
     if not hmac.compare_digest(
         signature,
         expected_signature
     ):
+
         abort(400)
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
     for event in data.get(
         "events",
         []
     ):
-        if event.get("type") != "message":
+
+        if (
+            event.get("type")
+            != "message"
+        ):
+
             continue
 
-        message = event.get(
-            "message",
-            {}
+        message = (
+            event.get(
+                "message",
+                {}
+            )
         )
 
-        if message.get("type") != "text":
+        if (
+            message.get("type")
+            != "text"
+        ):
+
             continue
 
-        text = message.get(
-            "text",
-            ""
+        text = (
+            message.get(
+                "text",
+                ""
+            )
         )
 
-        event_id = event.get(
-            "webhookEventId",
-            str(time.time_ns())
+        event_id = (
+            event.get(
+                "webhookEventId",
+                str(
+                    time.time_ns()
+                )
+            )
         )
 
         print(
@@ -753,7 +1568,9 @@ def webhook():
             flush=True
         )
 
-        signal = parse_signal(text)
+        signal = parse_signal(
+            text
+        )
 
         print(
             "PARSED SIGNAL:",
@@ -762,6 +1579,7 @@ def webhook():
         )
 
         if not signal["symbol"]:
+
             print(
                 "NOT A SIGNAL",
                 flush=True
@@ -769,11 +1587,15 @@ def webhook():
 
             continue
 
-        valid, error = validate_signal(
+        (
+            valid,
+            error
+        ) = validate_signal(
             signal
         )
 
         if not valid:
+
             print(
                 "SIGNAL REJECTED:",
                 error,
@@ -783,13 +1605,19 @@ def webhook():
             continue
 
         try:
-            entry_result = place_entry(
+
+            (
+                entry_result,
+                params,
+                contract,
+                expected_qty
+            ) = place_limit_entry(
                 signal,
                 event_id
             )
 
             print(
-                "ENTRY RESULT:",
+                "LIMIT ENTRY RESULT:",
                 json.dumps(
                     entry_result,
                     ensure_ascii=False
@@ -797,62 +1625,87 @@ def webhook():
                 flush=True
             )
 
-            if entry_result.get("code") != 0:
+            if (
+                entry_result.get(
+                    "code"
+                )
+                != 0
+            ):
+
                 raise RuntimeError(
                     f"Entry failed: "
                     f"{entry_result}"
                 )
 
-            # TEST MODE ENDS HERE
+            # TEST MODE STOPS HERE
             if not LIVE_TRADING:
+
                 print(
                     "TEST MODE: "
-                    "NO REAL POSITION / "
-                    "TP / SL CREATED",
+                    f"LIMIT VALIDATED | "
+                    f"LEVERAGE={LEVERAGE}x | "
+                    "NO REAL ORDER CREATED",
                     flush=True
                 )
 
                 continue
 
-            symbol = (
-                signal["symbol"]
-                + "-USDT"
+            data_result = (
+                entry_result.get(
+                    "data",
+                    {}
+                )
             )
 
-            filled_qty = wait_for_position(
-                symbol,
-                signal["side"]
+            order = (
+                data_result.get(
+                    "order",
+                    data_result
+                )
             )
 
-            if filled_qty <= 0:
+            order_id = (
+                order.get(
+                    "orderId"
+                )
+            )
+
+            client_order_id = (
+                params.get(
+                    "clientOrderId"
+                )
+            )
+
+            if not order_id:
+
                 raise RuntimeError(
-                    "LIVE entry sent, "
-                    "but positionAmt "
-                    "was not found"
+                    "No orderId returned"
                 )
 
-            print(
-                "LIVE POSITION FOUND:",
-                filled_qty,
-                flush=True
-            )
+            thread = threading.Thread(
+                target=
+                    monitor_limit_order,
 
-            exit_result = place_tp_sl(
-                signal,
-                event_id,
-                filled_qty
-            )
-
-            print(
-                "EXIT RESULT:",
-                json.dumps(
-                    exit_result,
-                    ensure_ascii=False
+                args=(
+                    signal,
+                    event_id,
+                    order_id,
+                    client_order_id,
+                    contract
                 ),
+
+                daemon=True
+            )
+
+            thread.start()
+
+            print(
+                "LIMIT MONITOR STARTED",
                 flush=True
             )
 
         except Exception as e:
+
             print(
                 "TRADING ERROR:",
                 str(e),
