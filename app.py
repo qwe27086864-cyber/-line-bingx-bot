@@ -8,21 +8,37 @@ import time
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
 
 app = Flask(__name__)
 
-# =========================
+# =========================================================
 # Environment Variables
-# =========================
+# =========================================================
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+
 BINGX_API_KEY = os.environ.get("BINGX_API_KEY", "")
 BINGX_SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "")
 
+LIVE_TRADING = os.environ.get(
+    "LIVE_TRADING",
+    "false"
+).strip().lower() == "true"
 
-# =========================
-# Parse LINE Trading Signal
-# =========================
+ORDER_USDT_RAW = os.environ.get("ORDER_USDT", "")
+
+BINGX_POSITION_MODE = os.environ.get(
+    "BINGX_POSITION_MODE",
+    "HEDGE"
+).strip().upper()
+
+BINGX_BASE_URL = "https://open-api.bingx.com"
+
+
+# =========================================================
+# Parse Trading Signal
+# =========================================================
 
 def parse_signal(text):
     result = {
@@ -78,9 +94,9 @@ def parse_signal(text):
         result["symbol"] = symbol.group(1).upper()
 
     if side:
-        s = side.group(1).upper()
+        direction = side.group(1).upper()
 
-        if s in ["多", "LONG"]:
+        if direction in ["多", "LONG"]:
             result["side"] = "LONG"
         else:
             result["side"] = "SHORT"
@@ -103,11 +119,11 @@ def parse_signal(text):
     return result
 
 
-# =========================
-# Check Required Fields
-# =========================
+# =========================================================
+# Validate Signal
+# =========================================================
 
-def valid_signal(signal):
+def validate_signal(signal):
     required = [
         "symbol",
         "side",
@@ -117,54 +133,47 @@ def valid_signal(signal):
 
     for field in required:
         if not signal.get(field):
-            return False
+            return False, f"Missing field: {field}"
 
-    return True
+    try:
+        entry = float(signal["entry"])
+        sl = float(signal["sl"])
 
+        if entry <= 0 or sl <= 0:
+            return False, "Entry / SL must be > 0"
 
-# =========================
-# Create DRY RUN Order
-# =========================
+        for tp_name in ["tp1", "tp2", "tp3"]:
+            if signal.get(tp_name):
+                if float(signal[tp_name]) <= 0:
+                    return False, f"{tp_name} must be > 0"
 
-def build_dry_run_order(signal):
+    except ValueError:
+        return False, "Invalid numeric value"
 
-    symbol = signal["symbol"]
-
-    # BingX perpetual symbol format
-    bingx_symbol = f"{symbol}-USDT"
-
-    side = signal["side"]
-
-    if side == "LONG":
-        order_side = "BUY"
-        position_side = "LONG"
-
-    else:
-        order_side = "SELL"
-        position_side = "SHORT"
-
-    order = {
-        "dry_run": True,
-        "symbol": bingx_symbol,
-        "side": order_side,
-        "positionSide": position_side,
-        "orderType": "MARKET",
-        "entry_reference": signal["entry"],
-        "takeProfit1": signal["tp1"],
-        "takeProfit2": signal["tp2"],
-        "takeProfit3": signal["tp3"],
-        "stopLoss": signal["sl"],
-    }
-
-    return order
+    return True, None
 
 
-# =========================
-# BingX API Signature
-# =========================
+# =========================================================
+# ORDER_USDT
+# =========================================================
 
-def bingx_signature(params):
+def get_order_usdt():
+    if not ORDER_USDT_RAW:
+        raise ValueError("ORDER_USDT not set")
 
+    value = float(ORDER_USDT_RAW)
+
+    if value <= 0:
+        raise ValueError("ORDER_USDT must be > 0")
+
+    return value
+
+
+# =========================================================
+# BingX Signature
+# =========================================================
+
+def bingx_sign(params):
     query_string = urllib.parse.urlencode(
         sorted(params.items())
     )
@@ -178,37 +187,24 @@ def bingx_signature(params):
     return query_string, signature
 
 
-# =========================
-# BingX Balance Test
-# =========================
+# =========================================================
+# BingX Request
+# =========================================================
 
-def bingx_get_balance():
-
+def bingx_private_request(method, path, params):
     if not BINGX_API_KEY:
-        return {
-            "success": False,
-            "error": "BINGX_API_KEY not set"
-        }
+        raise RuntimeError("BINGX_API_KEY not set")
 
     if not BINGX_SECRET_KEY:
-        return {
-            "success": False,
-            "error": "BINGX_SECRET_KEY not set"
-        }
+        raise RuntimeError("BINGX_SECRET_KEY not set")
 
-    base_url = "https://open-api.bingx.com"
+    params["recvWindow"] = 5000
+    params["timestamp"] = int(time.time() * 1000)
 
-    path = "/openApi/swap/v2/user/balance"
-
-    params = {
-        "recvWindow": 5000,
-        "timestamp": int(time.time() * 1000)
-    }
-
-    query_string, signature = bingx_signature(params)
+    query_string, signature = bingx_sign(params)
 
     url = (
-        base_url
+        BINGX_BASE_URL
         + path
         + "?"
         + query_string
@@ -217,57 +213,214 @@ def bingx_get_balance():
     )
 
     headers = {
-        "X-BX-APIKEY": BINGX_API_KEY
+        "X-BX-APIKEY": BINGX_API_KEY,
+        "Content-Type": "application/x-www-form-urlencoded"
     }
+
+    data = b"" if method == "POST" else None
 
     req = urllib.request.Request(
         url,
         headers=headers,
-        method="GET"
+        data=data,
+        method=method
     )
 
     try:
-
         with urllib.request.urlopen(
             req,
-            timeout=10
+            timeout=15
         ) as response:
 
             body = response.read().decode("utf-8")
 
-            data = json.loads(body)
+            return json.loads(body)
 
-            return {
-                "success": True,
-                "response": data
-            }
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        raise RuntimeError(
+            f"BingX HTTP {e.code}: {body}"
+        )
 
     except Exception as e:
+        raise RuntimeError(
+            f"BingX request failed: {str(e)}"
+        )
 
-        return {
-            "success": False,
-            "error": str(e)
+
+# =========================================================
+# Balance Test
+# =========================================================
+
+def bingx_get_balance():
+    return bingx_private_request(
+        "GET",
+        "/openApi/swap/v2/user/balance",
+        {}
+    )
+
+
+# =========================================================
+# Client Order ID
+# Prevent accidental duplicate order
+# =========================================================
+
+def make_client_order_id(event_id, signal):
+    source = (
+        str(event_id)
+        + "|"
+        + str(signal["symbol"])
+        + "|"
+        + str(signal["side"])
+        + "|"
+        + str(signal["entry"])
+    )
+
+    digest = hashlib.sha256(
+        source.encode("utf-8")
+    ).hexdigest()
+
+    return "line" + digest[:28]
+
+
+# =========================================================
+# Build Order
+# =========================================================
+
+def build_order_params(signal, event_id):
+    order_usdt = get_order_usdt()
+
+    symbol = f"{signal['symbol']}-USDT"
+
+    if signal["side"] == "LONG":
+        side = "BUY"
+    else:
+        side = "SELL"
+
+    if BINGX_POSITION_MODE == "ONEWAY":
+        position_side = "BOTH"
+    else:
+        position_side = signal["side"]
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "positionSide": position_side,
+        "type": "MARKET",
+        "quoteOrderQty": order_usdt,
+        "clientOrderId": make_client_order_id(
+            event_id,
+            signal
+        )
+    }
+
+    # Attach SL
+    if signal.get("sl"):
+        stop_loss = {
+            "type": "STOP_MARKET",
+            "stopPrice": float(signal["sl"]),
+            "workingType": "MARK_PRICE"
         }
 
+        params["stopLoss"] = json.dumps(
+            stop_loss,
+            separators=(",", ":")
+        )
 
-# =========================
+    # BingX supports one attached TP on the opening order.
+    # Use TP1 here.
+    if signal.get("tp1"):
+        take_profit = {
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": float(signal["tp1"]),
+            "workingType": "MARK_PRICE"
+        }
+
+        params["takeProfit"] = json.dumps(
+            take_profit,
+            separators=(",", ":")
+        )
+
+    return params
+
+
+# =========================================================
+# Test / Live Order
+# =========================================================
+
+def submit_order(signal, event_id):
+    params = build_order_params(
+        signal,
+        event_id
+    )
+
+    safe_log = dict(params)
+
+    print(
+        "ORDER PARAMETERS:",
+        json.dumps(
+            safe_log,
+            ensure_ascii=False
+        ),
+        flush=True
+    )
+
+    if LIVE_TRADING:
+        path = "/openApi/swap/v2/trade/order"
+
+        print(
+            "!!! LIVE TRADING ENABLED !!!",
+            flush=True
+        )
+
+    else:
+        path = "/openApi/swap/v2/trade/order/test"
+
+        print(
+            "TEST ORDER ONLY - NO REAL TRADE",
+            flush=True
+        )
+
+    response = bingx_private_request(
+        "POST",
+        path,
+        params
+    )
+
+    return response
+
+
+# =========================================================
 # Home
-# =========================
+# =========================================================
 
 @app.route("/", methods=["GET"])
 def home():
+    mode = (
+        "LIVE"
+        if LIVE_TRADING
+        else "TEST"
+    )
 
-    return "LINE BingX Bot DRY RUN is running", 200
+    return (
+        f"LINE BingX Bot running - {mode} mode",
+        200
+    )
 
 
-# =========================
+# =========================================================
 # LINE Webhook
-# =========================
+# =========================================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
-    body = request.get_data(as_text=True)
+    body = request.get_data(
+        as_text=True
+    )
 
     signature = request.headers.get(
         "X-Line-Signature",
@@ -275,11 +428,12 @@ def webhook():
     )
 
     if not LINE_CHANNEL_SECRET:
-        return "LINE_CHANNEL_SECRET not set", 500
-
+        return (
+            "LINE_CHANNEL_SECRET not set",
+            500
+        )
 
     # Verify LINE signature
-
     digest = hmac.new(
         LINE_CHANNEL_SECRET.encode("utf-8"),
         body.encode("utf-8"),
@@ -296,14 +450,14 @@ def webhook():
     ):
         abort(400)
 
-
     data = request.get_json(
         silent=True
     ) or {}
 
-
-    for event in data.get("events", []):
-
+    for event in data.get(
+        "events",
+        []
+    ):
         if event.get("type") != "message":
             continue
 
@@ -320,41 +474,46 @@ def webhook():
             ""
         )
 
+        event_id = event.get(
+            "webhookEventId",
+            str(time.time_ns())
+        )
+
         print(
             "LINE MESSAGE:",
             text,
             flush=True
         )
 
-
-        # =========================
-        # BingX Connection Test
-        # =========================
+        # ---------------------------------
+        # API connection test
+        # ---------------------------------
 
         if text.strip().upper() == "BINGX TEST":
+            try:
+                result = bingx_get_balance()
 
-            print(
-                "STARTING BINGX API TEST...",
-                flush=True
-            )
+                print(
+                    "BINGX TEST RESULT:",
+                    json.dumps(
+                        result,
+                        ensure_ascii=False
+                    ),
+                    flush=True
+                )
 
-            result = bingx_get_balance()
-
-            print(
-                "BINGX TEST RESULT:",
-                json.dumps(
-                    result,
-                    ensure_ascii=False
-                ),
-                flush=True
-            )
+            except Exception as e:
+                print(
+                    "BINGX TEST ERROR:",
+                    str(e),
+                    flush=True
+                )
 
             continue
 
-
-        # =========================
-        # Parse Signal
-        # =========================
+        # ---------------------------------
+        # Parse trading signal
+        # ---------------------------------
 
         signal = parse_signal(text)
 
@@ -364,8 +523,6 @@ def webhook():
             flush=True
         )
 
-
-        # Ignore normal messages
         if not signal["symbol"]:
             print(
                 "NOT A TRADING SIGNAL",
@@ -374,50 +531,59 @@ def webhook():
 
             continue
 
+        valid, error = validate_signal(
+            signal
+        )
 
-        # Check required fields
-        if not valid_signal(signal):
-
+        if not valid:
             print(
-                "SIGNAL INCOMPLETE - NO ACTION",
-                signal,
+                "SIGNAL REJECTED:",
+                error,
                 flush=True
             )
 
             continue
 
+        # ---------------------------------
+        # Send test/live BingX order
+        # ---------------------------------
 
-        # =========================
-        # DRY RUN
-        # =========================
+        try:
+            result = submit_order(
+                signal,
+                event_id
+            )
 
-        dry_run_order = build_dry_run_order(
-            signal
-        )
+            print(
+                "BINGX ORDER RESULT:",
+                json.dumps(
+                    result,
+                    ensure_ascii=False
+                ),
+                flush=True
+            )
 
-        print(
-            "==============================",
-            flush=True
-        )
+            # TP2 / TP3 currently only logged.
+            # They are NOT sent as separate orders yet.
+            if signal.get("tp2"):
+                print(
+                    "TP2 SAVED ONLY:",
+                    signal["tp2"],
+                    flush=True
+                )
 
-        print(
-            "DRY RUN ORDER - NO REAL TRADE",
-            flush=True
-        )
+            if signal.get("tp3"):
+                print(
+                    "TP3 SAVED ONLY:",
+                    signal["tp3"],
+                    flush=True
+                )
 
-        print(
-            json.dumps(
-                dry_run_order,
-                ensure_ascii=False,
-                indent=2
-            ),
-            flush=True
-        )
-
-        print(
-            "==============================",
-            flush=True
-        )
-
+        except Exception as e:
+            print(
+                "BINGX ORDER ERROR:",
+                str(e),
+                flush=True
+            )
 
     return "OK", 200
