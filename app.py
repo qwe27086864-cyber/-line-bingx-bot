@@ -10,6 +10,7 @@ import math
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
 import psycopg2
 
 
@@ -120,9 +121,16 @@ BINGX_BASE_URL = (
 # SCANNER SETTINGS
 # =========================================================
 
-SCANNER_MIN_SCORE = int(
+SCANNER_MIN_TREND_SCORE = int(
     os.environ.get(
-        "SCANNER_MIN_SCORE",
+        "SCANNER_MIN_TREND_SCORE",
+        "75"
+    )
+)
+
+SCANNER_MIN_BREAKOUT_SCORE = int(
+    os.environ.get(
+        "SCANNER_MIN_BREAKOUT_SCORE",
         "75"
     )
 )
@@ -190,6 +198,34 @@ SIM_MONITOR_SEC = int(
     )
 )
 
+FAST_DETAIL_LIMIT = int(
+    os.environ.get(
+        "FAST_DETAIL_LIMIT",
+        "120"
+    )
+)
+
+BREAKOUT_FORCE_SCORE = int(
+    os.environ.get(
+        "BREAKOUT_FORCE_SCORE",
+        "45"
+    )
+)
+
+MAX_DETAIL_SYMBOLS = int(
+    os.environ.get(
+        "MAX_DETAIL_SYMBOLS",
+        "180"
+    )
+)
+
+ONE_HOUR_CONFIRM_LIMIT = int(
+    os.environ.get(
+        "ONE_HOUR_CONFIRM_LIMIT",
+        "40"
+    )
+)
+
 
 # =========================================================
 # GLOBAL SCANNER STATUS
@@ -199,11 +235,15 @@ scanner_lock = threading.Lock()
 
 scanner_status = {
     "running": False,
+    "phase": "",
     "started_at": None,
     "finished_at": None,
     "total": 0,
     "processed": 0,
-    "candidates": 0,
+    "detail_total": 0,
+    "detail_processed": 0,
+    "trend_candidates": 0,
+    "breakout_candidates": 0,
     "new_trades": 0,
     "current_symbol": "",
     "error": "",
@@ -245,18 +285,32 @@ def init_database():
                 id SERIAL PRIMARY KEY,
                 symbol VARCHAR(50) NOT NULL,
                 side VARCHAR(10) NOT NULL DEFAULT 'LONG',
+
+                strategy VARCHAR(30),
+
                 signal_time TIMESTAMPTZ DEFAULT NOW(),
+
                 entry_price DOUBLE PRECISION NOT NULL,
 
                 score INTEGER,
+                trend_score INTEGER,
+                breakout_score INTEGER,
+
                 rsi DOUBLE PRECISION,
+                rsi_5m DOUBLE PRECISION,
+
                 volume_ratio DOUBLE PRECISION,
                 momentum_pct DOUBLE PRECISION,
+                momentum_5m DOUBLE PRECISION,
+
+                volatility_pct DOUBLE PRECISION,
+                extension_pct DOUBLE PRECISION,
 
                 trend_15m VARCHAR(20),
                 trend_1h VARCHAR(20),
 
                 breakout BOOLEAN DEFAULT FALSE,
+
                 reasons TEXT,
 
                 tp1 DOUBLE PRECISION,
@@ -283,18 +337,56 @@ def init_database():
             """
         )
 
-        cur.execute(
+        migrations = [
             """
             ALTER TABLE scanner_trades
-            ADD COLUMN IF NOT EXISTS momentum_pct
-            DOUBLE PRECISION;
+            ADD COLUMN IF NOT EXISTS strategy VARCHAR(30);
+            """,
             """
-        )
-
-        cur.execute(
+            ALTER TABLE scanner_trades
+            ADD COLUMN IF NOT EXISTS trend_score INTEGER;
+            """,
+            """
+            ALTER TABLE scanner_trades
+            ADD COLUMN IF NOT EXISTS breakout_score INTEGER;
+            """,
+            """
+            ALTER TABLE scanner_trades
+            ADD COLUMN IF NOT EXISTS rsi_5m DOUBLE PRECISION;
+            """,
+            """
+            ALTER TABLE scanner_trades
+            ADD COLUMN IF NOT EXISTS momentum_5m DOUBLE PRECISION;
+            """,
+            """
+            ALTER TABLE scanner_trades
+            ADD COLUMN IF NOT EXISTS volatility_pct DOUBLE PRECISION;
+            """,
+            """
+            ALTER TABLE scanner_trades
+            ADD COLUMN IF NOT EXISTS extension_pct DOUBLE PRECISION;
+            """,
+            """
+            ALTER TABLE scanner_trades
+            ADD COLUMN IF NOT EXISTS momentum_pct DOUBLE PRECISION;
+            """,
             """
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS reasons TEXT;
+            """
+        ]
+
+        for sql in migrations:
+
+            cur.execute(sql)
+
+        # Old V1 records are preserved,
+        # but excluded from V2 statistics.
+        cur.execute(
+            """
+            UPDATE scanner_trades
+            SET strategy = 'LEGACY_V1'
+            WHERE strategy IS NULL;
             """
         )
 
@@ -322,6 +414,76 @@ def init_database():
 
         if conn:
             conn.close()
+
+
+# =========================================================
+# PUBLIC BINGX REQUEST
+# =========================================================
+
+def bingx_public_request(
+    path,
+    params=None
+):
+
+    params = params or {}
+
+    query = urllib.parse.urlencode(
+        params
+    )
+
+    url = (
+        BINGX_BASE_URL
+        + path
+    )
+
+    if query:
+
+        url += (
+            "?"
+            + query
+        )
+
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "User-Agent":
+                "Mozilla/5.0"
+        }
+    )
+
+    try:
+
+        with urllib.request.urlopen(
+            req,
+            timeout=20
+        ) as response:
+
+            body = (
+                response
+                .read()
+                .decode("utf-8")
+            )
+
+            return json.loads(
+                body
+            )
+
+    except urllib.error.HTTPError as e:
+
+        body = (
+            e.read()
+            .decode(
+                "utf-8",
+                errors="replace"
+            )
+        )
+
+        raise RuntimeError(
+            f"BingX Public HTTP "
+            f"{e.code}: "
+            f"{body}"
+        )
 
 
 # =========================================================
@@ -380,6 +542,7 @@ def parse_signal(text):
     )
 
     if symbol:
+
         result["symbol"] = (
             symbol.group(1).upper()
         )
@@ -390,7 +553,10 @@ def parse_signal(text):
 
         result["side"] = (
             "LONG"
-            if s in ["多", "LONG"]
+            if s in [
+                "多",
+                "LONG"
+            ]
             else "SHORT"
         )
 
@@ -439,11 +605,25 @@ def validate_signal(signal):
 
     try:
 
-        entry = float(signal["entry"])
-        tp1 = float(signal["tp1"])
-        tp2 = float(signal["tp2"])
-        tp3 = float(signal["tp3"])
-        sl = float(signal["sl"])
+        entry = float(
+            signal["entry"]
+        )
+
+        tp1 = float(
+            signal["tp1"]
+        )
+
+        tp2 = float(
+            signal["tp2"]
+        )
+
+        tp3 = float(
+            signal["tp3"]
+        )
+
+        sl = float(
+            signal["sl"]
+        )
 
     except ValueError:
 
@@ -477,11 +657,14 @@ def validate_signal(signal):
             "TP percentages must total 100"
         )
 
-    return True, None
+    return (
+        True,
+        None
+    )
 
 
 # =========================================================
-# BINGX SIGNING
+# PRIVATE BINGX SIGNING
 # =========================================================
 
 def build_canonical(params):
@@ -519,7 +702,8 @@ def bingx_private_request(
     params["recvWindow"] = 5000
 
     params["timestamp"] = int(
-        time.time() * 1000
+        time.time()
+        * 1000
     )
 
     canonical = build_canonical(
@@ -527,8 +711,12 @@ def bingx_private_request(
     )
 
     signature = hmac.new(
-        BINGX_SECRET_KEY.encode("utf-8"),
-        canonical.encode("utf-8"),
+        BINGX_SECRET_KEY.encode(
+            "utf-8"
+        ),
+        canonical.encode(
+            "utf-8"
+        ),
         hashlib.sha256
     ).hexdigest()
 
@@ -588,7 +776,9 @@ def bingx_private_request(
                 .decode("utf-8")
             )
 
-            return json.loads(body)
+            return json.loads(
+                body
+            )
 
     except urllib.error.HTTPError as e:
 
@@ -608,7 +798,7 @@ def bingx_private_request(
 
 
 # =========================================================
-# SET LEVERAGE
+# LEVERAGE
 # =========================================================
 
 def set_leverage(
@@ -618,7 +808,8 @@ def set_leverage(
 
     leverage_side = (
         position_side
-        if BINGX_POSITION_MODE == "HEDGE"
+        if BINGX_POSITION_MODE
+        == "HEDGE"
         else "BOTH"
     )
 
@@ -650,12 +841,8 @@ def set_leverage(
 
 def get_contract_info(symbol):
 
-    result = bingx_private_request(
-        "GET",
-        "/openApi/swap/v2/quote/contracts",
-        {
-            "symbol": symbol
-        }
+    result = bingx_public_request(
+        "/openApi/swap/v2/quote/contracts"
     )
 
     if result.get("code") != 0:
@@ -665,15 +852,10 @@ def get_contract_info(symbol):
             f"{result}"
         )
 
-    data = result.get(
+    for item in result.get(
         "data",
         []
-    )
-
-    if isinstance(data, dict):
-        data = [data]
-
-    for item in data:
+    ):
 
         if item.get(
             "symbol"
@@ -745,7 +927,7 @@ def client_id(
 
 
 # =========================================================
-# BUILD LIMIT ENTRY
+# BUILD LINE LIMIT ENTRY
 # =========================================================
 
 def build_limit_entry(
@@ -920,7 +1102,7 @@ def build_limit_entry(
 
 
 # =========================================================
-# PLACE LIMIT ENTRY
+# PLACE LINE LIMIT ENTRY
 # =========================================================
 
 def place_limit_entry(
@@ -983,7 +1165,7 @@ def place_limit_entry(
 
 
 # =========================================================
-# QUERY ORDER
+# QUERY / CANCEL
 # =========================================================
 
 def query_order(
@@ -998,7 +1180,9 @@ def query_order(
 
     if order_id:
 
-        params["orderId"] = order_id
+        params["orderId"] = (
+            order_id
+        )
 
     elif client_order_id:
 
@@ -1019,10 +1203,6 @@ def query_order(
     )
 
 
-# =========================================================
-# CANCEL ORDER
-# =========================================================
-
 def cancel_order(
     symbol,
     order_id=None,
@@ -1035,13 +1215,15 @@ def cancel_order(
 
     if order_id:
 
-        params["orderId"] = order_id
+        params["orderId"] = (
+            order_id
+        )
 
     else:
 
-        params[
-            "clientOrderId"
-        ] = client_order_id
+        params["clientOrderId"] = (
+            client_order_id
+        )
 
     return bingx_private_request(
         "DELETE",
@@ -1051,7 +1233,7 @@ def cancel_order(
 
 
 # =========================================================
-# BUILD EXIT ORDER
+# EXIT ORDER
 # =========================================================
 
 def build_exit_order(
@@ -1107,20 +1289,17 @@ def build_exit_order(
             "MARK_PRICE",
     }
 
-    if (
-        BINGX_POSITION_MODE
-        == "ONEWAY"
-    ):
+    if BINGX_POSITION_MODE == "ONEWAY":
 
-        params[
-            "reduceOnly"
-        ] = "true"
+        params["reduceOnly"] = (
+            "true"
+        )
 
     return params
 
 
 # =========================================================
-# TP / SL
+# LINE TP / SL
 # =========================================================
 
 def place_tp_sl(
@@ -1222,8 +1401,7 @@ def place_tp_sl(
             raise RuntimeError(
                 f"{name} qty "
                 f"{qty} below "
-                f"minimum "
-                f"{min_qty}"
+                f"minimum {min_qty}"
             )
 
         value = (
@@ -1238,8 +1416,8 @@ def place_tp_sl(
 
             raise RuntimeError(
                 f"{name} value "
-                f"{value} USDT "
-                f"below minimum "
+                f"{value} below "
+                f"minimum "
                 f"{min_usdt}"
             )
 
@@ -1269,9 +1447,7 @@ def place_tp_sl(
             params
         )
 
-        if result.get(
-            "code"
-        ) != 0:
+        if result.get("code") != 0:
 
             raise RuntimeError(
                 f"{name} failed: "
@@ -1300,9 +1476,7 @@ def place_tp_sl(
         sl_params
     )
 
-    if sl_result.get(
-        "code"
-    ) != 0:
+    if sl_result.get("code") != 0:
 
         raise RuntimeError(
             f"SL failed: "
@@ -1316,7 +1490,7 @@ def place_tp_sl(
 
 
 # =========================================================
-# MONITOR LIMIT ORDER
+# LINE ORDER MONITOR
 # =========================================================
 
 def monitor_limit_order(
@@ -1344,9 +1518,7 @@ def monitor_limit_order(
                 client_order_id
             )
 
-            if result.get(
-                "code"
-            ) != 0:
+            if result.get("code") != 0:
 
                 raise RuntimeError(
                     str(result)
@@ -1358,12 +1530,8 @@ def monitor_limit_order(
             )
 
             if (
-                isinstance(
-                    order,
-                    dict
-                )
-                and "order"
-                in order
+                isinstance(order, dict)
+                and "order" in order
             ):
 
                 order = order["order"]
@@ -1436,7 +1604,7 @@ def monitor_limit_order(
 
 
 # =========================================================
-# EMA
+# INDICATORS
 # =========================================================
 
 def calculate_ema(
@@ -1449,9 +1617,7 @@ def calculate_ema(
         return None
 
     seed = (
-        sum(
-            values[:period]
-        )
+        sum(values[:period])
         / period
     )
 
@@ -1476,10 +1642,6 @@ def calculate_ema(
 
     return ema_value
 
-
-# =========================================================
-# RSI
-# =========================================================
 
 def calculate_rsi(
     closes,
@@ -1552,7 +1714,7 @@ def calculate_rsi(
 
 
 # =========================================================
-# GET KLINES
+# KLINES
 # =========================================================
 
 def get_klines(
@@ -1561,8 +1723,7 @@ def get_klines(
     limit=100
 ):
 
-    result = bingx_private_request(
-        "GET",
+    result = bingx_public_request(
         "/openApi/swap/v3/quote/klines",
         {
             "symbol":
@@ -1576,9 +1737,7 @@ def get_klines(
         }
     )
 
-    if result.get(
-        "code"
-    ) != 0:
+    if result.get("code") != 0:
 
         raise RuntimeError(
             f"Kline failed: "
@@ -1678,20 +1837,44 @@ def get_klines(
 
 
 # =========================================================
-# GET ALL CONTRACTS
+# SYMBOL FILTER
 # =========================================================
+
+def valid_scanner_symbol(symbol):
+
+    symbol = str(
+        symbol
+    ).upper()
+
+    match = re.fullmatch(
+        r"([A-Z0-9]{1,24})-USDT",
+        symbol
+    )
+
+    if not match:
+
+        return False
+
+    base = match.group(1)
+
+    # Reject malformed symbols such as
+    # ABCUSDT-USDT
+    if base.endswith(
+        "USDT"
+    ):
+
+        return False
+
+    return True
+
 
 def get_all_usdt_contracts():
 
-    result = bingx_private_request(
-        "GET",
-        "/openApi/swap/v2/quote/contracts",
-        {}
+    result = bingx_public_request(
+        "/openApi/swap/v2/quote/contracts"
     )
 
-    if result.get(
-        "code"
-    ) != 0:
+    if result.get("code") != 0:
 
         raise RuntimeError(
             f"Contract list failed: "
@@ -1712,25 +1895,8 @@ def get_all_usdt_contracts():
             )
         ).upper()
 
-        if not symbol.endswith(
-            "-USDT"
-        ):
-
-            continue
-
-        status = item.get(
-            "status",
-            None
-        )
-
-        if (
-            status is not None
-            and str(status)
-            in [
-                "0",
-                "false",
-                "False"
-            ]
+        if not valid_scanner_symbol(
+            symbol
         ):
 
             continue
@@ -1747,12 +1913,312 @@ def get_all_usdt_contracts():
 
 
 # =========================================================
-# ANALYZE 15M
+# FAST 5M ANALYSIS
 # =========================================================
 
-def analyze_15m(
+def analyze_fast_5m(
     symbol
 ):
+
+    candles = get_klines(
+        symbol,
+        "5m",
+        90
+    )
+
+    if len(candles) < 60:
+
+        return None
+
+    completed = candles[:-1]
+
+    if len(completed) < 55:
+
+        return None
+
+    closes = [
+        x["close"]
+        for x in completed
+    ]
+
+    highs = [
+        x["high"]
+        for x in completed
+    ]
+
+    lows = [
+        x["low"]
+        for x in completed
+    ]
+
+    volumes = [
+        x["volume"]
+        for x in completed
+    ]
+
+    price = closes[-1]
+
+    ema9 = calculate_ema(
+        closes,
+        9
+    )
+
+    ema20 = calculate_ema(
+        closes,
+        20
+    )
+
+    rsi = calculate_rsi(
+        closes,
+        14
+    )
+
+    if (
+        ema9 is None
+        or ema20 is None
+        or rsi is None
+    ):
+
+        return None
+
+    momentum_15m = (
+        (
+            price
+            - closes[-4]
+        )
+        / closes[-4]
+        * 100
+    )
+
+    momentum_1h = (
+        (
+            price
+            - closes[-13]
+        )
+        / closes[-13]
+        * 100
+    )
+
+    previous_volumes = (
+        volumes[-21:-1]
+    )
+
+    avg_volume = (
+        sum(previous_volumes)
+        / len(previous_volumes)
+        if previous_volumes
+        else 0
+    )
+
+    volume_ratio = (
+        volumes[-1]
+        / avg_volume
+        if avg_volume > 0
+        else 0
+    )
+
+    previous_high = max(
+        highs[-21:-1]
+    )
+
+    breakout = (
+        price
+        > previous_high
+    )
+
+    recent_high = max(
+        highs[-6:]
+    )
+
+    recent_low = min(
+        lows[-6:]
+    )
+
+    volatility_pct = (
+        (
+            recent_high
+            - recent_low
+        )
+        / price
+        * 100
+    )
+
+    extension_pct = (
+        (
+            price
+            - ema20
+        )
+        / ema20
+        * 100
+    )
+
+    # -----------------------------------------------------
+    # Breakout score
+    # -----------------------------------------------------
+
+    breakout_score = 0
+    breakout_reasons = []
+
+    if volume_ratio >= 1.5:
+
+        breakout_score += 15
+
+    if volume_ratio >= 2.0:
+
+        breakout_score += 15
+
+        breakout_reasons.append(
+            f"5m量能{volume_ratio:.2f}x"
+        )
+
+    if volume_ratio >= 3.0:
+
+        breakout_score += 10
+
+    if momentum_15m >= 0.8:
+
+        breakout_score += 10
+
+    if momentum_15m >= 1.5:
+
+        breakout_score += 15
+
+        breakout_reasons.append(
+            f"15分鐘+{momentum_15m:.2f}%"
+        )
+
+    if momentum_15m >= 3.0:
+
+        breakout_score += 10
+
+    if breakout:
+
+        breakout_score += 20
+
+        breakout_reasons.append(
+            "5m突破20根高點"
+        )
+
+    if (
+        rsi >= 55
+        and rsi <= 85
+    ):
+
+        breakout_score += 10
+
+    if volatility_pct >= 2:
+
+        breakout_score += 5
+
+    if volatility_pct >= 4:
+
+        breakout_score += 5
+
+        breakout_reasons.append(
+            f"波動擴張{volatility_pct:.2f}%"
+        )
+
+    if extension_pct > 10:
+
+        breakout_score -= 15
+
+    if rsi > 92:
+
+        breakout_score -= 20
+
+    # -----------------------------------------------------
+    # Trend seed score
+    # -----------------------------------------------------
+
+    trend_seed = 0
+    trend_reasons = []
+
+    if price > ema9:
+
+        trend_seed += 10
+
+    if ema9 > ema20:
+
+        trend_seed += 15
+
+        trend_reasons.append(
+            "5m EMA9>EMA20"
+        )
+
+    if momentum_1h > 0.5:
+
+        trend_seed += 10
+
+    if (
+        rsi >= 50
+        and rsi <= 75
+    ):
+
+        trend_seed += 10
+
+    if volume_ratio >= 1.2:
+
+        trend_seed += 5
+
+    fast_score = max(
+        trend_seed,
+        breakout_score
+    )
+
+    return {
+        "symbol":
+            symbol,
+
+        "price":
+            price,
+
+        "rsi_5m":
+            rsi,
+
+        "volume_ratio_5m":
+            volume_ratio,
+
+        "momentum_5m":
+            momentum_15m,
+
+        "momentum_1h_fast":
+            momentum_1h,
+
+        "volatility_pct":
+            volatility_pct,
+
+        "extension_pct":
+            extension_pct,
+
+        "breakout_5m":
+            breakout,
+
+        "breakout_score_fast":
+            breakout_score,
+
+        "trend_seed":
+            trend_seed,
+
+        "fast_score":
+            fast_score,
+
+        "breakout_reasons":
+            breakout_reasons,
+
+        "trend_reasons":
+            trend_reasons,
+    }
+
+
+# =========================================================
+# DETAILED 15M
+# =========================================================
+
+def analyze_15m_detail(
+    fast
+):
+
+    symbol = fast["symbol"]
 
     candles = get_klines(
         symbol,
@@ -1764,12 +2230,7 @@ def analyze_15m(
 
         return None
 
-    # Ignore current unfinished candle
     completed = candles[:-1]
-
-    if len(completed) < 55:
-
-        return None
 
     closes = [
         x["close"]
@@ -1811,11 +2272,7 @@ def analyze_15m(
 
         return None
 
-    if len(closes) < 6:
-
-        return None
-
-    momentum_pct = (
+    momentum = (
         (
             price
             - closes[-6]
@@ -1835,10 +2292,8 @@ def analyze_15m(
         else 0
     )
 
-    last_volume = volumes[-1]
-
     volume_ratio = (
-        last_volume
+        volumes[-1]
         / avg_volume
         if avg_volume > 0
         else 0
@@ -1848,27 +2303,44 @@ def analyze_15m(
         highs[-21:-1]
     )
 
-    breakout = (
+    breakout_15m = (
         price
         > previous_high
     )
 
-    score = 0
-    reasons = []
+    extension_15m = (
+        (
+            price
+            - ema20
+        )
+        / ema20
+        * 100
+    )
+
+    # -----------------------------------------------------
+    # TREND SCORE
+    # -----------------------------------------------------
+
+    trend_score = 0
+    trend_reasons = list(
+        fast[
+            "trend_reasons"
+        ]
+    )
 
     if price > ema20:
 
-        score += 15
+        trend_score += 15
 
-        reasons.append(
+        trend_reasons.append(
             "15m價格>EMA20"
         )
 
     if ema20 > ema50:
 
-        score += 20
+        trend_score += 20
 
-        reasons.append(
+        trend_reasons.append(
             "15m EMA20>EMA50"
         )
 
@@ -1877,74 +2349,218 @@ def analyze_15m(
         and rsi <= 68
     ):
 
-        score += 10
+        trend_score += 15
 
-        reasons.append(
-            f"RSI={rsi:.1f}"
+        trend_reasons.append(
+            f"15m RSI={rsi:.1f}"
         )
 
-    elif rsi > 75:
+    elif (
+        rsi > 68
+        and rsi < 80
+    ):
 
-        score -= 10
+        trend_score += 5
 
-        reasons.append(
-            f"RSI過熱={rsi:.1f}"
+    if momentum > 0.3:
+
+        trend_score += 5
+
+    if momentum > 1:
+
+        trend_score += 10
+
+        trend_reasons.append(
+            f"15m動能+{momentum:.2f}%"
         )
 
-    if momentum_pct > 1:
+    if volume_ratio >= 1.3:
 
-        score += 10
+        trend_score += 10
 
-        reasons.append(
-            f"短線+{momentum_pct:.2f}%"
+    if volume_ratio >= 1.8:
+
+        trend_score += 5
+
+        trend_reasons.append(
+            f"15m量能{volume_ratio:.2f}x"
         )
 
-    elif momentum_pct > 0.3:
+    if breakout_15m:
 
-        score += 5
+        trend_score += 15
+
+        trend_reasons.append(
+            "15m突破"
+        )
+
+    # Normal trend strategy:
+    # hard reject extreme overbought.
+    trend_blocked = False
+
+    if rsi >= 80:
+
+        trend_blocked = True
+
+        trend_reasons.append(
+            "趨勢策略阻擋: RSI>=80"
+        )
+
+    if extension_15m >= 10:
+
+        trend_blocked = True
+
+        trend_reasons.append(
+            "趨勢策略阻擋: 乖離過大"
+        )
+
+    # -----------------------------------------------------
+    # BREAKOUT SCORE
+    # -----------------------------------------------------
+
+    breakout_score = int(
+        fast[
+            "breakout_score_fast"
+        ]
+    )
+
+    breakout_reasons = list(
+        fast[
+            "breakout_reasons"
+        ]
+    )
 
     if volume_ratio >= 1.5:
 
-        score += 15
+        breakout_score += 10
 
-        reasons.append(
-            f"量能={volume_ratio:.2f}x"
+    if breakout_15m:
+
+        breakout_score += 10
+
+        breakout_reasons.append(
+            "15m同步突破"
         )
 
-    if volume_ratio >= 2:
+    if momentum > 1:
 
-        score += 5
+        breakout_score += 5
 
-    if breakout:
+    if (
+        price > ema20
+    ):
 
-        score += 15
+        breakout_score += 5
 
-        reasons.append(
-            "突破20根高點"
+    breakout_blocked = False
+
+    # Explosion strategy can tolerate
+    # higher RSI than TREND,
+    # but not extreme late chasing.
+    if fast[
+        "rsi_5m"
+    ] > 90:
+
+        breakout_blocked = True
+
+        breakout_reasons.append(
+            "爆發策略阻擋: 5m RSI>90"
         )
 
-    return {
-        "symbol": symbol,
-        "price": price,
-        "score": score,
-        "rsi": rsi,
-        "volume_ratio":
-            volume_ratio,
-        "momentum_pct":
-            momentum_pct,
-        "breakout":
-            breakout,
-        "ema20":
-            ema20,
-        "ema50":
-            ema50,
-        "reasons":
-            reasons,
-    }
+    if fast[
+        "extension_pct"
+    ] > 9:
+
+        breakout_blocked = True
+
+        breakout_reasons.append(
+            "爆發策略阻擋: 5m乖離過大"
+        )
+
+    # A breakout signal must genuinely have
+    # volume + movement + breakout.
+    if fast[
+        "volume_ratio_5m"
+    ] < 1.8:
+
+        breakout_blocked = True
+
+    if fast[
+        "momentum_5m"
+    ] < 1.0:
+
+        breakout_blocked = True
+
+    if not fast[
+        "breakout_5m"
+    ]:
+
+        breakout_blocked = True
+
+    result = dict(
+        fast
+    )
+
+    result.update(
+        {
+            "price":
+                price,
+
+            "rsi":
+                rsi,
+
+            "volume_ratio":
+                volume_ratio,
+
+            "momentum_pct":
+                momentum,
+
+            "breakout":
+                (
+                    fast[
+                        "breakout_5m"
+                    ]
+                    or breakout_15m
+                ),
+
+            "trend_15m":
+                (
+                    "UP"
+                    if (
+                        price > ema20
+                        and ema20 > ema50
+                    )
+                    else "DOWN"
+                ),
+
+            "trend_score":
+                trend_score,
+
+            "breakout_score":
+                breakout_score,
+
+            "trend_blocked":
+                trend_blocked,
+
+            "breakout_blocked":
+                breakout_blocked,
+
+            "trend_reasons_final":
+                trend_reasons,
+
+            "breakout_reasons_final":
+                breakout_reasons,
+
+            "extension_15m":
+                extension_15m,
+        }
+    )
+
+    return result
 
 
 # =========================================================
-# CONFIRM 1H
+# 1H CONFIRMATION
 # =========================================================
 
 def confirm_1h(
@@ -2005,14 +2621,18 @@ def confirm_1h(
         ] = "UP"
 
         result[
-            "score"
-        ] += 10
+            "trend_score"
+        ] += 15
 
         result[
-            "reasons"
+            "trend_reasons_final"
         ].append(
             "1h多頭確認"
         )
+
+        result[
+            "breakout_score"
+        ] += 5
 
     elif price > ema20:
 
@@ -2021,7 +2641,7 @@ def confirm_1h(
         ] = "WEAK_UP"
 
         result[
-            "score"
+            "trend_score"
         ] += 5
 
     else:
@@ -2030,11 +2650,123 @@ def confirm_1h(
             "trend_1h"
         ] = "DOWN"
 
+        result[
+            "trend_score"
+        ] -= 10
+
     return result
 
 
 # =========================================================
-# DB HELPERS
+# STRATEGY DECISION
+# =========================================================
+
+def choose_strategy(
+    result
+):
+
+    trend_ok = (
+        not result.get(
+            "trend_blocked",
+            True
+        )
+        and result[
+            "trend_score"
+        ] >= SCANNER_MIN_TREND_SCORE
+        and result.get(
+            "trend_1h",
+            "UNKNOWN"
+        ) in [
+            "UP",
+            "WEAK_UP"
+        ]
+    )
+
+    breakout_ok = (
+        not result.get(
+            "breakout_blocked",
+            True
+        )
+        and result[
+            "breakout_score"
+        ] >= SCANNER_MIN_BREAKOUT_SCORE
+    )
+
+    if (
+        trend_ok
+        and breakout_ok
+    ):
+
+        if (
+            result[
+                "breakout_score"
+            ]
+            > result[
+                "trend_score"
+            ]
+        ):
+
+            strategy = (
+                "BREAKOUT"
+            )
+
+        else:
+
+            strategy = (
+                "TREND"
+            )
+
+    elif trend_ok:
+
+        strategy = "TREND"
+
+    elif breakout_ok:
+
+        strategy = (
+            "BREAKOUT"
+        )
+
+    else:
+
+        return None
+
+    result[
+        "strategy"
+    ] = strategy
+
+    if strategy == "TREND":
+
+        result[
+            "score"
+        ] = result[
+            "trend_score"
+        ]
+
+        result[
+            "reasons"
+        ] = result[
+            "trend_reasons_final"
+        ]
+
+    else:
+
+        result[
+            "score"
+        ] = result[
+            "breakout_score"
+        ]
+
+        result[
+            "reasons"
+        ] = result[
+            "breakout_reasons_final"
+        ]
+
+    return result
+
+
+# =========================================================
+# SCANNER DATABASE HELPERS
 # =========================================================
 
 def scanner_open_count():
@@ -2046,7 +2778,9 @@ def scanner_open_count():
         """
         SELECT COUNT(*)
         FROM scanner_trades
-        WHERE status = 'OPEN';
+        WHERE status = 'OPEN'
+        AND strategy
+        IN ('TREND', 'BREAKOUT');
         """
     )
 
@@ -2070,6 +2804,8 @@ def scanner_can_open(
         SELECT id
         FROM scanner_trades
         WHERE symbol = %s
+        AND strategy
+        IN ('TREND', 'BREAKOUT')
         AND (
             status = 'OPEN'
             OR signal_time >
@@ -2135,19 +2871,34 @@ def create_simulated_trade(
         INSERT INTO scanner_trades (
             symbol,
             side,
+            strategy,
             entry_price,
+
             score,
+            trend_score,
+            breakout_score,
+
             rsi,
+            rsi_5m,
+
             volume_ratio,
             momentum_pct,
+            momentum_5m,
+
+            volatility_pct,
+            extension_pct,
+
             trend_15m,
             trend_1h,
+
             breakout,
             reasons,
+
             tp1,
             tp2,
             tp3,
             sl,
+
             highest_price,
             lowest_price
         )
@@ -2156,17 +2907,32 @@ def create_simulated_trade(
             'LONG',
             %s,
             %s,
+
             %s,
             %s,
             %s,
-            'UP',
+
+            %s,
+            %s,
+
+            %s,
+            %s,
+            %s,
+
+            %s,
+            %s,
+
+            %s,
+            %s,
+
+            %s,
+            %s,
+
             %s,
             %s,
             %s,
             %s,
-            %s,
-            %s,
-            %s,
+
             %s,
             %s
         )
@@ -2174,32 +2940,41 @@ def create_simulated_trade(
         """,
         (
             result["symbol"],
+            result["strategy"],
             entry,
+
             result["score"],
+            result["trend_score"],
+            result["breakout_score"],
+
             result["rsi"],
-            result[
-                "volume_ratio"
-            ],
-            result[
-                "momentum_pct"
-            ],
+            result["rsi_5m"],
+
+            result["volume_ratio"],
+            result["momentum_pct"],
+            result["momentum_5m"],
+
+            result["volatility_pct"],
+            result["extension_pct"],
+
+            result["trend_15m"],
             result.get(
                 "trend_1h",
                 "UNKNOWN"
             ),
-            result[
-                "breakout"
-            ],
+
+            result["breakout"],
+
             json.dumps(
-                result[
-                    "reasons"
-                ],
+                result["reasons"],
                 ensure_ascii=False
             ),
+
             tp1,
             tp2,
             tp3,
             sl,
+
             entry,
             entry,
         )
@@ -2214,8 +2989,9 @@ def create_simulated_trade(
     conn.close()
 
     print(
-        "SIMULATED TRADE CREATED:",
+        "SIMULATED V2 TRADE:",
         trade_id,
+        result["strategy"],
         result["symbol"],
         result["score"],
         flush=True
@@ -2225,7 +3001,7 @@ def create_simulated_trade(
 
 
 # =========================================================
-# FULL MARKET SCANNER
+# MARKET SCANNER
 # =========================================================
 
 def run_market_scan():
@@ -2239,6 +3015,10 @@ def run_market_scan():
             scanner_status[
                 "running"
             ] = True
+
+            scanner_status[
+                "phase"
+            ] = "FAST_5M"
 
             scanner_status[
                 "started_at"
@@ -2255,7 +3035,19 @@ def run_market_scan():
             ] = 0
 
             scanner_status[
-                "candidates"
+                "detail_total"
+            ] = 0
+
+            scanner_status[
+                "detail_processed"
+            ] = 0
+
+            scanner_status[
+                "trend_candidates"
+            ] = 0
+
+            scanner_status[
+                "breakout_candidates"
             ] = 0
 
             scanner_status[
@@ -2280,14 +3072,14 @@ def run_market_scan():
                 "total"
             ] = len(symbols)
 
-        print(
-            "SCANNER START:",
-            len(symbols),
-            "symbols",
-            flush=True
-        )
+        fast_results = []
 
-        results = []
+        # -------------------------------------------------
+        # PHASE 1:
+        # Every valid coin gets a 5m scan.
+        # This is what catches weak coins
+        # that suddenly start moving.
+        # -------------------------------------------------
 
         for index, symbol in enumerate(
             symbols
@@ -2305,20 +3097,20 @@ def run_market_scan():
 
             try:
 
-                result = analyze_15m(
+                result = analyze_fast_5m(
                     symbol
                 )
 
                 if result:
 
-                    results.append(
+                    fast_results.append(
                         result
                     )
 
             except Exception as e:
 
                 print(
-                    "SCAN SYMBOL ERROR:",
+                    "FAST SCAN ERROR:",
                     symbol,
                     str(e),
                     flush=True
@@ -2334,19 +3126,151 @@ def run_market_scan():
                 SCANNER_API_DELAY
             )
 
-        results.sort(
+        fast_results.sort(
             key=lambda x:
-                x["score"],
+                x["fast_score"],
             reverse=True
         )
 
-        # Only spend extra API calls
-        # on strongest 15m candidates
-        top_for_1h = results[:30]
+        # -------------------------------------------------
+        # Candidate construction
+        #
+        # Top overall movers are included,
+        # plus anything with unusual breakout activity.
+        # Therefore weak coins are NOT automatically removed.
+        # -------------------------------------------------
 
-        confirmed = []
+        detail_map = {}
 
-        for result in top_for_1h:
+        for item in fast_results[
+            :FAST_DETAIL_LIMIT
+        ]:
+
+            detail_map[
+                item["symbol"]
+            ] = item
+
+        for item in fast_results:
+
+            if (
+                item[
+                    "breakout_score_fast"
+                ]
+                >= BREAKOUT_FORCE_SCORE
+            ):
+
+                detail_map[
+                    item["symbol"]
+                ] = item
+
+        detail_list = list(
+            detail_map.values()
+        )
+
+        detail_list.sort(
+            key=lambda x:
+                x["fast_score"],
+            reverse=True
+        )
+
+        detail_list = detail_list[
+            :MAX_DETAIL_SYMBOLS
+        ]
+
+        with scanner_lock:
+
+            scanner_status[
+                "phase"
+            ] = "DETAIL_15M"
+
+            scanner_status[
+                "detail_total"
+            ] = len(detail_list)
+
+            scanner_status[
+                "detail_processed"
+            ] = 0
+
+        detailed = []
+
+        # -------------------------------------------------
+        # PHASE 2: 15m detailed analysis
+        # -------------------------------------------------
+
+        for index, fast in enumerate(
+            detail_list
+        ):
+
+            with scanner_lock:
+
+                scanner_status[
+                    "current_symbol"
+                ] = fast["symbol"]
+
+            try:
+
+                result = (
+                    analyze_15m_detail(
+                        fast
+                    )
+                )
+
+                if result:
+
+                    detailed.append(
+                        result
+                    )
+
+            except Exception as e:
+
+                print(
+                    "DETAIL ERROR:",
+                    fast["symbol"],
+                    str(e),
+                    flush=True
+                )
+
+            with scanner_lock:
+
+                scanner_status[
+                    "detail_processed"
+                ] = index + 1
+
+            time.sleep(
+                SCANNER_API_DELAY
+            )
+
+        # -------------------------------------------------
+        # PHASE 3:
+        # 1h confirmation for strongest detailed results
+        # -------------------------------------------------
+
+        detailed.sort(
+            key=lambda x:
+                max(
+                    x[
+                        "trend_score"
+                    ],
+                    x[
+                        "breakout_score"
+                    ]
+                ),
+            reverse=True
+        )
+
+        one_hour_targets = detailed[
+            :ONE_HOUR_CONFIRM_LIMIT
+        ]
+
+        confirmed_map = {}
+
+        with scanner_lock:
+
+            scanner_status[
+                "phase"
+            ] = "CONFIRM_1H"
+
+        for result in one_hour_targets:
 
             try:
 
@@ -2354,46 +3278,97 @@ def run_market_scan():
                     result
                 )
 
-                confirmed.append(
-                    result
-                )
-
             except Exception as e:
 
                 print(
-                    "1H CONFIRM ERROR:",
+                    "1H ERROR:",
                     result["symbol"],
                     str(e),
                     flush=True
                 )
 
+                result[
+                    "trend_1h"
+                ] = "UNKNOWN"
+
+            confirmed_map[
+                result["symbol"]
+            ] = result
+
             time.sleep(
                 SCANNER_API_DELAY
             )
 
-        confirmed.sort(
+        # Anything not in top 1h list
+        # remains UNKNOWN.
+        for result in detailed:
+
+            if (
+                result["symbol"]
+                not in confirmed_map
+            ):
+
+                result[
+                    "trend_1h"
+                ] = "UNKNOWN"
+
+                confirmed_map[
+                    result["symbol"]
+                ] = result
+
+        qualified = []
+
+        for result in confirmed_map.values():
+
+            chosen = choose_strategy(
+                result
+            )
+
+            if chosen:
+
+                qualified.append(
+                    chosen
+                )
+
+        qualified.sort(
             key=lambda x:
                 x["score"],
             reverse=True
         )
 
-        qualified = [
-            x
-            for x in confirmed
-            if x[
-                "score"
-            ] >= SCANNER_MIN_SCORE
-        ]
+        trend_count = len(
+            [
+                x
+                for x in qualified
+                if x[
+                    "strategy"
+                ] == "TREND"
+            ]
+        )
+
+        breakout_count = len(
+            [
+                x
+                for x in qualified
+                if x[
+                    "strategy"
+                ] == "BREAKOUT"
+            ]
+        )
 
         with scanner_lock:
 
             scanner_status[
-                "candidates"
-            ] = len(qualified)
+                "trend_candidates"
+            ] = trend_count
+
+            scanner_status[
+                "breakout_candidates"
+            ] = breakout_count
 
             scanner_status[
                 "top_results"
-            ] = qualified[:10]
+            ] = qualified[:15]
 
         created = 0
 
@@ -2437,9 +3412,17 @@ def run_market_scan():
                 "%Y-%m-%d %H:%M:%S"
             )
 
+            scanner_status[
+                "phase"
+            ] = "DONE"
+
         print(
-            "SCANNER FINISHED:",
-            "created",
+            "SCANNER V2 FINISHED:",
+            "Trend:",
+            trend_count,
+            "Breakout:",
+            breakout_count,
+            "Created:",
             created,
             flush=True
         )
@@ -2458,6 +3441,10 @@ def run_market_scan():
                 "error"
             ] = str(e)
 
+            scanner_status[
+                "phase"
+            ] = "ERROR"
+
     finally:
 
         with scanner_lock:
@@ -2472,20 +3459,16 @@ def run_market_scan():
 
 
 # =========================================================
-# GET ALL CURRENT PRICES
+# CURRENT PRICES
 # =========================================================
 
 def get_all_prices():
 
-    result = bingx_private_request(
-        "GET",
-        "/openApi/swap/v1/ticker/price",
-        {}
+    result = bingx_public_request(
+        "/openApi/swap/v1/ticker/price"
     )
 
-    if result.get(
-        "code"
-    ) != 0:
+    if result.get("code") != 0:
 
         raise RuntimeError(
             f"Price query failed: "
@@ -2510,9 +3493,9 @@ def get_all_prices():
 
         try:
 
-            symbol = item[
-                "symbol"
-            ]
+            symbol = (
+                item["symbol"]
+            )
 
             price = float(
                 item["price"]
@@ -2530,7 +3513,7 @@ def get_all_prices():
 
 
 # =========================================================
-# SIMULATED TRADE MONITOR
+# SIMULATION MONITOR
 # =========================================================
 
 def update_simulated_trades():
@@ -2612,8 +3595,6 @@ def update_simulated_trades():
             or price >= tp3
         )
 
-        # If TP3 is hit,
-        # TP1 and TP2 were necessarily crossed
         if new_tp3:
 
             new_tp1 = True
@@ -2633,9 +3614,6 @@ def update_simulated_trades():
 
         if new_tp3:
 
-            # 30% at +2%
-            # 40% at +4%
-            # 30% at +8%
             result_pct = (
                 (
                     TP1_PCT
@@ -2715,12 +3693,16 @@ def update_simulated_trades():
                     tp2_hit = %s,
                     tp3_hit = %s,
                     sl_hit = %s,
+
                     highest_price = %s,
                     lowest_price = %s,
+
                     exit_price = %s,
                     result_pct = %s,
+
                     status = %s,
                     closed_at = NOW()
+
                 WHERE id = %s;
                 """,
                 (
@@ -2728,10 +3710,13 @@ def update_simulated_trades():
                     new_tp2,
                     new_tp3,
                     sl_hit,
+
                     highest_price,
                     lowest_price,
+
                     price,
                     result_pct,
+
                     status,
                     trade_id,
                 )
@@ -2746,16 +3731,20 @@ def update_simulated_trades():
                     tp1_hit = %s,
                     tp2_hit = %s,
                     tp3_hit = %s,
+
                     highest_price = %s,
                     lowest_price = %s
+
                 WHERE id = %s;
                 """,
                 (
                     new_tp1,
                     new_tp2,
                     new_tp3,
+
                     highest_price,
                     lowest_price,
+
                     trade_id,
                 )
             )
@@ -2865,6 +3854,8 @@ def scan_now():
 
             return (
                 "SCANNER ALREADY RUNNING | "
+                f"PHASE="
+                f"{scanner_status['phase']} | "
                 f"{scanner_status['processed']}/"
                 f"{scanner_status['total']} | "
                 f"{scanner_status['current_symbol']}",
@@ -2884,9 +3875,10 @@ def scan_now():
     thread.start()
 
     return (
-        "SCANNER STARTED | "
-        "This is simulation only. "
-        "No real scanner order will be placed.",
+        "SCANNER V2 STARTED | "
+        "TREND + BREAKOUT | "
+        "SIMULATION ONLY | "
+        "NO REAL SCANNER ORDER",
         200
     )
 
@@ -2910,11 +3902,11 @@ def scanner_status_page():
     lines = []
 
     lines.append(
-        "BingX Scanner"
+        "BingX Scanner V2"
     )
 
     lines.append(
-        "===================="
+        "================================"
     )
 
     lines.append(
@@ -2923,9 +3915,20 @@ def scanner_status_page():
     )
 
     lines.append(
-        f"Progress: "
+        f"Phase: "
+        f"{status['phase']}"
+    )
+
+    lines.append(
+        f"Fast 5m: "
         f"{status['processed']}/"
         f"{status['total']}"
+    )
+
+    lines.append(
+        f"Detail 15m: "
+        f"{status['detail_processed']}/"
+        f"{status['detail_total']}"
     )
 
     lines.append(
@@ -2933,15 +3936,24 @@ def scanner_status_page():
         f"{status['current_symbol']}"
     )
 
+    lines.append("")
+
     lines.append(
-        f"Candidates: "
-        f"{status['candidates']}"
+        f"TREND candidates: "
+        f"{status['trend_candidates']}"
+    )
+
+    lines.append(
+        f"BREAKOUT candidates: "
+        f"{status['breakout_candidates']}"
     )
 
     lines.append(
         f"New simulated trades: "
         f"{status['new_trades']}"
     )
+
+    lines.append("")
 
     lines.append(
         f"Started: "
@@ -2953,9 +3965,7 @@ def scanner_status_page():
         f"{status['finished_at']}"
     )
 
-    if status[
-        "error"
-    ]:
+    if status["error"]:
 
         lines.append(
             f"ERROR: "
@@ -2968,7 +3978,7 @@ def scanner_status_page():
     )
 
     lines.append(
-        "===================="
+        "================================"
     )
 
     for item in status[
@@ -2977,11 +3987,32 @@ def scanner_status_page():
 
         lines.append(
             f"{item['symbol']} | "
+            f"{item['strategy']} | "
             f"Score {item['score']} | "
-            f"RSI {item['rsi']:.1f} | "
-            f"Volume {item['volume_ratio']:.2f}x | "
-            f"Momentum {item['momentum_pct']:.2f}% | "
-            f"1H {item.get('trend_1h')}"
+            f"Trend {item['trend_score']} | "
+            f"Breakout {item['breakout_score']}"
+        )
+
+        lines.append(
+            f"5m RSI "
+            f"{item['rsi_5m']:.1f} | "
+            f"15m RSI "
+            f"{item['rsi']:.1f} | "
+            f"5m Vol "
+            f"{item['volume_ratio_5m']:.2f}x | "
+            f"5m Momentum "
+            f"{item['momentum_5m']:.2f}%"
+        )
+
+        lines.append(
+            f"15m Momentum "
+            f"{item['momentum_pct']:.2f}% | "
+            f"1H "
+            f"{item.get('trend_1h')}"
+        )
+
+        lines.append(
+            "--------------------------------"
         )
 
     return (
@@ -3010,23 +4041,37 @@ def scanner_trades_page():
         SELECT
             id,
             symbol,
+            strategy,
             signal_time,
+
             entry_price,
+
             score,
+            trend_score,
+            breakout_score,
+
             rsi,
+            rsi_5m,
+
             volume_ratio,
             momentum_pct,
+            momentum_5m,
+
             tp1,
             tp2,
             tp3,
             sl,
+
             tp1_hit,
             tp2_hit,
             tp3_hit,
             sl_hit,
+
             status,
             result_pct
+
         FROM scanner_trades
+
         ORDER BY id DESC
         LIMIT 100;
         """
@@ -3044,7 +4089,7 @@ def scanner_trades_page():
     )
 
     lines.append(
-        "=================================================="
+        "================================================"
     )
 
     for row in rows:
@@ -3052,20 +4097,32 @@ def scanner_trades_page():
         (
             trade_id,
             symbol,
+            strategy,
             signal_time,
+
             entry,
+
             score,
+            trend_score,
+            breakout_score,
+
             rsi,
+            rsi_5m,
+
             volume_ratio,
             momentum,
+            momentum_5m,
+
             tp1,
             tp2,
             tp3,
             sl,
+
             tp1_hit,
             tp2_hit,
             tp3_hit,
             sl_hit,
+
             status,
             result_pct
         ) = row
@@ -3073,6 +4130,7 @@ def scanner_trades_page():
         lines.append(
             f"#{trade_id} "
             f"{symbol} | "
+            f"{strategy} | "
             f"{status}"
         )
 
@@ -3087,14 +4145,26 @@ def scanner_trades_page():
         )
 
         lines.append(
-            f"Score: "
-            f"{score} | "
-            f"RSI: "
-            f"{rsi:.1f} | "
-            f"Vol: "
-            f"{volume_ratio:.2f}x | "
-            f"Momentum: "
-            f"{momentum:.2f}%"
+            f"Score: {score} | "
+            f"Trend: {trend_score} | "
+            f"Breakout: {breakout_score}"
+        )
+
+        lines.append(
+            f"RSI 15m: {rsi} | "
+            f"RSI 5m: {rsi_5m}"
+        )
+
+        lines.append(
+            f"15m Vol: "
+            f"{volume_ratio} | "
+            f"15m Momentum: "
+            f"{momentum}%"
+        )
+
+        lines.append(
+            f"5m Momentum: "
+            f"{momentum_5m}%"
         )
 
         lines.append(
@@ -3123,7 +4193,7 @@ def scanner_trades_page():
         )
 
         lines.append(
-            "--------------------------------------------------"
+            "------------------------------------------------"
         )
 
     return (
@@ -3150,7 +4220,9 @@ def scanner_stats_page():
     cur.execute(
         """
         SELECT COUNT(*)
-        FROM scanner_trades;
+        FROM scanner_trades
+        WHERE strategy
+        IN ('TREND', 'BREAKOUT');
         """
     )
 
@@ -3160,7 +4232,9 @@ def scanner_stats_page():
         """
         SELECT COUNT(*)
         FROM scanner_trades
-        WHERE status = 'OPEN';
+        WHERE strategy
+        IN ('TREND', 'BREAKOUT')
+        AND status = 'OPEN';
         """
     )
 
@@ -3172,7 +4246,9 @@ def scanner_stats_page():
         """
         SELECT COUNT(*)
         FROM scanner_trades
-        WHERE status = 'WIN';
+        WHERE strategy
+        IN ('TREND', 'BREAKOUT')
+        AND status = 'WIN';
         """
     )
 
@@ -3182,7 +4258,9 @@ def scanner_stats_page():
         """
         SELECT COUNT(*)
         FROM scanner_trades
-        WHERE status = 'LOSS';
+        WHERE strategy
+        IN ('TREND', 'BREAKOUT')
+        AND status = 'LOSS';
         """
     )
 
@@ -3196,7 +4274,9 @@ def scanner_stats_page():
                 0
             )
         FROM scanner_trades
-        WHERE result_pct
+        WHERE strategy
+        IN ('TREND', 'BREAKOUT')
+        AND result_pct
         IS NOT NULL;
         """
     )
@@ -3209,55 +4289,38 @@ def scanner_stats_page():
     cur.execute(
         """
         SELECT
-            COALESCE(
-                SUM(result_pct),
-                0
-            )
+            strategy,
+            COUNT(*) AS total,
+
+            SUM(
+                CASE
+                    WHEN status = 'WIN'
+                    THEN 1
+                    ELSE 0
+                END
+            ) AS wins,
+
+            SUM(
+                CASE
+                    WHEN status = 'LOSS'
+                    THEN 1
+                    ELSE 0
+                END
+            ) AS losses
+
         FROM scanner_trades
-        WHERE result_pct
-        IS NOT NULL;
+
+        WHERE strategy
+        IN ('TREND', 'BREAKOUT')
+
+        GROUP BY strategy
+
+        ORDER BY strategy;
         """
     )
 
-    total_result = float(
-        cur.fetchone()[0]
-        or 0
-    )
-
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM scanner_trades
-        WHERE tp1_hit = TRUE;
-        """
-    )
-
-    tp1_hits = (
-        cur.fetchone()[0]
-    )
-
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM scanner_trades
-        WHERE tp2_hit = TRUE;
-        """
-    )
-
-    tp2_hits = (
-        cur.fetchone()[0]
-    )
-
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM scanner_trades
-        WHERE tp3_hit = TRUE;
-        """
-    )
-
-    tp3_hits = (
-        cur.fetchone()[0]
+    strategy_rows = (
+        cur.fetchall()
     )
 
     cur.execute(
@@ -3272,7 +4335,9 @@ def scanner_stats_page():
                     THEN '80-84'
                 ELSE '75-79'
             END AS bucket,
+
             COUNT(*) AS total,
+
             SUM(
                 CASE
                     WHEN status = 'WIN'
@@ -3280,6 +4345,7 @@ def scanner_stats_page():
                     ELSE 0
                 END
             ) AS wins,
+
             SUM(
                 CASE
                     WHEN status = 'LOSS'
@@ -3287,32 +4353,49 @@ def scanner_stats_page():
                     ELSE 0
                 END
             ) AS losses
+
         FROM scanner_trades
-        WHERE status
-        IN (
-            'WIN',
-            'LOSS'
-        )
+
+        WHERE strategy
+        IN ('TREND', 'BREAKOUT')
+
+        AND status
+        IN ('WIN', 'LOSS')
+
         GROUP BY bucket
+
         ORDER BY bucket DESC;
         """
     )
 
-    buckets = cur.fetchall()
+    score_rows = (
+        cur.fetchall()
+    )
+
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM scanner_trades
+        WHERE strategy = 'LEGACY_V1';
+        """
+    )
+
+    legacy_count = (
+        cur.fetchone()[0]
+    )
 
     cur.close()
     conn.close()
 
     closed = (
-        wins + losses
+        wins
+        + losses
     )
 
     win_rate = (
-        (
-            wins
-            / closed
-            * 100
-        )
+        wins
+        / closed
+        * 100
         if closed > 0
         else 0
     )
@@ -3320,15 +4403,15 @@ def scanner_stats_page():
     lines = []
 
     lines.append(
-        "BINGX SCANNER STATISTICS"
+        "BINGX SCANNER V2 STATISTICS"
     )
 
     lines.append(
-        "=============================="
+        "================================"
     )
 
     lines.append(
-        f"Total signals: {total}"
+        f"V2 Total: {total}"
     )
 
     lines.append(
@@ -3348,7 +4431,7 @@ def scanner_stats_page():
     )
 
     lines.append(
-        f"Win rate: "
+        f"Overall win rate: "
         f"{win_rate:.2f}%"
     )
 
@@ -3358,35 +4441,56 @@ def scanner_stats_page():
     )
 
     lines.append(
-        f"Sum result: "
-        f"{total_result:.2f}%"
+        f"Old V1 records excluded: "
+        f"{legacy_count}"
     )
 
     lines.append("")
 
     lines.append(
-        f"TP1 hits: "
-        f"{tp1_hits}"
+        "WIN RATE BY STRATEGY"
     )
 
     lines.append(
-        f"TP2 hits: "
-        f"{tp2_hits}"
+        "================================"
     )
 
-    lines.append(
-        f"TP3 hits: "
-        f"{tp3_hits}"
-    )
+    for (
+        strategy,
+        strategy_total,
+        strategy_wins,
+        strategy_losses
+    ) in strategy_rows:
+
+        resolved = (
+            strategy_wins
+            + strategy_losses
+        )
+
+        rate = (
+            strategy_wins
+            / resolved
+            * 100
+            if resolved > 0
+            else 0
+        )
+
+        lines.append(
+            f"{strategy}: "
+            f"{strategy_total} signals | "
+            f"{strategy_wins}W/"
+            f"{strategy_losses}L | "
+            f"{rate:.2f}%"
+        )
 
     lines.append("")
 
     lines.append(
-        "SCORE WIN RATE"
+        "WIN RATE BY SCORE"
     )
 
     lines.append(
-        "=============================="
+        "================================"
     )
 
     for (
@@ -3394,7 +4498,7 @@ def scanner_stats_page():
         bucket_total,
         bucket_wins,
         bucket_losses
-    ) in buckets:
+    ) in score_rows:
 
         resolved = (
             bucket_wins
@@ -3442,13 +4546,16 @@ def home():
 
     return (
         "<pre>"
-        "LINE BingX Bot\n"
-        "========================\n"
+        "LINE BingX Bot + Scanner V2\n"
+        "================================\n"
         f"LINE trading: {mode}\n"
-        f"Leverage: {LEVERAGE}x\n"
+        f"LINE leverage: {LEVERAGE}x\n"
         f"Database: "
         f"{'ON' if DATABASE_URL else 'OFF'}\n\n"
-        "Scanner: SIMULATION ONLY\n\n"
+
+        "Scanner trading: SIMULATION ONLY\n"
+        "Scanner strategies: TREND + BREAKOUT\n\n"
+
         "Pages:\n"
         "/db-test\n"
         "/scan-now\n"
@@ -3632,7 +4739,7 @@ def webhook():
             if not LIVE_TRADING:
 
                 print(
-                    "TEST MODE: "
+                    "LINE TEST MODE: "
                     "NO REAL ORDER",
                     flush=True
                 )
@@ -3692,7 +4799,10 @@ def webhook():
                 flush=True
             )
 
-    return "OK", 200
+    return (
+        "OK",
+        200
+    )
 
 
 # =========================================================
