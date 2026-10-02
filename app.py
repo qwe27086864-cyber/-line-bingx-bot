@@ -9,16 +9,13 @@ import json
 import urllib.request
 import urllib.parse
 
-
 app = Flask(__name__)
-
 
 # =========================
 # Environment Variables
 # =========================
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-
 BINGX_API_KEY = os.environ.get("BINGX_API_KEY", "")
 BINGX_SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "")
 
@@ -107,10 +104,67 @@ def parse_signal(text):
 
 
 # =========================
+# Check Required Fields
+# =========================
+
+def valid_signal(signal):
+    required = [
+        "symbol",
+        "side",
+        "entry",
+        "sl"
+    ]
+
+    for field in required:
+        if not signal.get(field):
+            return False
+
+    return True
+
+
+# =========================
+# Create DRY RUN Order
+# =========================
+
+def build_dry_run_order(signal):
+
+    symbol = signal["symbol"]
+
+    # BingX perpetual symbol format
+    bingx_symbol = f"{symbol}-USDT"
+
+    side = signal["side"]
+
+    if side == "LONG":
+        order_side = "BUY"
+        position_side = "LONG"
+
+    else:
+        order_side = "SELL"
+        position_side = "SHORT"
+
+    order = {
+        "dry_run": True,
+        "symbol": bingx_symbol,
+        "side": order_side,
+        "positionSide": position_side,
+        "orderType": "MARKET",
+        "entry_reference": signal["entry"],
+        "takeProfit1": signal["tp1"],
+        "takeProfit2": signal["tp2"],
+        "takeProfit3": signal["tp3"],
+        "stopLoss": signal["sl"],
+    }
+
+    return order
+
+
+# =========================
 # BingX API Signature
 # =========================
 
 def bingx_signature(params):
+
     query_string = urllib.parse.urlencode(
         sorted(params.items())
     )
@@ -126,7 +180,6 @@ def bingx_signature(params):
 
 # =========================
 # BingX Balance Test
-# NO ORDER WILL BE PLACED
 # =========================
 
 def bingx_get_balance():
@@ -204,7 +257,7 @@ def bingx_get_balance():
 @app.route("/", methods=["GET"])
 def home():
 
-    return "LINE BingX Bot is running", 200
+    return "LINE BingX Bot DRY RUN is running", 200
 
 
 # =========================
@@ -222,11 +275,10 @@ def webhook():
     )
 
     if not LINE_CHANNEL_SECRET:
-
         return "LINE_CHANNEL_SECRET not set", 500
 
 
-    # Verify LINE Signature
+    # Verify LINE signature
 
     digest = hmac.new(
         LINE_CHANNEL_SECRET.encode("utf-8"),
@@ -234,17 +286,14 @@ def webhook():
         hashlib.sha256
     ).digest()
 
-
     expected_signature = base64.b64encode(
         digest
     ).decode("utf-8")
-
 
     if not hmac.compare_digest(
         signature,
         expected_signature
     ):
-
         abort(400)
 
 
@@ -253,34 +302,23 @@ def webhook():
     ) or {}
 
 
-    # =========================
-    # Process LINE Messages
-    # =========================
-
-    for event in data.get(
-        "events",
-        []
-    ):
+    for event in data.get("events", []):
 
         if event.get("type") != "message":
             continue
-
 
         message = event.get(
             "message",
             {}
         )
 
-
         if message.get("type") != "text":
             continue
-
 
         text = message.get(
             "text",
             ""
         )
-
 
         print(
             "LINE MESSAGE:",
@@ -290,7 +328,7 @@ def webhook():
 
 
         # =========================
-        # BingX API Test Command
+        # BingX Connection Test
         # =========================
 
         if text.strip().upper() == "BINGX TEST":
@@ -300,9 +338,7 @@ def webhook():
                 flush=True
             )
 
-
             result = bingx_get_balance()
-
 
             print(
                 "BINGX TEST RESULT:",
@@ -313,20 +349,73 @@ def webhook():
                 flush=True
             )
 
+            continue
+
+
+        # =========================
+        # Parse Signal
+        # =========================
+
+        signal = parse_signal(text)
+
+        print(
+            "PARSED SIGNAL:",
+            signal,
+            flush=True
+        )
+
+
+        # Ignore normal messages
+        if not signal["symbol"]:
+            print(
+                "NOT A TRADING SIGNAL",
+                flush=True
+            )
+
+            continue
+
+
+        # Check required fields
+        if not valid_signal(signal):
+
+            print(
+                "SIGNAL INCOMPLETE - NO ACTION",
+                signal,
+                flush=True
+            )
 
             continue
 
 
         # =========================
-        # Parse Trading Signal
+        # DRY RUN
         # =========================
 
-        signal = parse_signal(text)
-
+        dry_run_order = build_dry_run_order(
+            signal
+        )
 
         print(
-            "PARSED SIGNAL:",
-            signal,
+            "==============================",
+            flush=True
+        )
+
+        print(
+            "DRY RUN ORDER - NO REAL TRADE",
+            flush=True
+        )
+
+        print(
+            json.dumps(
+                dry_run_order,
+                ensure_ascii=False,
+                indent=2
+            ),
+            flush=True
+        )
+
+        print(
+            "==============================",
             flush=True
         )
 
