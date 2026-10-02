@@ -10,6 +10,7 @@ import math
 import threading
 import urllib.request
 import urllib.error
+import psycopg2
 
 
 app = Flask(__name__)
@@ -31,6 +32,11 @@ BINGX_API_KEY = os.environ.get(
 
 BINGX_SECRET_KEY = os.environ.get(
     "BINGX_SECRET_KEY",
+    ""
+)
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
     ""
 )
 
@@ -111,6 +117,132 @@ BINGX_BASE_URL = (
 
 
 # =========================================================
+# DATABASE
+# =========================================================
+
+def get_db_connection():
+
+    if not DATABASE_URL:
+
+        raise RuntimeError(
+            "DATABASE_URL not set"
+        )
+
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require"
+    )
+
+
+def init_database():
+
+    conn = None
+    cur = None
+
+    try:
+
+        conn = get_db_connection()
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scanner_trades (
+                id SERIAL PRIMARY KEY,
+
+                symbol VARCHAR(50) NOT NULL,
+
+                side VARCHAR(10)
+                    NOT NULL
+                    DEFAULT 'LONG',
+
+                signal_time TIMESTAMPTZ
+                    DEFAULT NOW(),
+
+                entry_price DOUBLE PRECISION
+                    NOT NULL,
+
+                score INTEGER,
+
+                rsi DOUBLE PRECISION,
+
+                volume_ratio DOUBLE PRECISION,
+
+                trend_15m VARCHAR(20),
+
+                trend_1h VARCHAR(20),
+
+                breakout BOOLEAN
+                    DEFAULT FALSE,
+
+                tp1 DOUBLE PRECISION,
+
+                tp2 DOUBLE PRECISION,
+
+                tp3 DOUBLE PRECISION,
+
+                sl DOUBLE PRECISION,
+
+                status VARCHAR(30)
+                    DEFAULT 'OPEN',
+
+                tp1_hit BOOLEAN
+                    DEFAULT FALSE,
+
+                tp2_hit BOOLEAN
+                    DEFAULT FALSE,
+
+                tp3_hit BOOLEAN
+                    DEFAULT FALSE,
+
+                sl_hit BOOLEAN
+                    DEFAULT FALSE,
+
+                highest_price DOUBLE PRECISION,
+
+                lowest_price DOUBLE PRECISION,
+
+                exit_price DOUBLE PRECISION,
+
+                result_pct DOUBLE PRECISION,
+
+                closed_at TIMESTAMPTZ,
+
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW()
+            );
+            """
+        )
+
+        conn.commit()
+
+        print(
+            "DATABASE READY",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            "DATABASE INIT ERROR:",
+            str(e),
+            flush=True
+        )
+
+        raise
+
+    finally:
+
+        if cur:
+
+            cur.close()
+
+        if conn:
+
+            conn.close()
+
+
+# =========================================================
 # SIGNAL PARSER
 # =========================================================
 
@@ -166,11 +298,13 @@ def parse_signal(text):
     )
 
     if symbol:
+
         result["symbol"] = (
             symbol.group(1).upper()
         )
 
     if side:
+
         s = side.group(1).upper()
 
         result["side"] = (
@@ -180,26 +314,31 @@ def parse_signal(text):
         )
 
     if entry:
+
         result["entry"] = (
             entry.group(1)
         )
 
     if tp1:
+
         result["tp1"] = (
             tp1.group(1)
         )
 
     if tp2:
+
         result["tp2"] = (
             tp2.group(1)
         )
 
     if tp3:
+
         result["tp3"] = (
             tp3.group(1)
         )
 
     if sl:
+
         result["sl"] = (
             sl.group(1)
         )
@@ -796,7 +935,6 @@ def place_limit_entry(
         params["symbol"]
     )
 
-    # Only change leverage when LIVE
     if LIVE_TRADING:
 
         set_leverage(
@@ -1193,7 +1331,6 @@ def place_tp_sl(
             result
         )
 
-    # Full-position SL
     sl_params = (
         build_exit_order(
             symbol,
@@ -1434,6 +1571,54 @@ def monitor_limit_order(
 
 
 # =========================================================
+# DATABASE TEST
+# =========================================================
+
+@app.route(
+    "/db-test",
+    methods=["GET"]
+)
+def db_test():
+
+    conn = None
+    cur = None
+
+    try:
+
+        conn = get_db_connection()
+
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT NOW();"
+        )
+
+        now = cur.fetchone()[0]
+
+        return (
+            f"DATABASE OK | {now}",
+            200
+        )
+
+    except Exception as e:
+
+        return (
+            f"DATABASE ERROR | {str(e)}",
+            500
+        )
+
+    finally:
+
+        if cur:
+
+            cur.close()
+
+        if conn:
+
+            conn.close()
+
+
+# =========================================================
 # HOME
 # =========================================================
 
@@ -1452,7 +1637,8 @@ def home():
     return (
         f"LINE BingX LIMIT Bot "
         f"{mode} mode | "
-        f"{LEVERAGE}x",
+        f"{LEVERAGE}x | "
+        f"DB={'ON' if DATABASE_URL else 'OFF'}",
         200
     )
 
@@ -1637,7 +1823,6 @@ def webhook():
                     f"{entry_result}"
                 )
 
-            # TEST MODE STOPS HERE
             if not LIVE_TRADING:
 
                 print(
@@ -1713,3 +1898,20 @@ def webhook():
             )
 
     return "OK", 200
+
+
+# =========================================================
+# INITIALIZE DATABASE
+# =========================================================
+
+try:
+
+    init_database()
+
+except Exception as e:
+
+    print(
+        "STARTUP DATABASE ERROR:",
+        str(e),
+        flush=True
+    )
