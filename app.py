@@ -258,7 +258,6 @@ scanner_status = {
 def get_db_connection():
 
     if not DATABASE_URL:
-
         raise RuntimeError(
             "DATABASE_URL not set"
         )
@@ -283,14 +282,19 @@ def init_database():
             """
             CREATE TABLE IF NOT EXISTS scanner_trades (
                 id SERIAL PRIMARY KEY,
+
                 symbol VARCHAR(50) NOT NULL,
-                side VARCHAR(10) NOT NULL DEFAULT 'LONG',
+                side VARCHAR(10)
+                    NOT NULL
+                    DEFAULT 'LONG',
 
                 strategy VARCHAR(30),
 
-                signal_time TIMESTAMPTZ DEFAULT NOW(),
+                signal_time TIMESTAMPTZ
+                    DEFAULT NOW(),
 
-                entry_price DOUBLE PRECISION NOT NULL,
+                entry_price DOUBLE PRECISION
+                    NOT NULL,
 
                 score INTEGER,
                 trend_score INTEGER,
@@ -309,7 +313,8 @@ def init_database():
                 trend_15m VARCHAR(20),
                 trend_1h VARCHAR(20),
 
-                breakout BOOLEAN DEFAULT FALSE,
+                breakout BOOLEAN
+                    DEFAULT FALSE,
 
                 reasons TEXT,
 
@@ -318,12 +323,20 @@ def init_database():
                 tp3 DOUBLE PRECISION,
                 sl DOUBLE PRECISION,
 
-                status VARCHAR(30) DEFAULT 'OPEN',
+                status VARCHAR(30)
+                    DEFAULT 'OPEN',
 
-                tp1_hit BOOLEAN DEFAULT FALSE,
-                tp2_hit BOOLEAN DEFAULT FALSE,
-                tp3_hit BOOLEAN DEFAULT FALSE,
-                sl_hit BOOLEAN DEFAULT FALSE,
+                tp1_hit BOOLEAN
+                    DEFAULT FALSE,
+
+                tp2_hit BOOLEAN
+                    DEFAULT FALSE,
+
+                tp3_hit BOOLEAN
+                    DEFAULT FALSE,
+
+                sl_hit BOOLEAN
+                    DEFAULT FALSE,
 
                 highest_price DOUBLE PRECISION,
                 lowest_price DOUBLE PRECISION,
@@ -331,8 +344,11 @@ def init_database():
                 exit_price DOUBLE PRECISION,
                 result_pct DOUBLE PRECISION,
 
+                exit_reason VARCHAR(30),
+
                 closed_at TIMESTAMPTZ,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TIMESTAMPTZ
+                    DEFAULT NOW()
             );
             """
         )
@@ -342,46 +358,56 @@ def init_database():
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS strategy VARCHAR(30);
             """,
+
             """
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS trend_score INTEGER;
             """,
+
             """
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS breakout_score INTEGER;
             """,
+
             """
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS rsi_5m DOUBLE PRECISION;
             """,
+
             """
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS momentum_5m DOUBLE PRECISION;
             """,
+
             """
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS volatility_pct DOUBLE PRECISION;
             """,
+
             """
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS extension_pct DOUBLE PRECISION;
             """,
+
             """
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS momentum_pct DOUBLE PRECISION;
             """,
+
             """
             ALTER TABLE scanner_trades
             ADD COLUMN IF NOT EXISTS reasons TEXT;
+            """,
+
+            """
+            ALTER TABLE scanner_trades
+            ADD COLUMN IF NOT EXISTS exit_reason VARCHAR(30);
             """
         ]
 
         for sql in migrations:
-
             cur.execute(sql)
 
-        # Old V1 records are preserved,
-        # but excluded from V2 statistics.
         cur.execute(
             """
             UPDATE scanner_trades
@@ -437,11 +463,7 @@ def bingx_public_request(
     )
 
     if query:
-
-        url += (
-            "?"
-            + query
-        )
+        url += "?" + query
 
     req = urllib.request.Request(
         url,
@@ -542,7 +564,6 @@ def parse_signal(text):
     )
 
     if symbol:
-
         result["symbol"] = (
             symbol.group(1).upper()
         )
@@ -657,10 +678,7 @@ def validate_signal(signal):
             "TP percentages must total 100"
         )
 
-    return (
-        True,
-        None
-    )
+    return True, None
 
 
 # =========================================================
@@ -1179,19 +1197,14 @@ def query_order(
     }
 
     if order_id:
-
-        params["orderId"] = (
-            order_id
-        )
+        params["orderId"] = order_id
 
     elif client_order_id:
-
         params["clientOrderId"] = (
             client_order_id
         )
 
     else:
-
         raise RuntimeError(
             "Missing order ID"
         )
@@ -1214,13 +1227,9 @@ def cancel_order(
     }
 
     if order_id:
-
-        params["orderId"] = (
-            order_id
-        )
+        params["orderId"] = order_id
 
     else:
-
         params["clientOrderId"] = (
             client_order_id
         )
@@ -1250,8 +1259,7 @@ def build_exit_order(
 
     close_side = (
         "SELL"
-        if position_side
-        == "LONG"
+        if position_side == "LONG"
         else "BUY"
     )
 
@@ -1291,9 +1299,9 @@ def build_exit_order(
 
     if BINGX_POSITION_MODE == "ONEWAY":
 
-        params["reduceOnly"] = (
-            "true"
-        )
+        params[
+            "reduceOnly"
+        ] = "true"
 
     return params
 
@@ -1369,11 +1377,13 @@ def place_tp_sl(
             q1,
             float(signal["tp1"])
         ),
+
         (
             "TP2",
             q2,
             float(signal["tp2"])
         ),
+
         (
             "TP3",
             q3,
@@ -1417,8 +1427,7 @@ def place_tp_sl(
             raise RuntimeError(
                 f"{name} value "
                 f"{value} below "
-                f"minimum "
-                f"{min_usdt}"
+                f"minimum {min_usdt}"
             )
 
     tp_results = []
@@ -1530,8 +1539,12 @@ def monitor_limit_order(
             )
 
             if (
-                isinstance(order, dict)
-                and "order" in order
+                isinstance(
+                    order,
+                    dict
+                )
+                and "order"
+                in order
             ):
 
                 order = order["order"]
@@ -1617,7 +1630,9 @@ def calculate_ema(
         return None
 
     seed = (
-        sum(values[:period])
+        sum(
+            values[:period]
+        )
         / period
     )
 
@@ -1857,8 +1872,6 @@ def valid_scanner_symbol(symbol):
 
     base = match.group(1)
 
-    # Reject malformed symbols such as
-    # ABCUSDT-USDT
     if base.endswith(
         "USDT"
     ):
@@ -2052,15 +2065,10 @@ def analyze_fast_5m(
         * 100
     )
 
-    # -----------------------------------------------------
-    # Breakout score
-    # -----------------------------------------------------
-
     breakout_score = 0
     breakout_reasons = []
 
     if volume_ratio >= 1.5:
-
         breakout_score += 15
 
     if volume_ratio >= 2.0:
@@ -2072,11 +2080,9 @@ def analyze_fast_5m(
         )
 
     if volume_ratio >= 3.0:
-
         breakout_score += 10
 
     if momentum_15m >= 0.8:
-
         breakout_score += 10
 
     if momentum_15m >= 1.5:
@@ -2088,7 +2094,6 @@ def analyze_fast_5m(
         )
 
     if momentum_15m >= 3.0:
-
         breakout_score += 10
 
     if breakout:
@@ -2103,11 +2108,9 @@ def analyze_fast_5m(
         rsi >= 55
         and rsi <= 85
     ):
-
         breakout_score += 10
 
     if volatility_pct >= 2:
-
         breakout_score += 5
 
     if volatility_pct >= 4:
@@ -2119,22 +2122,15 @@ def analyze_fast_5m(
         )
 
     if extension_pct > 10:
-
         breakout_score -= 15
 
     if rsi > 92:
-
         breakout_score -= 20
-
-    # -----------------------------------------------------
-    # Trend seed score
-    # -----------------------------------------------------
 
     trend_seed = 0
     trend_reasons = []
 
     if price > ema9:
-
         trend_seed += 10
 
     if ema9 > ema20:
@@ -2146,18 +2142,15 @@ def analyze_fast_5m(
         )
 
     if momentum_1h > 0.5:
-
         trend_seed += 10
 
     if (
         rsi >= 50
         and rsi <= 75
     ):
-
         trend_seed += 10
 
     if volume_ratio >= 1.2:
-
         trend_seed += 5
 
     fast_score = max(
@@ -2317,11 +2310,8 @@ def analyze_15m_detail(
         * 100
     )
 
-    # -----------------------------------------------------
-    # TREND SCORE
-    # -----------------------------------------------------
-
     trend_score = 0
+
     trend_reasons = list(
         fast[
             "trend_reasons"
@@ -2359,11 +2349,9 @@ def analyze_15m_detail(
         rsi > 68
         and rsi < 80
     ):
-
         trend_score += 5
 
     if momentum > 0.3:
-
         trend_score += 5
 
     if momentum > 1:
@@ -2375,7 +2363,6 @@ def analyze_15m_detail(
         )
 
     if volume_ratio >= 1.3:
-
         trend_score += 10
 
     if volume_ratio >= 1.8:
@@ -2394,8 +2381,6 @@ def analyze_15m_detail(
             "15m突破"
         )
 
-    # Normal trend strategy:
-    # hard reject extreme overbought.
     trend_blocked = False
 
     if rsi >= 80:
@@ -2414,10 +2399,6 @@ def analyze_15m_detail(
             "趨勢策略阻擋: 乖離過大"
         )
 
-    # -----------------------------------------------------
-    # BREAKOUT SCORE
-    # -----------------------------------------------------
-
     breakout_score = int(
         fast[
             "breakout_score_fast"
@@ -2431,7 +2412,6 @@ def analyze_15m_detail(
     )
 
     if volume_ratio >= 1.5:
-
         breakout_score += 10
 
     if breakout_15m:
@@ -2443,20 +2423,13 @@ def analyze_15m_detail(
         )
 
     if momentum > 1:
-
         breakout_score += 5
 
-    if (
-        price > ema20
-    ):
-
+    if price > ema20:
         breakout_score += 5
 
     breakout_blocked = False
 
-    # Explosion strategy can tolerate
-    # higher RSI than TREND,
-    # but not extreme late chasing.
     if fast[
         "rsi_5m"
     ] > 90:
@@ -2477,8 +2450,6 @@ def analyze_15m_detail(
             "爆發策略阻擋: 5m乖離過大"
         )
 
-    # A breakout signal must genuinely have
-    # volume + movement + breakout.
     if fast[
         "volume_ratio_5m"
     ] < 1.8:
@@ -2722,9 +2693,7 @@ def choose_strategy(
 
     elif breakout_ok:
 
-        strategy = (
-            "BREAKOUT"
-        )
+        strategy = "BREAKOUT"
 
     else:
 
@@ -3074,13 +3043,6 @@ def run_market_scan():
 
         fast_results = []
 
-        # -------------------------------------------------
-        # PHASE 1:
-        # Every valid coin gets a 5m scan.
-        # This is what catches weak coins
-        # that suddenly start moving.
-        # -------------------------------------------------
-
         for index, symbol in enumerate(
             symbols
         ):
@@ -3131,14 +3093,6 @@ def run_market_scan():
                 x["fast_score"],
             reverse=True
         )
-
-        # -------------------------------------------------
-        # Candidate construction
-        #
-        # Top overall movers are included,
-        # plus anything with unusual breakout activity.
-        # Therefore weak coins are NOT automatically removed.
-        # -------------------------------------------------
 
         detail_map = {}
 
@@ -3193,10 +3147,6 @@ def run_market_scan():
 
         detailed = []
 
-        # -------------------------------------------------
-        # PHASE 2: 15m detailed analysis
-        # -------------------------------------------------
-
         for index, fast in enumerate(
             detail_list
         ):
@@ -3209,10 +3159,8 @@ def run_market_scan():
 
             try:
 
-                result = (
-                    analyze_15m_detail(
-                        fast
-                    )
+                result = analyze_15m_detail(
+                    fast
                 )
 
                 if result:
@@ -3239,11 +3187,6 @@ def run_market_scan():
             time.sleep(
                 SCANNER_API_DELAY
             )
-
-        # -------------------------------------------------
-        # PHASE 3:
-        # 1h confirmation for strongest detailed results
-        # -------------------------------------------------
 
         detailed.sort(
             key=lambda x:
@@ -3299,8 +3242,6 @@ def run_market_scan():
                 SCANNER_API_DELAY
             )
 
-        # Anything not in top 1h list
-        # remains UNKNOWN.
         for result in detailed:
 
             if (
@@ -3416,17 +3357,6 @@ def run_market_scan():
                 "phase"
             ] = "DONE"
 
-        print(
-            "SCANNER V2 FINISHED:",
-            "Trend:",
-            trend_count,
-            "Breakout:",
-            breakout_count,
-            "Created:",
-            created,
-            flush=True
-        )
-
     except Exception as e:
 
         print(
@@ -3493,9 +3423,9 @@ def get_all_prices():
 
         try:
 
-            symbol = (
-                item["symbol"]
-            )
+            symbol = item[
+                "symbol"
+            ]
 
             price = float(
                 item["price"]
@@ -3538,7 +3468,9 @@ def update_simulated_trades():
             tp3_hit,
             highest_price,
             lowest_price
+
         FROM scanner_trades
+
         WHERE status = 'OPEN';
         """
     )
@@ -3566,7 +3498,9 @@ def update_simulated_trades():
 
             continue
 
-        price = prices[symbol]
+        price = prices[
+            symbol
+        ]
 
         highest_price = max(
             highest_price
@@ -3611,6 +3545,7 @@ def update_simulated_trades():
         closed = False
         result_pct = None
         status = "OPEN"
+        exit_reason = None
 
         if new_tp3:
 
@@ -3635,12 +3570,15 @@ def update_simulated_trades():
             )
 
             status = "WIN"
+            exit_reason = (
+                "TP3_EXIT"
+            )
+
             closed = True
 
         elif sl_hit:
 
             remaining = 1.0
-
             realized = 0.0
 
             if new_tp1:
@@ -3681,6 +3619,10 @@ def update_simulated_trades():
                 else "LOSS"
             )
 
+            exit_reason = (
+                "SL_EXIT"
+            )
+
             closed = True
 
         if closed:
@@ -3688,6 +3630,7 @@ def update_simulated_trades():
             cur.execute(
                 """
                 UPDATE scanner_trades
+
                 SET
                     tp1_hit = %s,
                     tp2_hit = %s,
@@ -3701,6 +3644,8 @@ def update_simulated_trades():
                     result_pct = %s,
 
                     status = %s,
+                    exit_reason = %s,
+
                     closed_at = NOW()
 
                 WHERE id = %s;
@@ -3718,6 +3663,8 @@ def update_simulated_trades():
                     result_pct,
 
                     status,
+                    exit_reason,
+
                     trade_id,
                 )
             )
@@ -3727,6 +3674,7 @@ def update_simulated_trades():
             cur.execute(
                 """
                 UPDATE scanner_trades
+
                 SET
                     tp1_hit = %s,
                     tp2_hit = %s,
@@ -3750,6 +3698,7 @@ def update_simulated_trades():
             )
 
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -3853,12 +3802,7 @@ def scan_now():
         ]:
 
             return (
-                "SCANNER ALREADY RUNNING | "
-                f"PHASE="
-                f"{scanner_status['phase']} | "
-                f"{scanner_status['processed']}/"
-                f"{scanner_status['total']} | "
-                f"{scanner_status['current_symbol']}",
+                "SCANNER ALREADY RUNNING",
                 200
             )
 
@@ -3876,9 +3820,7 @@ def scan_now():
 
     return (
         "SCANNER V2 STARTED | "
-        "TREND + BREAKOUT | "
-        "SIMULATION ONLY | "
-        "NO REAL SCANNER ORDER",
+        "SIMULATION ONLY",
         200
     )
 
@@ -3936,85 +3878,6 @@ def scanner_status_page():
         f"{status['current_symbol']}"
     )
 
-    lines.append("")
-
-    lines.append(
-        f"TREND candidates: "
-        f"{status['trend_candidates']}"
-    )
-
-    lines.append(
-        f"BREAKOUT candidates: "
-        f"{status['breakout_candidates']}"
-    )
-
-    lines.append(
-        f"New simulated trades: "
-        f"{status['new_trades']}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        f"Started: "
-        f"{status['started_at']}"
-    )
-
-    lines.append(
-        f"Finished: "
-        f"{status['finished_at']}"
-    )
-
-    if status["error"]:
-
-        lines.append(
-            f"ERROR: "
-            f"{status['error']}"
-        )
-
-    lines.append("")
-    lines.append(
-        "TOP RESULTS"
-    )
-
-    lines.append(
-        "================================"
-    )
-
-    for item in status[
-        "top_results"
-    ]:
-
-        lines.append(
-            f"{item['symbol']} | "
-            f"{item['strategy']} | "
-            f"Score {item['score']} | "
-            f"Trend {item['trend_score']} | "
-            f"Breakout {item['breakout_score']}"
-        )
-
-        lines.append(
-            f"5m RSI "
-            f"{item['rsi_5m']:.1f} | "
-            f"15m RSI "
-            f"{item['rsi']:.1f} | "
-            f"5m Vol "
-            f"{item['volume_ratio_5m']:.2f}x | "
-            f"5m Momentum "
-            f"{item['momentum_5m']:.2f}%"
-        )
-
-        lines.append(
-            f"15m Momentum "
-            f"{item['momentum_pct']:.2f}% | "
-            f"1H "
-            f"{item.get('trend_1h')}"
-        )
-
-        lines.append(
-            "--------------------------------"
-        )
-
     return (
         "<pre>"
         + "\n".join(lines)
@@ -4068,11 +3931,13 @@ def scanner_trades_page():
             sl_hit,
 
             status,
-            result_pct
+            result_pct,
+            exit_reason
 
         FROM scanner_trades
 
         ORDER BY id DESC
+
         LIMIT 100;
         """
     )
@@ -4124,7 +3989,8 @@ def scanner_trades_page():
             sl_hit,
 
             status,
-            result_pct
+            result_pct,
+            exit_reason
         ) = row
 
         lines.append(
@@ -4135,13 +4001,11 @@ def scanner_trades_page():
         )
 
         lines.append(
-            f"Time: "
-            f"{signal_time}"
+            f"Time: {signal_time}"
         )
 
         lines.append(
-            f"Entry: "
-            f"{entry}"
+            f"Entry: {entry}"
         )
 
         lines.append(
@@ -4188,6 +4052,11 @@ def scanner_trades_page():
         )
 
         lines.append(
+            f"Exit: "
+            f"{exit_reason or '-'}"
+        )
+
+        lines.append(
             f"Result: "
             f"{result_pct if result_pct is not None else '-'}%"
         )
@@ -4205,6 +4074,222 @@ def scanner_trades_page():
 
 
 # =========================================================
+# PERFORMANCE HELPERS
+# =========================================================
+
+def calculate_performance_stats(
+    trades
+):
+
+    """
+    trades:
+    [
+        {
+            "result": float,
+            "status": WIN/LOSS,
+            "strategy": ...
+        }
+    ]
+    """
+
+    if not trades:
+
+        return {
+            "closed": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0,
+            "avg_result": 0,
+            "avg_win": 0,
+            "avg_loss": 0,
+            "reward_risk": 0,
+            "profit_factor": 0,
+            "total_result": 0,
+            "max_losing_streak": 0,
+            "max_drawdown": 0,
+        }
+
+    results = [
+        float(
+            x["result"]
+        )
+        for x in trades
+    ]
+
+    wins_list = [
+        x
+        for x in results
+        if x > 0
+    ]
+
+    loss_list = [
+        x
+        for x in results
+        if x <= 0
+    ]
+
+    closed = len(
+        results
+    )
+
+    wins = len(
+        wins_list
+    )
+
+    losses = len(
+        loss_list
+    )
+
+    win_rate = (
+        wins
+        / closed
+        * 100
+        if closed
+        else 0
+    )
+
+    avg_result = (
+        sum(results)
+        / closed
+        if closed
+        else 0
+    )
+
+    avg_win = (
+        sum(wins_list)
+        / len(wins_list)
+        if wins_list
+        else 0
+    )
+
+    avg_loss = (
+        sum(loss_list)
+        / len(loss_list)
+        if loss_list
+        else 0
+    )
+
+    reward_risk = (
+        avg_win
+        / abs(avg_loss)
+        if avg_loss < 0
+        else 0
+    )
+
+    gross_profit = sum(
+        wins_list
+    )
+
+    gross_loss = abs(
+        sum(
+            loss_list
+        )
+    )
+
+    profit_factor = (
+        gross_profit
+        / gross_loss
+        if gross_loss > 0
+        else (
+            float("inf")
+            if gross_profit > 0
+            else 0
+        )
+    )
+
+    total_result = sum(
+        results
+    )
+
+    # ------------------------------
+    # Maximum losing streak
+    # ------------------------------
+
+    current_losing = 0
+    max_losing = 0
+
+    for result in results:
+
+        if result <= 0:
+
+            current_losing += 1
+
+            max_losing = max(
+                max_losing,
+                current_losing
+            )
+
+        else:
+
+            current_losing = 0
+
+    # ------------------------------
+    # Drawdown based on cumulative %
+    # ------------------------------
+
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+
+    for result in results:
+
+        equity += result
+
+        peak = max(
+            peak,
+            equity
+        )
+
+        drawdown = (
+            equity
+            - peak
+        )
+
+        max_drawdown = min(
+            max_drawdown,
+            drawdown
+        )
+
+    return {
+        "closed":
+            closed,
+
+        "wins":
+            wins,
+
+        "losses":
+            losses,
+
+        "win_rate":
+            win_rate,
+
+        "avg_result":
+            avg_result,
+
+        "avg_win":
+            avg_win,
+
+        "avg_loss":
+            avg_loss,
+
+        "reward_risk":
+            reward_risk,
+
+        "profit_factor":
+            profit_factor,
+
+        "total_result":
+            total_result,
+
+        "max_losing_streak":
+            max_losing,
+
+        "max_drawdown":
+            max_drawdown,
+    }
+
+
+# =========================================================
 # SCANNER STATS
 # =========================================================
 
@@ -4216,6 +4301,10 @@ def scanner_stats_page():
 
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # -----------------------------------------------------
+    # Total / Open
+    # -----------------------------------------------------
 
     cur.execute(
         """
@@ -4242,55 +4331,167 @@ def scanner_stats_page():
         cur.fetchone()[0]
     )
 
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM scanner_trades
-        WHERE strategy
-        IN ('TREND', 'BREAKOUT')
-        AND status = 'WIN';
-        """
-    )
-
-    wins = cur.fetchone()[0]
-
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM scanner_trades
-        WHERE strategy
-        IN ('TREND', 'BREAKOUT')
-        AND status = 'LOSS';
-        """
-    )
-
-    losses = cur.fetchone()[0]
+    # -----------------------------------------------------
+    # Closed trades, ordered chronologically
+    # -----------------------------------------------------
 
     cur.execute(
         """
         SELECT
-            COALESCE(
-                AVG(result_pct),
-                0
-            )
+            result_pct,
+            status,
+            strategy,
+            score,
+            exit_reason,
+            tp1_hit,
+            tp2_hit,
+            tp3_hit,
+            closed_at
+
         FROM scanner_trades
+
         WHERE strategy
         IN ('TREND', 'BREAKOUT')
+
+        AND status
+        IN ('WIN', 'LOSS')
+
         AND result_pct
-        IS NOT NULL;
+        IS NOT NULL
+
+        ORDER BY
+            closed_at ASC,
+            id ASC;
         """
     )
 
-    avg_result = float(
-        cur.fetchone()[0]
-        or 0
+    closed_rows = (
+        cur.fetchall()
     )
+
+    trades = []
+
+    for row in closed_rows:
+
+        (
+            result_pct,
+            status,
+            strategy,
+            score,
+            exit_reason,
+            tp1_hit,
+            tp2_hit,
+            tp3_hit,
+            closed_at
+        ) = row
+
+        trades.append(
+            {
+                "result":
+                    float(
+                        result_pct
+                        or 0
+                    ),
+
+                "status":
+                    status,
+
+                "strategy":
+                    strategy,
+
+                "score":
+                    score,
+
+                "exit_reason":
+                    exit_reason,
+
+                "tp1_hit":
+                    bool(tp1_hit),
+
+                "tp2_hit":
+                    bool(tp2_hit),
+
+                "tp3_hit":
+                    bool(tp3_hit),
+
+                "closed_at":
+                    closed_at,
+            }
+        )
+
+    stats = (
+        calculate_performance_stats(
+            trades
+        )
+    )
+
+    # -----------------------------------------------------
+    # TP hit rates
+    # -----------------------------------------------------
+
+    closed_count = (
+        stats["closed"]
+    )
+
+    tp1_hits = sum(
+        1
+        for x in trades
+        if x["tp1_hit"]
+    )
+
+    tp2_hits = sum(
+        1
+        for x in trades
+        if x["tp2_hit"]
+    )
+
+    tp3_hits = sum(
+        1
+        for x in trades
+        if x["tp3_hit"]
+    )
+
+    tp1_rate = (
+        tp1_hits
+        / closed_count
+        * 100
+        if closed_count
+        else 0
+    )
+
+    tp2_rate = (
+        tp2_hits
+        / closed_count
+        * 100
+        if closed_count
+        else 0
+    )
+
+    tp3_rate = (
+        tp3_hits
+        / closed_count
+        * 100
+        if closed_count
+        else 0
+    )
+
+    # -----------------------------------------------------
+    # Strategy stats
+    # -----------------------------------------------------
 
     cur.execute(
         """
         SELECT
             strategy,
             COUNT(*) AS total,
+
+            SUM(
+                CASE
+                    WHEN status = 'OPEN'
+                    THEN 1
+                    ELSE 0
+                END
+            ) AS open_count,
 
             SUM(
                 CASE
@@ -4306,7 +4507,18 @@ def scanner_stats_page():
                     THEN 1
                     ELSE 0
                 END
-            ) AS losses
+            ) AS losses,
+
+            COALESCE(
+                AVG(
+                    CASE
+                        WHEN result_pct
+                        IS NOT NULL
+                        THEN result_pct
+                    END
+                ),
+                0
+            ) AS avg_result
 
         FROM scanner_trades
 
@@ -4323,17 +4535,26 @@ def scanner_stats_page():
         cur.fetchall()
     )
 
+    # -----------------------------------------------------
+    # Score buckets
+    # -----------------------------------------------------
+
     cur.execute(
         """
         SELECT
             CASE
+
                 WHEN score >= 90
                     THEN '90+'
+
                 WHEN score >= 85
                     THEN '85-89'
+
                 WHEN score >= 80
                     THEN '80-84'
+
                 ELSE '75-79'
+
             END AS bucket,
 
             COUNT(*) AS total,
@@ -4352,7 +4573,12 @@ def scanner_stats_page():
                     THEN 1
                     ELSE 0
                 END
-            ) AS losses
+            ) AS losses,
+
+            COALESCE(
+                AVG(result_pct),
+                0
+            ) AS avg_result
 
         FROM scanner_trades
 
@@ -4372,6 +4598,51 @@ def scanner_stats_page():
         cur.fetchall()
     )
 
+    # -----------------------------------------------------
+    # Exit reason stats
+    # -----------------------------------------------------
+
+    cur.execute(
+        """
+        SELECT
+            COALESCE(
+                exit_reason,
+                'UNKNOWN'
+            ) AS reason,
+
+            COUNT(*) AS count,
+
+            COALESCE(
+                AVG(result_pct),
+                0
+            ) AS avg_result
+
+        FROM scanner_trades
+
+        WHERE strategy
+        IN ('TREND', 'BREAKOUT')
+
+        AND status
+        IN ('WIN', 'LOSS')
+
+        GROUP BY
+            COALESCE(
+                exit_reason,
+                'UNKNOWN'
+            )
+
+        ORDER BY count DESC;
+        """
+    )
+
+    exit_rows = (
+        cur.fetchall()
+    )
+
+    # -----------------------------------------------------
+    # Legacy
+    # -----------------------------------------------------
+
     cur.execute(
         """
         SELECT COUNT(*)
@@ -4387,31 +4658,22 @@ def scanner_stats_page():
     cur.close()
     conn.close()
 
-    closed = (
-        wins
-        + losses
-    )
-
-    win_rate = (
-        wins
-        / closed
-        * 100
-        if closed > 0
-        else 0
-    )
+    # -----------------------------------------------------
+    # Output
+    # -----------------------------------------------------
 
     lines = []
 
     lines.append(
-        "BINGX SCANNER V2 STATISTICS"
+        "BINGX SCANNER V2 PERFORMANCE"
     )
 
     lines.append(
-        "================================"
+        "========================================"
     )
 
     lines.append(
-        f"V2 Total: {total}"
+        f"Total signals: {total}"
     )
 
     lines.append(
@@ -4419,47 +4681,126 @@ def scanner_stats_page():
     )
 
     lines.append(
-        f"Closed: {closed}"
+        f"Closed: {stats['closed']}"
     )
 
     lines.append(
-        f"Wins: {wins}"
+        f"Wins: {stats['wins']}"
     )
 
     lines.append(
-        f"Losses: {losses}"
-    )
-
-    lines.append(
-        f"Overall win rate: "
-        f"{win_rate:.2f}%"
-    )
-
-    lines.append(
-        f"Average result: "
-        f"{avg_result:.2f}%"
-    )
-
-    lines.append(
-        f"Old V1 records excluded: "
-        f"{legacy_count}"
+        f"Losses: {stats['losses']}"
     )
 
     lines.append("")
 
     lines.append(
-        "WIN RATE BY STRATEGY"
+        f"Win rate: "
+        f"{stats['win_rate']:.2f}%"
     )
 
     lines.append(
-        "================================"
+        f"Average result: "
+        f"{stats['avg_result']:.2f}%"
+    )
+
+    lines.append(
+        f"Average win: "
+        f"{stats['avg_win']:.2f}%"
+    )
+
+    lines.append(
+        f"Average loss: "
+        f"{stats['avg_loss']:.2f}%"
+    )
+
+    if (
+        stats[
+            "profit_factor"
+        ] == float("inf")
+    ):
+
+        pf_text = "INF"
+
+    else:
+
+        pf_text = (
+            f"{stats['profit_factor']:.2f}"
+        )
+
+    lines.append(
+        f"Reward / Risk: "
+        f"{stats['reward_risk']:.2f}"
+    )
+
+    lines.append(
+        f"Profit Factor: "
+        f"{pf_text}"
+    )
+
+    lines.append(
+        f"Cumulative result: "
+        f"{stats['total_result']:.2f}%"
+    )
+
+    lines.append(
+        f"Max losing streak: "
+        f"{stats['max_losing_streak']}"
+    )
+
+    lines.append(
+        f"Max drawdown: "
+        f"{stats['max_drawdown']:.2f}%"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "TP HIT RATE"
+    )
+
+    lines.append(
+        "========================================"
+    )
+
+    lines.append(
+        f"TP1: "
+        f"{tp1_hits}/"
+        f"{closed_count} | "
+        f"{tp1_rate:.2f}%"
+    )
+
+    lines.append(
+        f"TP2: "
+        f"{tp2_hits}/"
+        f"{closed_count} | "
+        f"{tp2_rate:.2f}%"
+    )
+
+    lines.append(
+        f"TP3: "
+        f"{tp3_hits}/"
+        f"{closed_count} | "
+        f"{tp3_rate:.2f}%"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "BY STRATEGY"
+    )
+
+    lines.append(
+        "========================================"
     )
 
     for (
         strategy,
         strategy_total,
+        strategy_open,
         strategy_wins,
-        strategy_losses
+        strategy_losses,
+        strategy_avg
     ) in strategy_rows:
 
         resolved = (
@@ -4471,33 +4812,36 @@ def scanner_stats_page():
             strategy_wins
             / resolved
             * 100
-            if resolved > 0
+            if resolved
             else 0
         )
 
         lines.append(
             f"{strategy}: "
-            f"{strategy_total} signals | "
+            f"{strategy_total} total | "
+            f"{strategy_open} open | "
             f"{strategy_wins}W/"
             f"{strategy_losses}L | "
-            f"{rate:.2f}%"
+            f"Win {rate:.2f}% | "
+            f"Avg {float(strategy_avg):.2f}%"
         )
 
     lines.append("")
 
     lines.append(
-        "WIN RATE BY SCORE"
+        "BY SCORE"
     )
 
     lines.append(
-        "================================"
+        "========================================"
     )
 
     for (
         bucket,
         bucket_total,
         bucket_wins,
-        bucket_losses
+        bucket_losses,
+        bucket_avg
     ) in score_rows:
 
         resolved = (
@@ -4509,16 +4853,47 @@ def scanner_stats_page():
             bucket_wins
             / resolved
             * 100
-            if resolved > 0
+            if resolved
             else 0
         )
 
         lines.append(
             f"{bucket}: "
+            f"{bucket_total} closed | "
             f"{bucket_wins}W/"
             f"{bucket_losses}L | "
-            f"{rate:.2f}%"
+            f"Win {rate:.2f}% | "
+            f"Avg {float(bucket_avg):.2f}%"
         )
+
+    lines.append("")
+
+    lines.append(
+        "EXIT REASONS"
+    )
+
+    lines.append(
+        "========================================"
+    )
+
+    for (
+        reason,
+        count,
+        avg_result
+    ) in exit_rows:
+
+        lines.append(
+            f"{reason}: "
+            f"{count} trades | "
+            f"Avg {float(avg_result):.2f}%"
+        )
+
+    lines.append("")
+
+    lines.append(
+        f"Legacy V1 excluded: "
+        f"{legacy_count}"
+    )
 
     return (
         "<pre>"
@@ -4548,20 +4923,28 @@ def home():
         "<pre>"
         "LINE BingX Bot + Scanner V2\n"
         "================================\n"
-        f"LINE trading: {mode}\n"
-        f"LINE leverage: {LEVERAGE}x\n"
+
+        f"LINE trading: "
+        f"{mode}\n"
+
+        f"LINE leverage: "
+        f"{LEVERAGE}x\n"
+
         f"Database: "
         f"{'ON' if DATABASE_URL else 'OFF'}\n\n"
 
-        "Scanner trading: SIMULATION ONLY\n"
-        "Scanner strategies: TREND + BREAKOUT\n\n"
+        "Scanner trading: "
+        "SIMULATION ONLY\n"
+
+        "Scanner strategies: "
+        "TREND + BREAKOUT\n\n"
 
         "Pages:\n"
+
         "/db-test\n"
-        "/scan-now\n"
-        "/scanner-status\n"
         "/scanner-trades\n"
         "/scanner-stats\n"
+
         "</pre>",
         200
     )
@@ -4581,9 +4964,11 @@ def webhook():
         as_text=True
     )
 
-    signature = request.headers.get(
-        "X-Line-Signature",
-        ""
+    signature = (
+        request.headers.get(
+            "X-Line-Signature",
+            ""
+        )
     )
 
     if not LINE_CHANNEL_SECRET:
@@ -4753,13 +5138,17 @@ def webhook():
                 )
             )
 
-            order = data_result.get(
-                "order",
-                data_result
+            order = (
+                data_result.get(
+                    "order",
+                    data_result
+                )
             )
 
-            order_id = order.get(
-                "orderId"
+            order_id = (
+                order.get(
+                    "orderId"
+                )
             )
 
             client_order_id = (
