@@ -989,6 +989,7 @@ def scanner_open_count():
         SELECT COUNT(*)
         FROM scanner_trades
         WHERE status = 'OPEN'
+          AND engine_version = 'V3'
           AND strategy IN ('TREND', 'BREAKOUT');
         """
     )
@@ -1006,6 +1007,7 @@ def scanner_can_open(symbol):
         SELECT id
         FROM scanner_trades
         WHERE symbol = %s
+          AND engine_version = 'V3'
           AND strategy IN ('TREND', 'BREAKOUT')
           AND (
               status = 'OPEN'
