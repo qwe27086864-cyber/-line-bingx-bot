@@ -310,23 +310,50 @@ def bingx_private_request(method, path, params=None):
 
 def parse_signal(text):
     result = {
-        "symbol": None, "side": None, "entry": None,
-        "tp1": None, "tp2": None, "tp3": None, "sl": None,
+        "symbol": None,
+        "side": None,
+        "entry": None,
+        "tp1": None,
+        "tp2": None,
+        "tp3": None,
+        "sl": None,
     }
 
-    symbol = re.search(r"å¹£ç¨®\s*[:ï¼]\s*([A-Za-z0-9]+)", text)
-    side = re.search(r"æ¹å\s*[:ï¼]\s*(å¤|ç©º|LONG|SHORT|Long|Short)", text)
-    entry = re.search(r"é²å ´(?:å¹ä½)?\s*[:ï¼]\s*([0-9.]+)", text)
-    tp1 = re.search(r"TP1\s*[:ï¼]\s*([0-9.]+)", text, re.I)
-    tp2 = re.search(r"TP2\s*[:ï¼]\s*([0-9.]+)", text, re.I)
-    tp3 = re.search(r"TP3\s*[:ï¼]\s*([0-9.]+)", text, re.I)
-    sl = re.search(r"(?:SL|æ­¢æ)\s*[:ï¼]\s*([0-9.]+)", text, re.I)
+    symbol = re.search(
+        r"\u5e63\u7a2e\s*[:\uff1a]\s*([A-Za-z0-9]+)",
+        text,
+        re.I,
+    )
+
+    side = re.search(
+        r"\u65b9\u5411\s*[:\uff1a]\s*(\u591a|\u7a7a|LONG|SHORT)",
+        text,
+        re.I,
+    )
+
+    entry = re.search(
+        r"\u9032\u5834(?:\u50f9\u4f4d)?\s*[:\uff1a]\s*([0-9.]+)",
+        text,
+        re.I,
+    )
+
+    tp1 = re.search(r"TP1\s*[:\uff1a]\s*([0-9.]+)", text, re.I)
+    tp2 = re.search(r"TP2\s*[:\uff1a]\s*([0-9.]+)", text, re.I)
+    tp3 = re.search(r"TP3\s*[:\uff1a]\s*([0-9.]+)", text, re.I)
+
+    sl = re.search(
+        r"(?:SL|\u6b62\u640d)\s*[:\uff1a]\s*([0-9.]+)",
+        text,
+        re.I,
+    )
 
     if symbol:
         result["symbol"] = symbol.group(1).upper()
+
     if side:
-        s = side.group(1).upper()
-        result["side"] = "LONG" if s in ["å¤", "LONG"] else "SHORT"
+        side_text = side.group(1).upper()
+        result["side"] = "LONG" if side_text in ["\u591a", "LONG"] else "SHORT"
+
     if entry:
         result["entry"] = entry.group(1)
     if tp1:
@@ -339,7 +366,6 @@ def parse_signal(text):
         result["sl"] = sl.group(1)
 
     return result
-
 
 def validate_signal(signal):
     for key in ["symbol", "side", "entry", "tp1", "tp2", "tp3", "sl"]:
