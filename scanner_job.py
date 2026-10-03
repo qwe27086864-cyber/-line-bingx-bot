@@ -14,9 +14,18 @@ from app import (
     scanner_can_open,
     create_simulated_trade,
     update_simulated_trades,
+    get_klines,
+    calculate_ema,
+    calculate_rsi,
 
     SCANNER_MAX_NEW_PER_SCAN,
     SCANNER_MAX_OPEN,
+    TP1_PCT,
+    TP2_PCT,
+    TP3_PCT,
+    SCANNER_TP1,
+    SCANNER_TP2,
+    SCANNER_TP3,
 )
 
 
@@ -25,24 +34,25 @@ from app import (
 # =========================================================
 
 RADAR_MIN_5M_MOVE = 0.60
-RADAR_STRONG_5M_MOVE = 1.20
-
 RADAR_MAX_CANDIDATES = 12
 
+# 24h quote volume minimum
+# deliberately kept low so smaller coins can still qualify
 RADAR_MIN_24H_QUOTE_VOLUME = 50000
 
 API_DELAY = 1.10
 
 
 # =========================================================
-# RADAR DATABASE
+# DATABASE MIGRATION
 # =========================================================
 
-def init_radar_database():
+def init_extra_database():
 
     conn = get_db_connection()
     cur = conn.cursor()
 
+    # Fast-radar snapshots
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS radar_snapshots (
@@ -54,9 +64,17 @@ def init_radar_database():
 
             price_change_24h DOUBLE PRECISION,
 
-            captured_at TIMESTAMPTZ
-            DEFAULT NOW()
+            captured_at TIMESTAMPTZ DEFAULT NOW()
         );
+        """
+    )
+
+    # Record how the trade finally closed
+    cur.execute(
+        """
+        ALTER TABLE scanner_trades
+        ADD COLUMN IF NOT EXISTS exit_reason
+        VARCHAR(30);
         """
     )
 
@@ -66,7 +84,7 @@ def init_radar_database():
     conn.close()
 
     print(
-        "RADAR DATABASE READY",
+        "RADAR / EXIT DATABASE READY",
         flush=True
     )
 
@@ -173,13 +191,15 @@ def get_all_tickers():
                     bid + ask
                 ) / 2
 
-                spread_pct = (
-                    (
-                        ask - bid
+                if mid > 0:
+
+                    spread_pct = (
+                        (
+                            ask - bid
+                        )
+                        / mid
+                        * 100
                     )
-                    / mid
-                    * 100
-                )
 
             tickers.append(
                 {
@@ -384,8 +404,8 @@ def build_radar_candidates(
             - captured_at
         ).total_seconds() / 60
 
-        # Previous snapshot should roughly
-        # represent the prior 5-minute run.
+        # Ignore snapshots that are too recent
+        # or clearly stale.
         if age_minutes < 2:
 
             continue
@@ -403,9 +423,6 @@ def build_radar_candidates(
             * 100
         )
 
-        # Avoid extremely illiquid markets.
-        # Kept deliberately low so small coins
-        # are not automatically excluded.
         if (
             item["quote_volume"]
             < RADAR_MIN_24H_QUOTE_VOLUME
@@ -413,8 +430,7 @@ def build_radar_candidates(
 
             continue
 
-        # Very large spreads are dangerous
-        # even in simulation.
+        # Extremely wide spread is dangerous
         if (
             item["spread_pct"]
             > 2.0
@@ -423,7 +439,6 @@ def build_radar_candidates(
             continue
 
         radar_score = 0
-
         reasons = []
 
         if move_pct >= 0.30:
@@ -524,7 +539,7 @@ def build_radar_candidates(
 
 
 # =========================================================
-# DEEP ANALYSIS
+# DEEP ENTRY ANALYSIS
 # =========================================================
 
 def deep_analyze(
@@ -538,12 +553,12 @@ def deep_analyze(
     print(
         "DEEP ANALYSIS:",
         symbol,
-        "5m move:",
+        "| 5m move:",
         f"{radar['radar_move']:.2f}%",
         flush=True
     )
 
-    # 5m Kline
+    # 5m
     fast = analyze_fast_5m(
         symbol
     )
@@ -556,7 +571,6 @@ def deep_analyze(
         API_DELAY
     )
 
-    # Add radar information
     fast[
         "radar_move"
     ] = radar[
@@ -569,7 +583,7 @@ def deep_analyze(
         "radar_score"
     ]
 
-    # 15m analysis
+    # 15m
     detailed = (
         analyze_15m_detail(
             fast
@@ -584,7 +598,7 @@ def deep_analyze(
         API_DELAY
     )
 
-    # 1h confirmation
+    # 1h
     detailed = confirm_1h(
         detailed
     )
@@ -619,7 +633,363 @@ def deep_analyze(
 
 
 # =========================================================
-# MAIN SCAN
+# TREND EXIT ANALYSIS
+# =========================================================
+
+def should_exit_after_tp2(
+    symbol
+):
+
+    """
+    Only used after TP2 has already been hit.
+
+    We require at least TWO weakness signals
+    before closing the remaining 30%.
+    """
+
+    candles_5m = get_klines(
+        symbol,
+        "5m",
+        60
+    )
+
+    time.sleep(
+        API_DELAY
+    )
+
+    candles_15m = get_klines(
+        symbol,
+        "15m",
+        60
+    )
+
+    if (
+        len(candles_5m) < 30
+        or len(candles_15m) < 30
+    ):
+
+        return (
+            False,
+            [],
+            None
+        )
+
+    # Ignore unfinished candle
+    c5 = candles_5m[:-1]
+    c15 = candles_15m[:-1]
+
+    close5 = [
+        x["close"]
+        for x in c5
+    ]
+
+    close15 = [
+        x["close"]
+        for x in c15
+    ]
+
+    current_price = (
+        close5[-1]
+    )
+
+    ema9_5 = calculate_ema(
+        close5,
+        9
+    )
+
+    ema20_5 = calculate_ema(
+        close5,
+        20
+    )
+
+    ema20_15 = calculate_ema(
+        close15,
+        20
+    )
+
+    rsi5 = calculate_rsi(
+        close5,
+        14
+    )
+
+    if (
+        ema9_5 is None
+        or ema20_5 is None
+        or ema20_15 is None
+        or rsi5 is None
+    ):
+
+        return (
+            False,
+            [],
+            current_price
+        )
+
+    weakness = []
+
+    # Signal 1:
+    # price loses 5m EMA20
+    if (
+        current_price
+        < ema20_5
+    ):
+
+        weakness.append(
+            "5m跌破EMA20"
+        )
+
+    # Signal 2:
+    # short EMA turns bearish
+    if (
+        ema9_5
+        < ema20_5
+    ):
+
+        weakness.append(
+            "5m EMA9<EMA20"
+        )
+
+    # Signal 3:
+    # 15m structure starts weakening
+    if (
+        close15[-1]
+        < ema20_15
+    ):
+
+        weakness.append(
+            "15m跌破EMA20"
+        )
+
+    # Signal 4:
+    # momentum is no longer positive
+    momentum_15m = (
+        (
+            close5[-1]
+            - close5[-4]
+        )
+        / close5[-4]
+        * 100
+    )
+
+    if momentum_15m < 0:
+
+        weakness.append(
+            f"15分鐘動能{momentum_15m:.2f}%"
+        )
+
+    # Signal 5:
+    # RSI has clearly weakened
+    if rsi5 < 48:
+
+        weakness.append(
+            f"5m RSI降至{rsi5:.1f}"
+        )
+
+    # Need two weakness signals.
+    exit_now = (
+        len(weakness)
+        >= 2
+    )
+
+    return (
+        exit_now,
+        weakness,
+        current_price
+    )
+
+
+# =========================================================
+# CLOSE LAST 30% ON TREND WEAKNESS
+# =========================================================
+
+def manage_tp2_trend_exits():
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            symbol,
+            entry_price
+
+        FROM scanner_trades
+
+        WHERE status = 'OPEN'
+
+        AND strategy
+        IN ('TREND', 'BREAKOUT')
+
+        AND tp2_hit = TRUE
+
+        AND tp3_hit = FALSE;
+        """
+    )
+
+    trades = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    if not trades:
+
+        print(
+            "TP2 TREND MONITOR: "
+            "NO POSITIONS",
+            flush=True
+        )
+
+        return
+
+    print(
+        "TP2 TREND MONITOR:",
+        len(trades),
+        "position(s)",
+        flush=True
+    )
+
+    for (
+        trade_id,
+        symbol,
+        entry_price
+    ) in trades:
+
+        try:
+
+            (
+                exit_now,
+                weakness,
+                current_price
+            ) = should_exit_after_tp2(
+                symbol
+            )
+
+            if (
+                not exit_now
+                or current_price is None
+            ):
+
+                print(
+                    "KEEP RUNNING:",
+                    symbol,
+                    "|",
+                    ", ".join(
+                        weakness
+                    )
+                    if weakness
+                    else
+                    "trend still healthy",
+                    flush=True
+                )
+
+                continue
+
+            remaining_return_pct = (
+                (
+                    current_price
+                    - entry_price
+                )
+                / entry_price
+                * 100
+            )
+
+            # TP1 = 30%
+            # TP2 = 40%
+            # final remaining 30% exits at market
+            result_pct = (
+                (
+                    TP1_PCT
+                    / 100
+                )
+                * SCANNER_TP1
+
+                +
+
+                (
+                    TP2_PCT
+                    / 100
+                )
+                * SCANNER_TP2
+
+                +
+
+                (
+                    TP3_PCT
+                    / 100
+                )
+                * remaining_return_pct
+            )
+
+            status = (
+                "WIN"
+                if result_pct > 0
+                else "LOSS"
+            )
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                UPDATE scanner_trades
+
+                SET
+                    exit_price = %s,
+
+                    result_pct = %s,
+
+                    status = %s,
+
+                    exit_reason =
+                        'TREND_EXIT',
+
+                    closed_at =
+                        NOW()
+
+                WHERE id = %s
+
+                AND status = 'OPEN';
+                """,
+                (
+                    current_price,
+                    result_pct,
+                    status,
+                    trade_id,
+                )
+            )
+
+            conn.commit()
+
+            cur.close()
+            conn.close()
+
+            print(
+                "TREND EXIT:",
+                symbol,
+                "| Price:",
+                current_price,
+                "| Final result:",
+                f"{result_pct:.2f}%",
+                "| Weakness:",
+                ", ".join(
+                    weakness
+                ),
+                flush=True
+            )
+
+        except Exception as e:
+
+            print(
+                "TREND EXIT ERROR:",
+                symbol,
+                str(e),
+                flush=True
+            )
+
+
+# =========================================================
+# MAIN 5-MINUTE RADAR
 # =========================================================
 
 def run_fast_radar():
@@ -641,9 +1011,12 @@ def run_fast_radar():
 
     init_database()
 
-    init_radar_database()
+    init_extra_database()
 
-    # Update existing simulated trades first.
+    # -----------------------------------------------------
+    # 1. Update existing TP / SL results
+    # -----------------------------------------------------
+
     try:
 
         update_simulated_trades()
@@ -656,9 +1029,34 @@ def run_fast_radar():
             flush=True
         )
 
+    # -----------------------------------------------------
+    # 2. If TP2 has already been reached,
+    #    check whether last 30% should exit early
+    # -----------------------------------------------------
+
+    try:
+
+        manage_tp2_trend_exits()
+
+    except Exception as e:
+
+        print(
+            "TREND EXIT MANAGER ERROR:",
+            str(e),
+            flush=True
+        )
+
+    # -----------------------------------------------------
+    # 3. Load previous market snapshot
+    # -----------------------------------------------------
+
     previous = (
         load_previous_snapshots()
     )
+
+    # -----------------------------------------------------
+    # 4. Get current whole-market snapshot
+    # -----------------------------------------------------
 
     current = (
         get_all_tickers()
@@ -670,7 +1068,7 @@ def run_fast_radar():
         flush=True
     )
 
-    # First run only creates the baseline.
+    # First run only creates baseline
     if not previous:
 
         save_snapshots(
@@ -678,12 +1076,16 @@ def run_fast_radar():
         )
 
         print(
-            "FIRST RADAR RUN:"
-            " BASELINE CREATED",
+            "FIRST RADAR RUN: "
+            "BASELINE CREATED",
             flush=True
         )
 
         return
+
+    # -----------------------------------------------------
+    # 5. Find fast-moving markets
+    # -----------------------------------------------------
 
     candidates = (
         build_radar_candidates(
@@ -692,8 +1094,8 @@ def run_fast_radar():
         )
     )
 
-    # Always save newest snapshot
-    # before deep analysis.
+    # Save current prices immediately
+    # for next 5-minute comparison
     save_snapshots(
         current
     )
@@ -709,11 +1111,17 @@ def run_fast_radar():
         print(
             item["symbol"],
             "|",
-            f"5m {item['radar_move']:.2f}%",
+            f"5m "
+            f"{item['radar_move']:.2f}%",
             "|",
-            f"Radar {item['radar_score']}",
+            f"Radar "
+            f"{item['radar_score']}",
             flush=True
         )
+
+    # -----------------------------------------------------
+    # 6. Deep analyze only radar candidates
+    # -----------------------------------------------------
 
     qualified = []
 
@@ -745,6 +1153,10 @@ def run_fast_radar():
             x["score"],
         reverse=True
     )
+
+    # -----------------------------------------------------
+    # 7. Create simulation trades
+    # -----------------------------------------------------
 
     created = 0
 
@@ -798,6 +1210,10 @@ def run_fast_radar():
         created,
         flush=True
     )
+
+    # -----------------------------------------------------
+    # 8. One final result update
+    # -----------------------------------------------------
 
     try:
 
