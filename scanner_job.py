@@ -19,9 +19,9 @@ from app import (
     get_klines,
     calculate_ema,
     calculate_rsi,
-    calculate_net_result,
-    finalize_v3_trade,
+    finalize_trade,
 
+    SCANNER_ENGINE_VERSION,
     SCANNER_MAX_NEW_PER_SCAN,
     SCANNER_MAX_OPEN,
     TP1_PCT,
@@ -33,7 +33,7 @@ from app import (
 )
 
 # =========================================================
-# V3 FAST RADAR SETTINGS
+# V4.2 FAST RADAR SETTINGS
 # =========================================================
 
 RADAR_MIN_5M_MOVE = 0.60
@@ -42,8 +42,9 @@ RADAR_MIN_24H_QUOTE_VOLUME = 50000
 RADAR_MAX_SPREAD_PCT = 2.0
 API_DELAY = 1.10
 
-# Trend-exit requires at least this many weakness signals.
+# TP2 runner trend-exit requires this many weakness signals.
 TREND_EXIT_WEAKNESS_COUNT = 2
+
 
 # =========================================================
 # DATABASE
@@ -69,7 +70,7 @@ def init_extra_database():
     cur.close()
     conn.close()
 
-    print("V3 RADAR DATABASE READY", flush=True)
+    print("V4.2 RADAR DATABASE READY", flush=True)
 
 
 # =========================================================
@@ -91,6 +92,7 @@ def get_all_tickers():
     for item in data:
         try:
             symbol = str(item.get("symbol", "")).upper()
+
             if not valid_scanner_symbol(symbol):
                 continue
 
@@ -104,6 +106,7 @@ def get_all_tickers():
                 continue
 
             spread_pct = 0.0
+
             if bid > 0 and ask > 0:
                 mid = (bid + ask) / 2
                 if mid > 0:
@@ -144,6 +147,7 @@ def load_previous_snapshots():
     conn.close()
 
     result = {}
+
     for symbol, price, volume, change_24h, captured_at in rows:
         result[symbol] = {
             "price": float(price),
@@ -191,7 +195,7 @@ def save_snapshots(tickers):
 
 
 # =========================================================
-# FAST RADAR
+# V4.2 LONG / SHORT FAST RADAR
 # =========================================================
 
 def build_radar_candidates(current, previous):
@@ -201,6 +205,7 @@ def build_radar_candidates(current, previous):
     for item in current:
         symbol = item["symbol"]
         old = previous.get(symbol)
+
         if not old:
             continue
 
@@ -212,11 +217,12 @@ def build_radar_candidates(current, previous):
 
         age_minutes = (now - captured_at).total_seconds() / 60
 
-        # Cron should be about 5m, but allow delayed executions.
+        # Cron normally runs every 5m, but allow delayed runs.
         if age_minutes < 2 or age_minutes > 20:
             continue
 
         move_pct = (item["price"] - old_price) / old_price * 100
+        abs_move = abs(move_pct)
 
         if item["quote_volume"] < RADAR_MIN_24H_QUOTE_VOLUME:
             continue
@@ -224,58 +230,83 @@ def build_radar_candidates(current, previous):
         if item["spread_pct"] > RADAR_MAX_SPREAD_PCT:
             continue
 
+        if abs_move < RADAR_MIN_5M_MOVE:
+            continue
+
+        side = "LONG" if move_pct > 0 else "SHORT"
+
         radar_score = 0
         reasons = []
 
-        if move_pct >= 0.30:
+        if abs_move >= 0.30:
             radar_score += 10
-        if move_pct >= 0.60:
+
+        if abs_move >= 0.60:
             radar_score += 20
-            reasons.append(f"5åé+{move_pct:.2f}%")
-        if move_pct >= 1.20:
+            reasons.append(
+                f"5åé{'ä¸æ¼²' if side == 'LONG' else 'ä¸è·'} {abs_move:.2f}%"
+            )
+
+        if abs_move >= 1.20:
             radar_score += 25
             reasons.append("ç­ç·å¿«éå é")
-        if move_pct >= 2.00:
+
+        if abs_move >= 2.00:
             radar_score += 20
 
-        if item["change_24h"] > 0:
-            radar_score += 5
-        if item["change_24h"] >= 5:
-            radar_score += 5
+        # 24h direction agrees with radar direction.
+        if side == "LONG":
+            if item["change_24h"] > 0:
+                radar_score += 5
+            if item["change_24h"] >= 5:
+                radar_score += 5
+        else:
+            if item["change_24h"] < 0:
+                radar_score += 5
+            if item["change_24h"] <= -5:
+                radar_score += 5
+
         if item["spread_pct"] <= 0.5:
             radar_score += 5
 
-        if move_pct >= RADAR_MIN_5M_MOVE:
-            candidates.append({
-                "symbol": symbol,
-                "radar_move": move_pct,
-                "radar_score": radar_score,
-                "radar_price": item["price"],
-                "quote_volume": item["quote_volume"],
-                "change_24h": item["change_24h"],
-                "spread_pct": item["spread_pct"],
-                "radar_reasons": reasons,
-            })
+        candidates.append({
+            "symbol": symbol,
+            "side": side,
+            "radar_move": move_pct,
+            "radar_abs_move": abs_move,
+            "radar_score": radar_score,
+            "radar_price": item["price"],
+            "quote_volume": item["quote_volume"],
+            "change_24h": item["change_24h"],
+            "spread_pct": item["spread_pct"],
+            "radar_reasons": reasons,
+        })
 
     candidates.sort(
-        key=lambda x: (x["radar_score"], x["radar_move"]),
+        key=lambda x: (x["radar_score"], x["radar_abs_move"]),
         reverse=True,
     )
+
     return candidates[:RADAR_MAX_CANDIDATES]
 
 
 def deep_analyze(radar):
     symbol = radar["symbol"]
+    side = radar["side"]
 
     print(
         "DEEP ANALYSIS:",
         symbol,
+        "|",
+        side,
         "| radar move",
-        f"{radar['radar_move']:.2f}%",
+        f"{radar['radar_move']:+.2f}%",
         flush=True,
     )
 
-    fast = analyze_fast_5m(symbol)
+    # Lock analysis to the radar direction.
+    fast = analyze_fast_5m(symbol, side_hint=side)
+
     if not fast:
         return None
 
@@ -285,6 +316,7 @@ def deep_analyze(radar):
     fast["radar_score"] = radar["radar_score"]
 
     detailed = analyze_15m_detail(fast)
+
     if not detailed:
         return None
 
@@ -296,24 +328,25 @@ def deep_analyze(radar):
     chosen = choose_strategy(detailed)
 
     if not chosen:
-        print("REJECTED:", symbol, flush=True)
+        print("REJECTED:", symbol, side, flush=True)
         return None
 
     chosen["reasons"].insert(
         0,
-        f"é·é5m+{radar['radar_move']:.2f}%"
+        f"é·é5m {radar['radar_move']:+.2f}% | {side}"
     )
 
     return chosen
 
 
 # =========================================================
-# TP2 RUNNER TREND EXIT
+# TP2 RUNNER TREND EXIT - LONG / SHORT
 # =========================================================
 
-def should_exit_after_tp2(symbol):
+def should_exit_after_tp2(symbol, side):
     candles_5m = get_klines(symbol, "5m", 60)
     time.sleep(API_DELAY)
+
     candles_15m = get_klines(symbol, "15m", 60)
 
     if len(candles_5m) < 30 or len(candles_15m) < 30:
@@ -334,31 +367,46 @@ def should_exit_after_tp2(symbol):
     if None in (ema9_5, ema20_5, ema20_15, rsi5):
         return False, []
 
+    momentum_15m = (close5[-1] - close5[-4]) / close5[-4] * 100
     weakness = []
 
-    if last5 < ema20_5:
-        weakness.append("5mè·ç ´EMA20")
+    if side == "SHORT":
+        if last5 > ema20_5:
+            weakness.append("5mç«åEMA20")
 
-    if ema9_5 < ema20_5:
-        weakness.append("5m EMA9<EMA20")
+        if ema9_5 > ema20_5:
+            weakness.append("5m EMA9>EMA20")
 
-    if close15[-1] < ema20_15:
-        weakness.append("15mè·ç ´EMA20")
+        if close15[-1] > ema20_15:
+            weakness.append("15mç«åEMA20")
 
-    momentum_15m = (close5[-1] - close5[-4]) / close5[-4] * 100
-    if momentum_15m < 0:
-        weakness.append(f"15åéåè½{momentum_15m:.2f}%")
+        if momentum_15m > 0:
+            weakness.append(f"15åéåå½åè½ +{momentum_15m:.2f}%")
 
-    if rsi5 < 48:
-        weakness.append(f"5m RSIéè³{rsi5:.1f}")
+        if rsi5 > 52:
+            weakness.append(f"5m RSIååè³ {rsi5:.1f}")
+
+    else:
+        if last5 < ema20_5:
+            weakness.append("5mè·ç ´EMA20")
+
+        if ema9_5 < ema20_5:
+            weakness.append("5m EMA9<EMA20")
+
+        if close15[-1] < ema20_15:
+            weakness.append("15mè·ç ´EMA20")
+
+        if momentum_15m < 0:
+            weakness.append(f"15åéåè½ {momentum_15m:.2f}%")
+
+        if rsi5 < 48:
+            weakness.append(f"5m RSIéè³ {rsi5:.1f}")
 
     return len(weakness) >= TREND_EXIT_WEAKNESS_COUNT, weakness
 
 
 def manage_tp2_trend_exits():
-    # First run the 1m replay/protective-stop engine.
-    # This guarantees a position that already hit protection is closed
-    # before the trend-exit logic sees it.
+    # First run TP/SL/breakeven/TIMEOUT management.
     update_simulated_trades()
 
     prices = get_all_prices()
@@ -371,6 +419,8 @@ def manage_tp2_trend_exits():
         SELECT
             id,
             symbol,
+            side,
+            engine_version,
             entry_price,
             tp1,
             highest_price,
@@ -379,18 +429,19 @@ def manage_tp2_trend_exits():
             sim_leverage
         FROM scanner_trades
         WHERE status='OPEN'
-          AND engine_version='V3'
+          AND engine_version IN ('V3', %s)
           AND strategy IN ('TREND','BREAKOUT')
           AND tp2_hit=TRUE
           AND tp3_hit=FALSE
         ORDER BY id ASC;
-        """
+        """,
+        (SCANNER_ENGINE_VERSION,),
     )
 
     trades = cur.fetchall()
 
     if not trades:
-        print("TP2 TREND MONITOR: NO V3 RUNNERS", flush=True)
+        print("TP2 TREND MONITOR: NO RUNNERS", flush=True)
         cur.close()
         conn.close()
         return
@@ -398,37 +449,56 @@ def manage_tp2_trend_exits():
     print("TP2 TREND MONITOR:", len(trades), "runner(s)", flush=True)
 
     for (
-        trade_id, symbol, entry_price, tp1,
-        highest_price, lowest_price,
-        margin_usdt, leverage
+        trade_id,
+        symbol,
+        side,
+        engine_version,
+        entry_price,
+        tp1,
+        highest_price,
+        lowest_price,
+        margin_usdt,
+        leverage,
     ) in trades:
+
         try:
             if symbol not in prices:
                 continue
 
-            exit_now, weakness = should_exit_after_tp2(symbol)
+            side = (side or "LONG").upper()
+
+            exit_now, weakness = should_exit_after_tp2(symbol, side)
 
             if not exit_now:
                 print(
                     "KEEP RUNNING:",
                     symbol,
+                    side,
                     "|",
                     ", ".join(weakness) if weakness else "trend healthy",
                     flush=True,
                 )
                 continue
 
-            current_price = prices[symbol]
+            current_price = float(prices[symbol])
+            entry_price = float(entry_price)
+            tp1 = float(tp1)
 
-            # Protection is already TP1 after TP2.
-            # Never let trend-exit simulate below the protection floor.
-            effective_exit = max(float(current_price), float(tp1))
-
-            runner_return_pct = (
-                (effective_exit - float(entry_price))
-                / float(entry_price)
-                * 100
-            )
+            # After TP2, TP1 is the protection level.
+            if side == "SHORT":
+                effective_exit = min(current_price, tp1)
+                runner_return_pct = (
+                    (entry_price - effective_exit)
+                    / entry_price
+                    * 100
+                )
+            else:
+                effective_exit = max(current_price, tp1)
+                runner_return_pct = (
+                    (effective_exit - entry_price)
+                    / entry_price
+                    * 100
+                )
 
             gross_result = (
                 (TP1_PCT / 100) * SCANNER_TP1
@@ -436,10 +506,16 @@ def manage_tp2_trend_exits():
                 + (TP3_PCT / 100) * runner_return_pct
             )
 
-            highest_price = max(float(highest_price or entry_price), effective_exit)
-            lowest_price = min(float(lowest_price or entry_price), effective_exit)
+            highest_price = max(
+                float(highest_price or entry_price),
+                effective_exit,
+            )
+            lowest_price = min(
+                float(lowest_price or entry_price),
+                effective_exit,
+            )
 
-            finalize_v3_trade(
+            finalize_trade(
                 cur,
                 trade_id,
                 effective_exit,
@@ -455,11 +531,13 @@ def manage_tp2_trend_exits():
                 leverage,
                 ", ".join(weakness),
             )
+
             conn.commit()
 
             print(
                 "TREND EXIT:",
                 symbol,
+                side,
                 "| price",
                 effective_exit,
                 "| weakness",
@@ -469,39 +547,51 @@ def manage_tp2_trend_exits():
 
         except Exception as e:
             conn.rollback()
-            print("TREND EXIT ERROR:", symbol, str(e), flush=True)
+            print(
+                "TREND EXIT ERROR:",
+                symbol,
+                str(e),
+                flush=True,
+            )
 
     cur.close()
     conn.close()
 
 
 # =========================================================
-# MAIN V3 RADAR
+# MAIN V4.2 RADAR
 # =========================================================
 
 def run_fast_radar():
     print("========================================", flush=True)
-    print("BINGX V3 5-MINUTE RADAR START", flush=True)
+    print("BINGX V4.2 5-MINUTE RADAR START", flush=True)
     print("========================================", flush=True)
 
     init_database()
     init_extra_database()
 
-    # 1. Update V2/V3 open trades. V3 gets 1m replay + protection.
+    # 1. Update all old/current open simulated trades.
     try:
         update_simulated_trades()
     except Exception as e:
         print("TRADE UPDATE ERROR:", str(e), flush=True)
 
-    # 2. Manage V3 TP2 runner exits.
+    # 2. Manage TP2 runners.
     try:
         manage_tp2_trend_exits()
     except Exception as e:
         print("TREND EXIT MANAGER ERROR:", str(e), flush=True)
 
-    # 3. Risk gate before looking for new entries.
+    # 3. V4.2 risk gate.
     allow_new, risk_reason = scanner_risk_allows_new_trade()
-    print("RISK GATE:", allow_new, "|", risk_reason, flush=True)
+
+    print(
+        "RISK GATE:",
+        allow_new,
+        "|",
+        risk_reason,
+        flush=True,
+    )
 
     previous = load_previous_snapshots()
     current = get_all_tickers()
@@ -510,12 +600,12 @@ def run_fast_radar():
 
     if not previous:
         save_snapshots(current)
-        print("FIRST RADAR RUN: BASELINE CREATED", flush=True)
+        print("FIRST V4.2 RADAR RUN: BASELINE CREATED", flush=True)
         return
 
     candidates = build_radar_candidates(current, previous)
 
-    # Save snapshot early so the next cron has a stable comparison baseline.
+    # Save early so next cron has a stable comparison baseline.
     save_snapshots(current)
 
     print("FAST RADAR CANDIDATES:", len(candidates), flush=True)
@@ -523,16 +613,22 @@ def run_fast_radar():
     for item in candidates:
         print(
             item["symbol"],
+            "|",
+            item["side"],
             "| 5m",
-            f"{item['radar_move']:.2f}%",
+            f"{item['radar_move']:+.2f}%",
             "| Radar",
             item["radar_score"],
             flush=True,
         )
 
     if not allow_new:
-        print("NEW ENTRY BLOCKED BY RISK CONTROL:", risk_reason, flush=True)
-        print("BINGX V3 RADAR COMPLETE", flush=True)
+        print(
+            "NEW ENTRY BLOCKED BY RISK CONTROL:",
+            risk_reason,
+            flush=True,
+        )
+        print("BINGX V4.2 RADAR COMPLETE", flush=True)
         return
 
     qualified = []
@@ -540,12 +636,28 @@ def run_fast_radar():
     for radar in candidates:
         try:
             result = deep_analyze(radar)
+
             if result:
                 qualified.append(result)
-        except Exception as e:
-            print("DEEP ANALYSIS ERROR:", radar["symbol"], str(e), flush=True)
 
-    qualified.sort(key=lambda x: x["score"], reverse=True)
+        except Exception as e:
+            print(
+                "DEEP ANALYSIS ERROR:",
+                radar["symbol"],
+                radar["side"],
+                str(e),
+                flush=True,
+            )
+
+    # Prefer score, then BREAKOUT, then stronger absolute radar move.
+    qualified.sort(
+        key=lambda x: (
+            x["score"],
+            1 if x["strategy"] == "BREAKOUT" else 0,
+            abs(x.get("radar_move", 0)),
+        ),
+        reverse=True,
+    )
 
     created = 0
 
@@ -558,19 +670,25 @@ def run_fast_radar():
             break
 
         allow_new, risk_reason = scanner_risk_allows_new_trade()
+
         if not allow_new:
             print("RISK CONTROL STOP:", risk_reason, flush=True)
             break
 
         if not scanner_can_open(result["symbol"]):
-            print("COOLDOWN:", result["symbol"], flush=True)
+            print(
+                "COOLDOWN:",
+                result["symbol"],
+                result["side"],
+                flush=True,
+            )
             continue
 
         create_simulated_trade(result)
         created += 1
 
     print("QUALIFIED:", len(qualified), flush=True)
-    print("NEW V3 SIMULATED TRADES:", created, flush=True)
+    print("NEW V4.2 SIMULATED TRADES:", created, flush=True)
 
     # Final update after new trades are inserted.
     try:
@@ -579,7 +697,7 @@ def run_fast_radar():
         print("POST UPDATE ERROR:", str(e), flush=True)
 
     print("========================================", flush=True)
-    print("BINGX V3 5-MINUTE RADAR COMPLETE", flush=True)
+    print("BINGX V4.2 5-MINUTE RADAR COMPLETE", flush=True)
     print("========================================", flush=True)
 
 
@@ -588,9 +706,14 @@ if __name__ == "__main__":
 
     try:
         run_fast_radar()
+
     except Exception as e:
         print("RADAR FATAL ERROR:", str(e), flush=True)
         raise
+
     finally:
         elapsed = time.time() - start
-        print(f"TOTAL RUN TIME: {elapsed:.2f} seconds", flush=True)
+        print(
+            f"TOTAL RUN TIME: {elapsed:.2f} seconds",
+            flush=True,
+        )
