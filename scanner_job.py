@@ -19,6 +19,7 @@ from app import (
     get_klines,
     calculate_ema,
     calculate_rsi,
+    side_return_pct,
     finalize_trade,
 
     SCANNER_ENGINE_VERSION,
@@ -37,7 +38,7 @@ from app import (
 # =========================================================
 
 RADAR_MIN_5M_MOVE = 0.60
-RADAR_MAX_CANDIDATES = 12
+RADAR_MAX_CANDIDATES = 20
 RADAR_MIN_24H_QUOTE_VOLUME = 50000
 RADAR_MAX_SPREAD_PCT = 2.0
 API_DELAY = 1.10
@@ -70,7 +71,7 @@ def init_extra_database():
     cur.close()
     conn.close()
 
-    print("V4.2 RADAR DATABASE READY", flush=True)
+    print("V4.2 LOCKED TEST RADAR DATABASE READY", flush=True)
 
 
 # =========================================================
@@ -340,6 +341,115 @@ def deep_analyze(radar):
 
 
 # =========================================================
+# V4.2 DYNAMIC MARKET BIAS / 20-SLOT QUOTA
+# =========================================================
+
+def _market_bias_score(symbol):
+    """
+    Returns roughly -4..+4 for one major coin.
+    Uses completed 1h candles only.
+    """
+    candles = get_klines(symbol, "1h", 90)
+    if len(candles) < 60:
+        return 0
+
+    completed = candles[:-1]
+    closes = [x["close"] for x in completed]
+
+    last = closes[-1]
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    rsi = calculate_rsi(closes, 14)
+
+    if ema20 is None or ema50 is None or rsi is None:
+        return 0
+
+    score = 0
+
+    score += 1 if last > ema20 else -1
+    score += 1 if ema20 > ema50 else -1
+
+    if rsi >= 55:
+        score += 1
+    elif rsi <= 45:
+        score -= 1
+
+    momentum_4h = (last - closes[-5]) / closes[-5] * 100
+
+    if momentum_4h >= 1.0:
+        score += 1
+    elif momentum_4h <= -1.0:
+        score -= 1
+
+    return score
+
+
+def determine_market_quota():
+    """
+    Scanner has 20 total slots, but LONG/SHORT allocation is dynamic.
+
+    Examples:
+      very strong bull -> 16 / 4
+      bull             -> 14 / 6
+      mild bull        -> 12 / 8
+      neutral          -> 10 / 10
+      mild bear        -> 8 / 12
+      bear             -> 6 / 14
+      very strong bear -> 4 / 16
+    """
+    try:
+        btc = _market_bias_score("BTC-USDT")
+        time.sleep(API_DELAY)
+        eth = _market_bias_score("ETH-USDT")
+        time.sleep(API_DELAY)
+
+        bias = btc + eth
+
+        if bias >= 6:
+            long_quota, short_quota, regime = 16, 4, "VERY_STRONG_BULL"
+        elif bias >= 3:
+            long_quota, short_quota, regime = 14, 6, "BULL"
+        elif bias >= 1:
+            long_quota, short_quota, regime = 12, 8, "MILD_BULL"
+        elif bias <= -6:
+            long_quota, short_quota, regime = 4, 16, "VERY_STRONG_BEAR"
+        elif bias <= -3:
+            long_quota, short_quota, regime = 6, 14, "BEAR"
+        elif bias <= -1:
+            long_quota, short_quota, regime = 8, 12, "MILD_BEAR"
+        else:
+            long_quota, short_quota, regime = 10, 10, "NEUTRAL"
+
+        # Respect SCANNER_MAX_OPEN even if user changes it from 20 later.
+        total = long_quota + short_quota
+        if total != SCANNER_MAX_OPEN and total > 0:
+            long_quota = int(round(SCANNER_MAX_OPEN * long_quota / total))
+            short_quota = SCANNER_MAX_OPEN - long_quota
+
+        return {
+            "regime": regime,
+            "bias_score": bias,
+            "btc_score": btc,
+            "eth_score": eth,
+            "long_quota": long_quota,
+            "short_quota": short_quota,
+        }
+
+    except Exception as e:
+        print("MARKET BIAS ERROR:", str(e), flush=True)
+
+        half = SCANNER_MAX_OPEN // 2
+        return {
+            "regime": "FALLBACK_NEUTRAL",
+            "bias_score": 0,
+            "btc_score": 0,
+            "eth_score": 0,
+            "long_quota": half,
+            "short_quota": SCANNER_MAX_OPEN - half,
+        }
+
+
+# =========================================================
 # TP2 RUNNER TREND EXIT - LONG / SHORT
 # =========================================================
 
@@ -423,13 +533,14 @@ def manage_tp2_trend_exits():
             engine_version,
             entry_price,
             tp1,
+            tp2,
             highest_price,
             lowest_price,
             sim_margin_usdt,
             sim_leverage
         FROM scanner_trades
         WHERE status='OPEN'
-          AND engine_version IN ('V3', %s)
+          AND engine_version IN ('V3', 'V4.2_PRE', %s)
           AND strategy IN ('TREND','BREAKOUT')
           AND tp2_hit=TRUE
           AND tp3_hit=FALSE
@@ -455,6 +566,7 @@ def manage_tp2_trend_exits():
         engine_version,
         entry_price,
         tp1,
+        tp2,
         highest_price,
         lowest_price,
         margin_usdt,
@@ -500,9 +612,21 @@ def manage_tp2_trend_exits():
                     * 100
                 )
 
+            tp1_return_pct = side_return_pct(
+                side,
+                entry_price,
+                tp1,
+            )
+
+            tp2_return_pct = side_return_pct(
+                side,
+                entry_price,
+                float(tp2),
+            )
+
             gross_result = (
-                (TP1_PCT / 100) * SCANNER_TP1
-                + (TP2_PCT / 100) * SCANNER_TP2
+                (TP1_PCT / 100) * tp1_return_pct
+                + (TP2_PCT / 100) * tp2_return_pct
                 + (TP3_PCT / 100) * runner_return_pct
             )
 
@@ -564,7 +688,7 @@ def manage_tp2_trend_exits():
 
 def run_fast_radar():
     print("========================================", flush=True)
-    print("BINGX V4.2 5-MINUTE RADAR START", flush=True)
+    print("BINGX V4.2 LOCKED TEST 5-MINUTE RADAR START", flush=True)
     print("========================================", flush=True)
 
     init_database()
@@ -590,6 +714,24 @@ def run_fast_radar():
         allow_new,
         "|",
         risk_reason,
+        flush=True,
+    )
+
+    market_quota = determine_market_quota()
+
+    print(
+        "MARKET REGIME:",
+        market_quota["regime"],
+        "| bias",
+        market_quota["bias_score"],
+        "| BTC",
+        market_quota["btc_score"],
+        "| ETH",
+        market_quota["eth_score"],
+        "| LONG",
+        market_quota["long_quota"],
+        "| SHORT",
+        market_quota["short_quota"],
         flush=True,
     )
 
@@ -669,6 +811,25 @@ def run_fast_radar():
             print("MAX OPEN TRADES REACHED", flush=True)
             break
 
+        side = result["side"]
+        side_open = scanner_open_count(side)
+
+        if side == "LONG":
+            side_limit = market_quota["long_quota"]
+        else:
+            side_limit = market_quota["short_quota"]
+
+        if side_open >= side_limit:
+            print(
+                "SIDE QUOTA FULL:",
+                side,
+                f"{side_open}/{side_limit}",
+                "| regime",
+                market_quota["regime"],
+                flush=True,
+            )
+            continue
+
         allow_new, risk_reason = scanner_risk_allows_new_trade()
 
         if not allow_new:
@@ -697,7 +858,7 @@ def run_fast_radar():
         print("POST UPDATE ERROR:", str(e), flush=True)
 
     print("========================================", flush=True)
-    print("BINGX V4.2 5-MINUTE RADAR COMPLETE", flush=True)
+    print("BINGX V4.2 LOCKED TEST 5-MINUTE RADAR COMPLETE", flush=True)
     print("========================================", flush=True)
 
 
