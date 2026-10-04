@@ -28,44 +28,45 @@ LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").strip().lower() == "true"
 ORDER_USDT = float(os.environ.get("ORDER_USDT", "10"))
 MAX_LIVE_ORDER_USDT = float(os.environ.get("MAX_LIVE_ORDER_USDT", "10"))
 
-TP1_PCT = float(os.environ.get("TP1_PCT", "30"))
-TP2_PCT = float(os.environ.get("TP2_PCT", "40"))
-TP3_PCT = float(os.environ.get("TP3_PCT", "30"))
+TP1_PCT = 35.0
+TP2_PCT = 40.0
+TP3_PCT = 25.0
 
 LEVERAGE = int(os.environ.get("LEVERAGE", "8"))
 BINGX_POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", "HEDGE").strip().upper()
 ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_TIMEOUT_SEC", "600"))
 ORDER_POLL_SEC = float(os.environ.get("ORDER_POLL_SEC", "2"))
+LINE_MAX_OPEN = 5
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
 # =========================================================
 # SCANNER V4.2 SETTINGS
 # =========================================================
 
-SCANNER_ENGINE_VERSION = "V4.2"
+SCANNER_ENGINE_VERSION = "V4.2R1"
 
-SCANNER_MIN_TREND_SCORE = int(os.environ.get("SCANNER_MIN_TREND_SCORE", "85"))
-SCANNER_MIN_BREAKOUT_SCORE = int(os.environ.get("SCANNER_MIN_BREAKOUT_SCORE", "85"))
-SCANNER_MAX_NEW_PER_SCAN = int(os.environ.get("SCANNER_MAX_NEW_PER_SCAN", "3"))
-SCANNER_MAX_OPEN = int(os.environ.get("SCANNER_MAX_OPEN", "10"))
-SCANNER_COOLDOWN_HOURS = int(os.environ.get("SCANNER_COOLDOWN_HOURS", "4"))
+SCANNER_MIN_TREND_SCORE = 85
+SCANNER_MIN_BREAKOUT_SCORE = 85
+SCANNER_MAX_NEW_PER_SCAN = 3
+SCANNER_MAX_OPEN = 20
+SCANNER_COOLDOWN_HOURS = 4
 
-SCANNER_TP1 = float(os.environ.get("SCANNER_TP1", "2"))
-SCANNER_TP2 = float(os.environ.get("SCANNER_TP2", "4"))
-SCANNER_TP3 = float(os.environ.get("SCANNER_TP3", "8"))
-SCANNER_SL = float(os.environ.get("SCANNER_SL", "3"))
+SCANNER_TP1 = 2.0
+SCANNER_TP2 = 4.0
+SCANNER_TP3 = 8.0
+SCANNER_SL = 2.5
 
 SCANNER_API_DELAY = float(os.environ.get("SCANNER_API_DELAY", "1.05"))
 SIM_MONITOR_SEC = int(os.environ.get("SIM_MONITOR_SEC", "30"))
 
-V42_MAIN_SCORE = int(os.environ.get("V42_MAIN_SCORE", "90"))
-V42_CONFIRM_SCORE = int(os.environ.get("V42_CONFIRM_SCORE", "85"))
-V42_ENABLE_80_84 = os.environ.get("V42_ENABLE_80_84", "false").strip().lower() == "true"
-V42_POSITION_TIMEOUT_HOURS = float(os.environ.get("V42_POSITION_TIMEOUT_HOURS", "4"))
+V42_MAIN_SCORE = 90
+V42_CONFIRM_SCORE = 85
+V42_ENABLE_80_84 = False
+V42_POSITION_TIMEOUT_HOURS = 4.0
 
-SIM_START_BALANCE = float(os.environ.get("SIM_START_BALANCE", "1000"))
-SIM_MARGIN_USDT = float(os.environ.get("SIM_MARGIN_USDT", "10"))
-SIM_LEVERAGE = int(os.environ.get("SIM_LEVERAGE", str(LEVERAGE)))
+SIM_START_BALANCE = 1000.0
+SIM_MARGIN_USDT = 10.0
+SIM_LEVERAGE = 8
 
 SIM_FEE_PCT = float(os.environ.get("SIM_FEE_PCT", "0.05"))
 SIM_SLIPPAGE_PCT = float(os.environ.get("SIM_SLIPPAGE_PCT", "0.03"))
@@ -143,6 +144,10 @@ def init_database():
                 breakout BOOLEAN DEFAULT FALSE,
                 reasons TEXT,
 
+                resonance BOOLEAN DEFAULT FALSE,
+                resonance_source VARCHAR(30),
+                management_mode VARCHAR(30) DEFAULT 'SCANNER',
+
                 tp1 DOUBLE PRECISION,
                 tp2 DOUBLE PRECISION,
                 tp3 DOUBLE PRECISION,
@@ -186,6 +191,9 @@ def init_database():
             "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS extension_pct DOUBLE PRECISION;",
             "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS momentum_pct DOUBLE PRECISION;",
             "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS reasons TEXT;",
+            "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS resonance BOOLEAN DEFAULT FALSE;",
+            "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS resonance_source VARCHAR(30);",
+            "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS management_mode VARCHAR(30) DEFAULT 'SCANNER';",
             "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS exit_reason VARCHAR(30);",
             "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS exit_detail TEXT;",
             "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;",
@@ -221,8 +229,38 @@ def init_database():
             """
         )
 
+        # Isolate the short pre-lock V4.2 trial so this locked test starts clean.
+        cur.execute(
+            """
+            UPDATE scanner_trades
+            SET engine_version = 'V4.2_PRE'
+            WHERE engine_version = 'V4.2';
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS line_signal_events (
+                id SERIAL PRIMARY KEY,
+                event_id VARCHAR(120) UNIQUE,
+                symbol VARCHAR(50) NOT NULL,
+                side VARCHAR(10) NOT NULL,
+                entry_price DOUBLE PRECISION,
+                tp1 DOUBLE PRECISION,
+                tp2 DOUBLE PRECISION,
+                tp3 DOUBLE PRECISION,
+                sl DOUBLE PRECISION,
+                relation VARCHAR(30) NOT NULL,
+                scanner_trade_id INTEGER,
+                order_status VARCHAR(30) DEFAULT 'RECEIVED',
+                note TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
         conn.commit()
-        print("DATABASE READY | V4.2 MIGRATIONS OK", flush=True)
+        print("DATABASE READY | V4.2 LOCKED TEST MIGRATIONS OK", flush=True)
     finally:
         if cur:
             cur.close()
@@ -585,13 +623,25 @@ def monitor_limit_order(signal, event_id, order_id, client_order_id, contract):
                 if executed_qty <= 0:
                     raise RuntimeError("FILLED but executedQty=0")
                 place_tp_sl(signal, event_id, executed_qty, contract)
+                try:
+                    update_line_event_status(event_id, "FILLED")
+                except Exception as db_error:
+                    print("LINE EVENT STATUS ERROR:", str(db_error), flush=True)
                 return
 
             if status in ["CANCELED", "EXPIRED"]:
+                try:
+                    update_line_event_status(event_id, status)
+                except Exception as db_error:
+                    print("LINE EVENT STATUS ERROR:", str(db_error), flush=True)
                 return
 
             if time.time() - start >= ENTRY_TIMEOUT_SEC:
                 cancel_order(symbol, order_id, client_order_id)
+                try:
+                    update_line_event_status(event_id, "ENTRY_TIMEOUT")
+                except Exception as db_error:
+                    print("LINE EVENT STATUS ERROR:", str(db_error), flush=True)
                 return
 
         except Exception as e:
@@ -1183,19 +1233,34 @@ def choose_strategy(result):
 # SCANNER DB / RISK
 # =========================================================
 
-def scanner_open_count():
+def scanner_open_count(side=None):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM scanner_trades
-        WHERE status = 'OPEN'
-          AND engine_version = %s
-          AND strategy IN ('TREND', 'BREAKOUT');
-        """,
-        (SCANNER_ENGINE_VERSION,),
-    )
+
+    if side in ("LONG", "SHORT"):
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM scanner_trades
+            WHERE status = 'OPEN'
+              AND engine_version = %s
+              AND strategy IN ('TREND', 'BREAKOUT')
+              AND side = %s;
+            """,
+            (SCANNER_ENGINE_VERSION, side),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM scanner_trades
+            WHERE status = 'OPEN'
+              AND engine_version = %s
+              AND strategy IN ('TREND', 'BREAKOUT');
+            """,
+            (SCANNER_ENGINE_VERSION,),
+        )
+
     count = cur.fetchone()[0]
     cur.close()
     conn.close()
@@ -1314,6 +1379,177 @@ def scanner_risk_allows_new_trade():
         return False, f"INSUFFICIENT_SIM_BALANCE {free_balance:.2f}U"
 
     return True, "OK"
+
+
+def register_line_signal(signal, event_id):
+    """
+    Record every Max Crypto/LINE signal and compare it with any OPEN V4.2
+    scanner trade in the same symbol.
+
+    RESONANCE:
+        Same symbol + same direction.
+        Keep one scanner trade, mark it as resonance, and switch its
+        simulated exit levels to the LINE TP/SL values.
+
+    OPPOSITE:
+        Same symbol + opposite direction.
+        Keep the scanner trade unchanged and record the disagreement only.
+
+    LINE_ONLY:
+        No open scanner trade in this symbol.
+    """
+    symbol = signal["symbol"] + "-USDT"
+    side = signal["side"]
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT id, side
+            FROM scanner_trades
+            WHERE engine_version = %s
+              AND status = 'OPEN'
+              AND strategy IN ('TREND','BREAKOUT')
+              AND symbol = %s
+            ORDER BY signal_time DESC, id DESC
+            LIMIT 1;
+            """,
+            (SCANNER_ENGINE_VERSION, symbol),
+        )
+        row = cur.fetchone()
+
+        relation = "LINE_ONLY"
+        scanner_trade_id = None
+        note = ""
+
+        if row:
+            scanner_trade_id = int(row[0])
+            scanner_side = str(row[1] or "LONG").upper()
+
+            if scanner_side == side:
+                relation = "RESONANCE"
+                note = "Same symbol and same direction; LINE TP/SL takes priority."
+
+                cur.execute(
+                    """
+                    UPDATE scanner_trades
+                    SET
+                        resonance = TRUE,
+                        resonance_source = 'MAX_CRYPTO',
+                        management_mode = 'LINE_TPSL',
+                        tp1 = %s,
+                        tp2 = %s,
+                        tp3 = %s,
+                        sl = %s
+                    WHERE id = %s
+                      AND status = 'OPEN';
+                    """,
+                    (
+                        float(signal["tp1"]),
+                        float(signal["tp2"]),
+                        float(signal["tp3"]),
+                        float(signal["sl"]),
+                        scanner_trade_id,
+                    ),
+                )
+            else:
+                relation = "OPPOSITE"
+                note = (
+                    "Same symbol but opposite direction; scanner direction kept. "
+                    "LINE signal recorded only."
+                )
+
+        cur.execute(
+            """
+            INSERT INTO line_signal_events (
+                event_id, symbol, side,
+                entry_price, tp1, tp2, tp3, sl,
+                relation, scanner_trade_id, order_status, note
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'RECEIVED',%s)
+            ON CONFLICT (event_id) DO NOTHING;
+            """,
+            (
+                str(event_id),
+                symbol,
+                side,
+                float(signal["entry"]),
+                float(signal["tp1"]),
+                float(signal["tp2"]),
+                float(signal["tp3"]),
+                float(signal["sl"]),
+                relation,
+                scanner_trade_id,
+                note,
+            ),
+        )
+
+        conn.commit()
+        return relation, scanner_trade_id
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_line_event_status(event_id, status, note=None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE line_signal_events
+            SET order_status=%s,
+                note=COALESCE(%s, note)
+            WHERE event_id=%s;
+            """,
+            (status, note, str(event_id)),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_live_open_position_count():
+    """
+    Best-effort count of currently open BingX perpetual positions.
+    Scanner remains simulation-only, so these positions represent the
+    separate LINE/Max Crypto live pool in the current architecture.
+    """
+    if not LIVE_TRADING:
+        return 0
+
+    result = bingx_private_request(
+        "GET",
+        "/openApi/swap/v2/user/positions",
+        {},
+    )
+
+    if result.get("code") != 0:
+        raise RuntimeError(f"Position query failed: {result}")
+
+    data = result.get("data", [])
+    if isinstance(data, dict):
+        data = data.get("positions", data.get("data", [data]))
+    if not isinstance(data, list):
+        data = []
+
+    count = 0
+    for item in data:
+        try:
+            qty = item.get(
+                "positionAmt",
+                item.get("positionAmount", item.get("availableAmt", 0)),
+            )
+            if abs(float(qty or 0)) > 0:
+                count += 1
+        except Exception:
+            continue
+
+    return count
 
 
 def create_simulated_trade(result):
@@ -1442,6 +1678,32 @@ def side_return_pct(side, entry, exit_price):
     if side == "SHORT":
         return (entry - exit_price) / entry * 100
     return (exit_price - entry) / entry * 100
+
+
+def gross_result_for_stop_levels(
+    side, entry, tp1, tp2,
+    tp1_hit, tp2_hit, stop_price
+):
+    realized = 0.0
+    remaining = 1.0
+
+    if tp1_hit:
+        realized += (TP1_PCT / 100) * side_return_pct(side, entry, tp1)
+        remaining -= TP1_PCT / 100
+
+    if tp2_hit:
+        realized += (TP2_PCT / 100) * side_return_pct(side, entry, tp2)
+        remaining -= TP2_PCT / 100
+
+    return realized + remaining * side_return_pct(side, entry, stop_price)
+
+
+def full_tp3_gross_result_levels(side, entry, tp1, tp2, tp3):
+    return (
+        (TP1_PCT / 100) * side_return_pct(side, entry, tp1)
+        + (TP2_PCT / 100) * side_return_pct(side, entry, tp2)
+        + (TP3_PCT / 100) * side_return_pct(side, entry, tp3)
+    )
 
 
 def gross_result_for_stop(tp1_hit, tp2_hit, stop_return_pct):
@@ -1883,7 +2145,7 @@ def update_v42_trade_replay(cur, row, current_price):
         # Conservative path: if stop and a new TP are both inside the same 1m
         # candle, credit the stop first.
         if _v42_stop_hit(side, high, low, active_stop):
-            gross = gross_result_for_stop(new_tp1, new_tp2, stop_return)
+            gross = gross_result_for_stop_levels(side, entry, tp1, tp2, new_tp1, new_tp2, active_stop)
             finalize_trade(
                 cur, trade_id, active_stop, gross, stop_reason,
                 new_tp1, new_tp2, new_tp3,
@@ -1903,7 +2165,7 @@ def update_v42_trade_replay(cur, row, current_price):
 
             # Same-candle conservative breakeven.
             if _v42_stop_hit(side, high, low, entry):
-                gross = gross_result_for_stop(True, False, 0.0)
+                gross = gross_result_for_stop_levels(side, entry, tp1, tp2, True, False, entry)
                 finalize_trade(
                     cur, trade_id, entry, gross, "BREAKEVEN_EXIT",
                     True, False, False, False,
@@ -1918,7 +2180,7 @@ def update_v42_trade_replay(cur, row, current_price):
             new_tp2 = True
 
             if _v42_stop_hit(side, high, low, tp1):
-                gross = gross_result_for_stop(True, True, SCANNER_TP1)
+                gross = gross_result_for_stop_levels(side, entry, tp1, tp2, True, True, tp1)
                 finalize_trade(
                     cur, trade_id, tp1, gross, "TP2_PROTECT_EXIT",
                     True, True, False, False,
@@ -1933,7 +2195,7 @@ def update_v42_trade_replay(cur, row, current_price):
             new_tp2 = True
 
             if _v42_stop_hit(side, high, low, tp1):
-                gross = gross_result_for_stop(True, True, SCANNER_TP1)
+                gross = gross_result_for_stop_levels(side, entry, tp1, tp2, True, True, tp1)
                 finalize_trade(
                     cur, trade_id, tp1, gross, "TP2_PROTECT_EXIT",
                     True, True, False, False,
@@ -1944,7 +2206,7 @@ def update_v42_trade_replay(cur, row, current_price):
                 return
 
             new_tp3 = True
-            gross = full_tp3_gross_result()
+            gross = full_tp3_gross_result_levels(side, entry, tp1, tp2, tp3)
 
             finalize_trade(
                 cur, trade_id, tp3, gross, "TP3_EXIT",
@@ -1963,7 +2225,7 @@ def update_v42_trade_replay(cur, row, current_price):
             current_price >= tp1 if side == "SHORT" else current_price <= tp1
         )
         if protection_hit:
-            gross = gross_result_for_stop(True, True, SCANNER_TP1)
+            gross = gross_result_for_stop_levels(side, entry, tp1, tp2, True, True, tp1)
             finalize_trade(
                 cur, trade_id, tp1, gross, "TP2_PROTECT_EXIT",
                 True, True, False, False,
@@ -1978,7 +2240,7 @@ def update_v42_trade_replay(cur, row, current_price):
             current_price >= entry if side == "SHORT" else current_price <= entry
         )
         if breakeven_hit:
-            gross = gross_result_for_stop(True, False, 0.0)
+            gross = gross_result_for_stop_levels(side, entry, tp1, tp2, True, False, entry)
             finalize_trade(
                 cur, trade_id, entry, gross, "BREAKEVEN_EXIT",
                 True, False, False, False,
@@ -1991,7 +2253,7 @@ def update_v42_trade_replay(cur, row, current_price):
     if not new_tp1:
         sl_now = current_price >= sl if side == "SHORT" else current_price <= sl
         if sl_now:
-            gross = -SCANNER_SL
+            gross = side_return_pct(side, entry, sl)
             finalize_trade(
                 cur, trade_id, sl, gross, "SL_EXIT",
                 False, False, False, True,
@@ -2050,7 +2312,7 @@ def update_simulated_trades():
             continue
 
         try:
-            if engine_version == SCANNER_ENGINE_VERSION:
+            if engine_version in (SCANNER_ENGINE_VERSION, "V4.2", "V4.2_PRE"):
                 update_v42_trade_replay(cur, row, prices[symbol])
             elif engine_version == "V3":
                 update_v3_trade_replay(cur, row, prices[symbol])
@@ -2202,6 +2464,7 @@ def scanner_trades_page():
         SELECT
             id, symbol, side, strategy, engine_version, signal_time,
             entry_price, score, trend_score, breakout_score,
+            resonance, resonance_source, management_mode,
             tp1, tp2, tp3, sl,
             tp1_hit, tp2_hit, tp3_hit, sl_hit,
             status, result_pct, net_result_pct, sim_pnl_usdt,
@@ -2224,6 +2487,7 @@ def scanner_trades_page():
         (
             trade_id, symbol, side, strategy, version, signal_time,
             entry, score, trend_score, breakout_score,
+            resonance, resonance_source, management_mode,
             tp1, tp2, tp3, sl,
             tp1_hit, tp2_hit, tp3_hit, sl_hit,
             status, gross, net, pnl,
@@ -2234,6 +2498,11 @@ def scanner_trades_page():
             f"#{trade_id} {symbol} | {version or '-'} | {side or 'LONG'} | {strategy} | {status}"
         )
         lines.append(f"Time: {signal_time}")
+        if resonance:
+            lines.append(
+                f"RESONANCE: YES | Source {resonance_source or '-'} | "
+                f"Management {management_mode or 'SCANNER'}"
+            )
         lines.append(
             f"Entry: {entry} | Score {score} | Trend {trend_score} | Breakout {breakout_score}"
         )
@@ -2372,6 +2641,35 @@ def scanner_stats_page():
     )
     exit_rows = cur.fetchall()
 
+    cur.execute(
+        """
+        SELECT
+            COUNT(*),
+            SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END),
+            COALESCE(AVG(CASE
+                WHEN status IN ('WIN','LOSS') THEN net_result_pct
+            END),0)
+        FROM scanner_trades
+        WHERE engine_version=%s
+          AND resonance=TRUE;
+        """,
+        (SCANNER_ENGINE_VERSION,),
+    )
+    resonance_total, resonance_wins, resonance_losses, resonance_avg = cur.fetchone()
+
+    cur.execute(
+        """
+        SELECT
+            relation,
+            COUNT(*)
+        FROM line_signal_events
+        GROUP BY relation
+        ORDER BY relation;
+        """
+    )
+    line_relation_rows = cur.fetchall()
+
     v3_rows = _load_engine_rows(cur, "V3")
     v3_net = [float(r[6] or 0) for r in v3_rows]
     v3_stats = calculate_performance_stats(v3_net)
@@ -2404,7 +2702,7 @@ def scanner_stats_page():
     open_notional = open_margin * SIM_LEVERAGE
 
     lines = [
-        "BINGX SCANNER V4.2 - PRODUCTION SIMULATION",
+        "BINGX SCANNER V4.2 LOCKED TEST - PRODUCTION SIMULATION",
         "============================================================",
         f"V4.2 Total signals: {int(total or 0)}",
         f"Open: {open_count}",
@@ -2475,6 +2773,24 @@ def scanner_stats_page():
             f"Win {wr:.2f}% | Avg net {float(eavg):.2f}%"
         )
 
+    resonance_resolved = int(resonance_wins or 0) + int(resonance_losses or 0)
+    resonance_wr = (
+        int(resonance_wins or 0) / resonance_resolved * 100
+        if resonance_resolved else 0
+    )
+
+    lines += [
+        "",
+        "RESONANCE / LINE SIGNALS",
+        "============================================================",
+        f"Resonance scanner trades: {int(resonance_total or 0)} | "
+        f"{int(resonance_wins or 0)}W/{int(resonance_losses or 0)}L | "
+        f"Win {resonance_wr:.2f}% | Avg net {float(resonance_avg or 0):.2f}%",
+    ]
+
+    for relation, count in line_relation_rows:
+        lines.append(f"{relation}: {int(count or 0)}")
+
     lines += [
         "",
         "V3 BENCHMARK",
@@ -2490,7 +2806,11 @@ def scanner_stats_page():
         f"Confirm tier: >= {V42_CONFIRM_SCORE}",
         f"80-84 enabled: {V42_ENABLE_80_84}",
         f"Timeout before TP1: {V42_POSITION_TIMEOUT_HOURS:.1f} hours",
-        f"Max open trades: {SCANNER_MAX_OPEN}",
+        f"Scanner max open trades: {SCANNER_MAX_OPEN}",
+        f"LINE/Max Crypto live pool max: {LINE_MAX_OPEN}",
+        f"TP split: {TP1_PCT:.0f}/{TP2_PCT:.0f}/{TP3_PCT:.0f}",
+        f"Scanner targets: {SCANNER_TP1:.1f}% / {SCANNER_TP2:.1f}% / {SCANNER_TP3:.1f}%",
+        f"Scanner initial SL: {SCANNER_SL:.1f}%",
         f"Daily loss stop: {SIM_DAILY_MAX_LOSS_USDT:.2f} U",
     ]
 
@@ -2505,7 +2825,7 @@ def scanner_status_page():
     ok, risk_reason = scanner_risk_allows_new_trade()
 
     lines = [
-        "BingX Scanner V4.2",
+        "BingX Scanner V4.2 LOCKED TEST",
         "================================",
         f"Web full-scan running: {status['running']}",
         f"Phase: {status['phase']}",
@@ -2540,7 +2860,7 @@ def home():
         f"LINE manual trading: {mode}\n"
         f"LINE leverage: {LEVERAGE}x\n"
         "Autonomous scanner: SIMULATION ONLY\n"
-        "Scanner version: V4.2\n"
+        "Scanner version: V4.2 LOCKED TEST\n"
         "Scanner manager: Render Cron every 5 minutes\n\n"
         "Pages:\n"
         "/db-test\n"
@@ -2601,6 +2921,51 @@ def webhook():
             continue
 
         try:
+            relation, scanner_trade_id = register_line_signal(signal, event_id)
+
+            print(
+                "LINE RELATION:",
+                relation,
+                "| scanner trade",
+                scanner_trade_id,
+                flush=True,
+            )
+
+            # Same symbol but opposite direction:
+            # keep the scanner direction and record the LINE disagreement only.
+            if relation == "OPPOSITE":
+                update_line_event_status(
+                    event_id,
+                    "RECORDED_ONLY",
+                    "Opposite to open scanner trade; no LINE order opened.",
+                )
+                print(
+                    "OPPOSITE SIGNAL RECORDED ONLY:",
+                    signal["symbol"],
+                    signal["side"],
+                    flush=True,
+                )
+                continue
+
+            # Scanner is simulation-only in this test version.
+            # LINE/Max Crypto has its own separate live pool, capped independently.
+            if LIVE_TRADING:
+                line_open = get_live_open_position_count()
+                if line_open >= LINE_MAX_OPEN:
+                    update_line_event_status(
+                        event_id,
+                        "POOL_FULL",
+                        f"LINE pool full: {line_open}/{LINE_MAX_OPEN}",
+                    )
+                    print(
+                        "LINE POOL FULL:",
+                        line_open,
+                        "/",
+                        LINE_MAX_OPEN,
+                        flush=True,
+                    )
+                    continue
+
             entry_result, params, contract, expected_qty = place_limit_entry(
                 signal, event_id
             )
@@ -2612,9 +2977,15 @@ def webhook():
             )
 
             if entry_result.get("code") != 0:
+                update_line_event_status(
+                    event_id,
+                    "ENTRY_ERROR",
+                    json.dumps(entry_result, ensure_ascii=False),
+                )
                 raise RuntimeError(f"Entry failed: {entry_result}")
 
             if not LIVE_TRADING:
+                update_line_event_status(event_id, "TEST_ONLY")
                 print("LINE TEST MODE: NO REAL ORDER", flush=True)
                 continue
 
@@ -2624,7 +2995,10 @@ def webhook():
             client_order_id = params.get("clientOrderId")
 
             if not order_id:
+                update_line_event_status(event_id, "NO_ORDER_ID")
                 raise RuntimeError("No orderId returned")
+
+            update_line_event_status(event_id, "ENTRY_PLACED")
 
             thread = threading.Thread(
                 target=monitor_limit_order,
