@@ -39,11 +39,13 @@ ORDER_POLL_SEC = float(os.environ.get("ORDER_POLL_SEC", "2"))
 BINGX_BASE_URL = "https://open-api.bingx.com"
 
 # =========================================================
-# SCANNER V3 SETTINGS
+# SCANNER V4.2 SETTINGS
 # =========================================================
 
-SCANNER_MIN_TREND_SCORE = int(os.environ.get("SCANNER_MIN_TREND_SCORE", "75"))
-SCANNER_MIN_BREAKOUT_SCORE = int(os.environ.get("SCANNER_MIN_BREAKOUT_SCORE", "75"))
+SCANNER_ENGINE_VERSION = "V4.2"
+
+SCANNER_MIN_TREND_SCORE = int(os.environ.get("SCANNER_MIN_TREND_SCORE", "85"))
+SCANNER_MIN_BREAKOUT_SCORE = int(os.environ.get("SCANNER_MIN_BREAKOUT_SCORE", "85"))
 SCANNER_MAX_NEW_PER_SCAN = int(os.environ.get("SCANNER_MAX_NEW_PER_SCAN", "3"))
 SCANNER_MAX_OPEN = int(os.environ.get("SCANNER_MAX_OPEN", "10"))
 SCANNER_COOLDOWN_HOURS = int(os.environ.get("SCANNER_COOLDOWN_HOURS", "4"))
@@ -56,34 +58,27 @@ SCANNER_SL = float(os.environ.get("SCANNER_SL", "3"))
 SCANNER_API_DELAY = float(os.environ.get("SCANNER_API_DELAY", "1.05"))
 SIM_MONITOR_SEC = int(os.environ.get("SIM_MONITOR_SEC", "30"))
 
-# V3 simulated money/risk assumptions
+V42_MAIN_SCORE = int(os.environ.get("V42_MAIN_SCORE", "90"))
+V42_CONFIRM_SCORE = int(os.environ.get("V42_CONFIRM_SCORE", "85"))
+V42_ENABLE_80_84 = os.environ.get("V42_ENABLE_80_84", "false").strip().lower() == "true"
+V42_POSITION_TIMEOUT_HOURS = float(os.environ.get("V42_POSITION_TIMEOUT_HOURS", "4"))
+
 SIM_START_BALANCE = float(os.environ.get("SIM_START_BALANCE", "1000"))
 SIM_MARGIN_USDT = float(os.environ.get("SIM_MARGIN_USDT", "10"))
 SIM_LEVERAGE = int(os.environ.get("SIM_LEVERAGE", str(LEVERAGE)))
 
-# Estimated per-side trading friction on notional.
-# 0.05% fee + 0.03% slippage per side by default.
 SIM_FEE_PCT = float(os.environ.get("SIM_FEE_PCT", "0.05"))
 SIM_SLIPPAGE_PCT = float(os.environ.get("SIM_SLIPPAGE_PCT", "0.03"))
 
-# Simulation risk controls (V3 only)
 SIM_DAILY_MAX_LOSS_USDT = float(os.environ.get("SIM_DAILY_MAX_LOSS_USDT", "20"))
 SIM_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("SIM_MAX_CONSECUTIVE_LOSSES", "4"))
 SIM_PAUSE_HOURS_AFTER_STREAK = int(os.environ.get("SIM_PAUSE_HOURS_AFTER_STREAK", "6"))
 
-# V3 TP/SL replay
 SIM_REPLAY_1M_LIMIT = int(os.environ.get("SIM_REPLAY_1M_LIMIT", "240"))
 
-# Optional web-service monitor. Keep false when Render Cron is the manager.
 ENABLE_WEB_SIM_MONITOR = os.environ.get(
     "ENABLE_WEB_SIM_MONITOR", "false"
 ).strip().lower() == "true"
-
-# Old full-scan route settings retained for compatibility
-FAST_DETAIL_LIMIT = int(os.environ.get("FAST_DETAIL_LIMIT", "120"))
-BREAKOUT_FORCE_SCORE = int(os.environ.get("BREAKOUT_FORCE_SCORE", "45"))
-MAX_DETAIL_SYMBOLS = int(os.environ.get("MAX_DETAIL_SYMBOLS", "180"))
-ONE_HOUR_CONFIRM_LIMIT = int(os.environ.get("ONE_HOUR_CONFIRM_LIMIT", "40"))
 
 scanner_lock = threading.Lock()
 scanner_status = {
@@ -180,6 +175,7 @@ def init_database():
         )
 
         migrations = [
+            "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS side VARCHAR(10) NOT NULL DEFAULT 'LONG';",
             "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS strategy VARCHAR(30);",
             "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS engine_version VARCHAR(10);",
             "ALTER TABLE scanner_trades ADD COLUMN IF NOT EXISTS trend_score INTEGER;",
@@ -201,7 +197,6 @@ def init_database():
         for sql in migrations:
             cur.execute(sql)
 
-        # Preserve old records without mixing them into V3.
         cur.execute(
             """
             UPDATE scanner_trades
@@ -227,7 +222,7 @@ def init_database():
         )
 
         conn.commit()
-        print("DATABASE READY | V3 MIGRATIONS OK", flush=True)
+        print("DATABASE READY | V4.2 MIGRATIONS OK", flush=True)
     finally:
         if cur:
             cur.close()
@@ -319,40 +314,20 @@ def parse_signal(text):
         "sl": None,
     }
 
-    symbol = re.search(
-        r"\u5e63\u7a2e\s*[:\uff1a]\s*([A-Za-z0-9]+)",
-        text,
-        re.I,
-    )
-
-    side = re.search(
-        r"\u65b9\u5411\s*[:\uff1a]\s*(\u591a|\u7a7a|LONG|SHORT)",
-        text,
-        re.I,
-    )
-
-    entry = re.search(
-        r"\u9032\u5834(?:\u50f9\u4f4d)?\s*[:\uff1a]\s*([0-9.]+)",
-        text,
-        re.I,
-    )
-
-    tp1 = re.search(r"TP1\s*[:\uff1a]\s*([0-9.]+)", text, re.I)
-    tp2 = re.search(r"TP2\s*[:\uff1a]\s*([0-9.]+)", text, re.I)
-    tp3 = re.search(r"TP3\s*[:\uff1a]\s*([0-9.]+)", text, re.I)
-
-    sl = re.search(
-        r"(?:SL|\u6b62\u640d)\s*[:\uff1a]\s*([0-9.]+)",
-        text,
-        re.I,
-    )
+    symbol = re.search(r"å¹£ç¨®\s*[:ï¼]\s*([A-Za-z0-9]+)", text, re.I)
+    side = re.search(r"æ¹å\s*[:ï¼]\s*(å¤|ç©º|LONG|SHORT)", text, re.I)
+    entry = re.search(r"é²å ´(?:å¹ä½)?\s*[:ï¼]\s*([0-9.]+)", text, re.I)
+    tp1 = re.search(r"TP1\s*[:ï¼]\s*([0-9.]+)", text, re.I)
+    tp2 = re.search(r"TP2\s*[:ï¼]\s*([0-9.]+)", text, re.I)
+    tp3 = re.search(r"TP3\s*[:ï¼]\s*([0-9.]+)", text, re.I)
+    sl = re.search(r"(?:SL|æ­¢æ)\s*[:ï¼]\s*([0-9.]+)", text, re.I)
 
     if symbol:
         result["symbol"] = symbol.group(1).upper()
 
     if side:
         side_text = side.group(1).upper()
-        result["side"] = "LONG" if side_text in ["\u591a", "LONG"] else "SHORT"
+        result["side"] = "LONG" if side_text in ["å¤", "LONG"] else "SHORT"
 
     if entry:
         result["entry"] = entry.group(1)
@@ -367,24 +342,30 @@ def parse_signal(text):
 
     return result
 
+
 def validate_signal(signal):
     for key in ["symbol", "side", "entry", "tp1", "tp2", "tp3", "sl"]:
         if not signal.get(key):
             return False, f"Missing field: {key}"
 
     try:
-        prices = [
-            float(signal["entry"]),
-            float(signal["tp1"]),
-            float(signal["tp2"]),
-            float(signal["tp3"]),
-            float(signal["sl"]),
-        ]
+        entry = float(signal["entry"])
+        tp1 = float(signal["tp1"])
+        tp2 = float(signal["tp2"])
+        tp3 = float(signal["tp3"])
+        sl = float(signal["sl"])
     except ValueError:
         return False, "Invalid price"
 
-    if min(prices) <= 0:
+    if min(entry, tp1, tp2, tp3, sl) <= 0:
         return False, "Prices must be > 0"
+
+    if signal["side"] == "LONG":
+        if not (sl < entry < tp1 < tp2 < tp3):
+            return False, "Invalid LONG price order"
+    else:
+        if not (tp3 < tp2 < tp1 < entry < sl):
+            return False, "Invalid SHORT price order"
 
     if abs(TP1_PCT + TP2_PCT + TP3_PCT - 100) > 0.0001:
         return False, "TP percentages must total 100"
@@ -701,7 +682,7 @@ def get_klines(symbol, interval, limit=100):
 
 
 # =========================================================
-# SCANNER ENTRY ANALYSIS
+# SCANNER V4.2 ENTRY ANALYSIS
 # =========================================================
 
 def valid_scanner_symbol(symbol):
@@ -726,7 +707,103 @@ def get_all_usdt_contracts():
     return sorted(set(symbols))
 
 
-def analyze_fast_5m(symbol):
+def _fast_direction_pack(
+    side, price, ema9, ema20, rsi,
+    momentum_15m, momentum_1h,
+    volume_ratio, volatility_pct,
+    previous_high, previous_low
+):
+    is_long = side == "LONG"
+    breakout = price > previous_high if is_long else price < previous_low
+    extension_pct = (
+        (price - ema20) / ema20 * 100
+        if is_long
+        else (ema20 - price) / ema20 * 100
+    )
+
+    directional_m15 = momentum_15m if is_long else -momentum_15m
+    directional_m1h = momentum_1h if is_long else -momentum_1h
+
+    breakout_score = 0
+    breakout_reasons = []
+
+    if volume_ratio >= 1.5:
+        breakout_score += 15
+    if volume_ratio >= 2.0:
+        breakout_score += 15
+        breakout_reasons.append(f"5méè½ {volume_ratio:.2f}x")
+    if volume_ratio >= 3.0:
+        breakout_score += 10
+
+    if directional_m15 >= 0.8:
+        breakout_score += 10
+    if directional_m15 >= 1.5:
+        breakout_score += 15
+        breakout_reasons.append(f"15åéæ¹ååè½ {directional_m15:.2f}%")
+    if directional_m15 >= 3.0:
+        breakout_score += 10
+
+    if breakout:
+        breakout_score += 20
+        breakout_reasons.append(
+            "5mçªç ´20æ ¹é«é»" if is_long else "5mè·ç ´20æ ¹ä½é»"
+        )
+
+    if is_long:
+        if 55 <= rsi <= 85:
+            breakout_score += 10
+        if rsi > 92:
+            breakout_score -= 20
+    else:
+        if 15 <= rsi <= 45:
+            breakout_score += 10
+        if rsi < 8:
+            breakout_score -= 20
+
+    if volatility_pct >= 2:
+        breakout_score += 5
+    if volatility_pct >= 4:
+        breakout_score += 5
+        breakout_reasons.append(f"æ³¢åæ´å¼µ {volatility_pct:.2f}%")
+
+    if extension_pct > 10:
+        breakout_score -= 15
+
+    trend_seed = 0
+    trend_reasons = []
+
+    price_ema9_ok = price > ema9 if is_long else price < ema9
+    ema_stack_ok = ema9 > ema20 if is_long else ema9 < ema20
+
+    if price_ema9_ok:
+        trend_seed += 10
+    if ema_stack_ok:
+        trend_seed += 15
+        trend_reasons.append(
+            "5m EMA9>EMA20" if is_long else "5m EMA9<EMA20"
+        )
+    if directional_m1h > 0.5:
+        trend_seed += 10
+
+    if is_long and 50 <= rsi <= 75:
+        trend_seed += 10
+    if (not is_long) and 25 <= rsi <= 50:
+        trend_seed += 10
+
+    if volume_ratio >= 1.2:
+        trend_seed += 5
+
+    return {
+        "breakout": breakout,
+        "extension_pct": extension_pct,
+        "breakout_score": breakout_score,
+        "breakout_reasons": breakout_reasons,
+        "trend_seed": trend_seed,
+        "trend_reasons": trend_reasons,
+    }
+
+
+def analyze_fast_5m(symbol, side_hint=None):
     candles = get_klines(symbol, "5m", 90)
     if len(candles) < 60:
         return None
@@ -756,83 +833,50 @@ def analyze_fast_5m(symbol):
     volume_ratio = volumes[-1] / avg_volume if avg_volume > 0 else 0
 
     previous_high = max(highs[-21:-1])
-    breakout = price > previous_high
+    previous_low = min(lows[-21:-1])
 
     recent_high = max(highs[-6:])
     recent_low = min(lows[-6:])
     volatility_pct = (recent_high - recent_low) / price * 100
-    extension_pct = (price - ema20) / ema20 * 100
 
-    breakout_score = 0
-    breakout_reasons = []
+    sides = [side_hint] if side_hint in ["LONG", "SHORT"] else ["LONG", "SHORT"]
+    candidates = []
 
-    if volume_ratio >= 1.5:
-        breakout_score += 15
-    if volume_ratio >= 2.0:
-        breakout_score += 15
-        breakout_reasons.append(f"5méè½{volume_ratio:.2f}x")
-    if volume_ratio >= 3.0:
-        breakout_score += 10
+    for side in sides:
+        pack = _fast_direction_pack(
+            side, price, ema9, ema20, rsi,
+            momentum_15m, momentum_1h,
+            volume_ratio, volatility_pct,
+            previous_high, previous_low,
+        )
 
-    if momentum_15m >= 0.8:
-        breakout_score += 10
-    if momentum_15m >= 1.5:
-        breakout_score += 15
-        breakout_reasons.append(f"15åé+{momentum_15m:.2f}%")
-    if momentum_15m >= 3.0:
-        breakout_score += 10
+        candidates.append({
+            "symbol": symbol,
+            "side": side,
+            "price": price,
+            "rsi_5m": rsi,
+            "volume_ratio_5m": volume_ratio,
+            "momentum_5m": momentum_15m,
+            "momentum_1h_fast": momentum_1h,
+            "volatility_pct": volatility_pct,
+            "extension_pct": pack["extension_pct"],
+            "breakout_5m": pack["breakout"],
+            "breakout_score_fast": max(0, pack["breakout_score"]),
+            "trend_seed": max(0, pack["trend_seed"]),
+            "fast_score": max(pack["trend_seed"], pack["breakout_score"]),
+            "breakout_reasons": pack["breakout_reasons"],
+            "trend_reasons": pack["trend_reasons"],
+        })
 
-    if breakout:
-        breakout_score += 20
-        breakout_reasons.append("5mçªç ´20æ ¹é«é»")
-
-    if 55 <= rsi <= 85:
-        breakout_score += 10
-    if volatility_pct >= 2:
-        breakout_score += 5
-    if volatility_pct >= 4:
-        breakout_score += 5
-        breakout_reasons.append(f"æ³¢åæ´å¼µ{volatility_pct:.2f}%")
-    if extension_pct > 10:
-        breakout_score -= 15
-    if rsi > 92:
-        breakout_score -= 20
-
-    trend_seed = 0
-    trend_reasons = []
-
-    if price > ema9:
-        trend_seed += 10
-    if ema9 > ema20:
-        trend_seed += 15
-        trend_reasons.append("5m EMA9>EMA20")
-    if momentum_1h > 0.5:
-        trend_seed += 10
-    if 50 <= rsi <= 75:
-        trend_seed += 10
-    if volume_ratio >= 1.2:
-        trend_seed += 5
-
-    return {
-        "symbol": symbol,
-        "price": price,
-        "rsi_5m": rsi,
-        "volume_ratio_5m": volume_ratio,
-        "momentum_5m": momentum_15m,
-        "momentum_1h_fast": momentum_1h,
-        "volatility_pct": volatility_pct,
-        "extension_pct": extension_pct,
-        "breakout_5m": breakout,
-        "breakout_score_fast": breakout_score,
-        "trend_seed": trend_seed,
-        "fast_score": max(trend_seed, breakout_score),
-        "breakout_reasons": breakout_reasons,
-        "trend_reasons": trend_reasons,
-    }
+    candidates.sort(key=lambda x: x["fast_score"], reverse=True)
+    return candidates[0] if candidates else None
 
 
 def analyze_15m_detail(fast):
     symbol = fast["symbol"]
+    side = fast["side"]
+    is_long = side == "LONG"
+
     candles = get_klines(symbol, "15m", 100)
     if len(candles) < 60:
         return None
@@ -840,6 +884,7 @@ def analyze_15m_detail(fast):
     completed = candles[:-1]
     closes = [x["close"] for x in completed]
     highs = [x["high"] for x in completed]
+    lows = [x["low"] for x in completed]
     volumes = [x["volume"] for x in completed]
 
     price = closes[-1]
@@ -851,49 +896,79 @@ def analyze_15m_detail(fast):
         return None
 
     momentum = (price - closes[-6]) / closes[-6] * 100
+    directional_momentum = momentum if is_long else -momentum
+
     previous_volumes = volumes[-21:-1]
     avg_volume = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0
     volume_ratio = volumes[-1] / avg_volume if avg_volume > 0 else 0
 
     previous_high = max(highs[-21:-1])
-    breakout_15m = price > previous_high
-    extension_15m = (price - ema20) / ema20 * 100
+    previous_low = min(lows[-21:-1])
+    breakout_15m = price > previous_high if is_long else price < previous_low
 
-    trend_score = 0
+    extension_15m = (
+        (price - ema20) / ema20 * 100
+        if is_long
+        else (ema20 - price) / ema20 * 100
+    )
+
+    trend_score = int(fast["trend_seed"])
     trend_reasons = list(fast["trend_reasons"])
 
-    if price > ema20:
+    price_ema20_ok = price > ema20 if is_long else price < ema20
+    ema_stack_ok = ema20 > ema50 if is_long else ema20 < ema50
+
+    if price_ema20_ok:
         trend_score += 15
-        trend_reasons.append("15må¹æ ¼>EMA20")
-    if ema20 > ema50:
+        trend_reasons.append(
+            "15må¹æ ¼>EMA20" if is_long else "15må¹æ ¼<EMA20"
+        )
+
+    if ema_stack_ok:
         trend_score += 20
-        trend_reasons.append("15m EMA20>EMA50")
-    if 50 <= rsi <= 68:
-        trend_score += 15
-        trend_reasons.append(f"15m RSI={rsi:.1f}")
-    elif 68 < rsi < 80:
+        trend_reasons.append(
+            "15m EMA20>EMA50" if is_long else "15m EMA20<EMA50"
+        )
+
+    if is_long:
+        if 50 <= rsi <= 68:
+            trend_score += 15
+            trend_reasons.append(f"15m RSI={rsi:.1f}")
+        elif 68 < rsi < 78:
+            trend_score += 5
+    else:
+        if 32 <= rsi <= 50:
+            trend_score += 15
+            trend_reasons.append(f"15m RSI={rsi:.1f}")
+        elif 22 < rsi < 32:
+            trend_score += 5
+
+    if directional_momentum > 0.3:
         trend_score += 5
-    if momentum > 0.3:
-        trend_score += 5
-    if momentum > 1:
+    if directional_momentum > 1:
         trend_score += 10
-        trend_reasons.append(f"15måè½+{momentum:.2f}%")
+        trend_reasons.append(f"15mæ¹ååè½ {directional_momentum:.2f}%")
+
     if volume_ratio >= 1.3:
         trend_score += 10
     if volume_ratio >= 1.8:
         trend_score += 5
-        trend_reasons.append(f"15méè½{volume_ratio:.2f}x")
+        trend_reasons.append(f"15méè½ {volume_ratio:.2f}x")
+
     if breakout_15m:
         trend_score += 15
-        trend_reasons.append("15mçªç ´")
+        trend_reasons.append("15mçªç ´" if is_long else "15mè·ç ´")
 
     trend_blocked = False
-    if rsi >= 80:
+    if is_long and rsi >= 78:
         trend_blocked = True
-        trend_reasons.append("è¶¨å¢ç­ç¥é»æ: RSI>=80")
-    if extension_15m >= 10:
+        trend_reasons.append("è¶¨å¢é»æï¼LONG RSIéç±")
+    if (not is_long) and rsi <= 22:
         trend_blocked = True
-        trend_reasons.append("è¶¨å¢ç­ç¥é»æ: ä¹é¢éå¤§")
+        trend_reasons.append("è¶¨å¢é»æï¼SHORT RSIéå·")
+    if extension_15m >= 8:
+        trend_blocked = True
+        trend_reasons.append("è¶¨å¢é»æï¼15mä¹é¢éå¤§")
 
     breakout_score = int(fast["breakout_score_fast"])
     breakout_reasons = list(fast["breakout_reasons"])
@@ -902,22 +977,29 @@ def analyze_15m_detail(fast):
         breakout_score += 10
     if breakout_15m:
         breakout_score += 10
-        breakout_reasons.append("15måæ­¥çªç ´")
-    if momentum > 1:
+        breakout_reasons.append("15måæ­¥çªç ´" if is_long else "15måæ­¥è·ç ´")
+    if directional_momentum > 1:
         breakout_score += 5
-    if price > ema20:
+    if price_ema20_ok:
         breakout_score += 5
 
     breakout_blocked = False
-    if fast["rsi_5m"] > 90:
+    if is_long and fast["rsi_5m"] > 90:
         breakout_blocked = True
-        breakout_reasons.append("çç¼ç­ç¥é»æ: 5m RSI>90")
+        breakout_reasons.append("çç¼é»æï¼5m RSI>90")
+    if (not is_long) and fast["rsi_5m"] < 10:
+        breakout_blocked = True
+        breakout_reasons.append("çç¼é»æï¼5m RSI<10")
     if fast["extension_pct"] > 9:
         breakout_blocked = True
-        breakout_reasons.append("çç¼ç­ç¥é»æ: 5mä¹é¢éå¤§")
+        breakout_reasons.append("çç¼é»æï¼5mä¹é¢éå¤§")
     if fast["volume_ratio_5m"] < 1.8:
         breakout_blocked = True
-    if fast["momentum_5m"] < 1.0:
+
+    directional_fast_momentum = (
+        fast["momentum_5m"] if is_long else -fast["momentum_5m"]
+    )
+    if directional_fast_momentum < 1.0:
         breakout_blocked = True
     if not fast["breakout_5m"]:
         breakout_blocked = True
@@ -929,9 +1011,15 @@ def analyze_15m_detail(fast):
         "volume_ratio": volume_ratio,
         "momentum_pct": momentum,
         "breakout": fast["breakout_5m"] or breakout_15m,
-        "trend_15m": "UP" if (price > ema20 and ema20 > ema50) else "DOWN",
-        "trend_score": trend_score,
-        "breakout_score": breakout_score,
+        "trend_15m": (
+            "UP"
+            if is_long and price > ema20 and ema20 > ema50
+            else "DOWN"
+            if (not is_long) and price < ema20 and ema20 < ema50
+            else "MIXED"
+        ),
+        "trend_score": max(0, min(100, trend_score)),
+        "breakout_score": max(0, min(100, breakout_score)),
         "trend_blocked": trend_blocked,
         "breakout_blocked": breakout_blocked,
         "trend_reasons_final": trend_reasons,
@@ -956,43 +1044,131 @@ def confirm_1h(result):
         result["trend_1h"] = "UNKNOWN"
         return result
 
-    if price > ema20 and ema20 > ema50:
-        result["trend_1h"] = "UP"
-        result["trend_score"] += 15
-        result["trend_reasons_final"].append("1hå¤é ­ç¢ºèª")
-        result["breakout_score"] += 5
-    elif price > ema20:
-        result["trend_1h"] = "WEAK_UP"
-        result["trend_score"] += 5
-    else:
-        result["trend_1h"] = "DOWN"
-        result["trend_score"] -= 10
+    is_long = result["side"] == "LONG"
 
+    if is_long:
+        if price > ema20 and ema20 > ema50:
+            result["trend_1h"] = "UP"
+            result["trend_score"] += 15
+            result["trend_reasons_final"].append("1hå¤é ­ç¢ºèª")
+            result["breakout_score"] += 5
+        elif price > ema20:
+            result["trend_1h"] = "WEAK_UP"
+            result["trend_score"] += 5
+        else:
+            result["trend_1h"] = "DOWN"
+            result["trend_score"] -= 10
+    else:
+        if price < ema20 and ema20 < ema50:
+            result["trend_1h"] = "DOWN"
+            result["trend_score"] += 15
+            result["trend_reasons_final"].append("1hç©ºé ­ç¢ºèª")
+            result["breakout_score"] += 5
+        elif price < ema20:
+            result["trend_1h"] = "WEAK_DOWN"
+            result["trend_score"] += 5
+        else:
+            result["trend_1h"] = "UP"
+            result["trend_score"] -= 10
+
+    result["trend_score"] = max(0, min(100, int(result["trend_score"])))
+    result["breakout_score"] = max(0, min(100, int(result["breakout_score"])))
     return result
 
 
+def _score_tier_allows(result, strategy):
+    score = result["trend_score"] if strategy == "TREND" else result["breakout_score"]
+
+    if score >= V42_MAIN_SCORE:
+        return True
+
+    side = result["side"]
+    is_long = side == "LONG"
+    directional_momentum = (
+        result["momentum_5m"] if is_long else -result["momentum_5m"]
+    )
+
+    aligned_1h = (
+        result.get("trend_1h") in ["UP", "WEAK_UP"]
+        if is_long
+        else result.get("trend_1h") in ["DOWN", "WEAK_DOWN"]
+    )
+
+    if score >= V42_CONFIRM_SCORE:
+        if strategy == "BREAKOUT":
+            return (
+                aligned_1h
+                and result.get("breakout", False)
+                and result.get("volume_ratio_5m", 0) >= 2.0
+                and directional_momentum >= 1.2
+            )
+
+        aligned_15m = (
+            result.get("trend_15m") == "UP"
+            if is_long
+            else result.get("trend_15m") == "DOWN"
+        )
+        return (
+            aligned_1h
+            and aligned_15m
+            and result.get("volume_ratio", 0) >= 1.3
+            and directional_momentum >= 0.6
+        )
+
+    if 80 <= score <= 84 and V42_ENABLE_80_84:
+        strong_1h = (
+            result.get("trend_1h") == "UP"
+            if is_long
+            else result.get("trend_1h") == "DOWN"
+        )
+        return (
+            strategy == "BREAKOUT"
+            and strong_1h
+            and result.get("breakout", False)
+            and result.get("volume_ratio_5m", 0) >= 2.5
+            and directional_momentum >= 1.5
+        )
+
+    return False
+
+
 def choose_strategy(result):
+    is_long = result["side"] == "LONG"
+
+    trend_alignment_ok = (
+        result.get("trend_1h") in ["UP", "WEAK_UP"]
+        if is_long
+        else result.get("trend_1h") in ["DOWN", "WEAK_DOWN"]
+    )
+
     trend_ok = (
         not result.get("trend_blocked", True)
         and result["trend_score"] >= SCANNER_MIN_TREND_SCORE
-        and result.get("trend_1h", "UNKNOWN") in ["UP", "WEAK_UP"]
+        and trend_alignment_ok
+        and _score_tier_allows(result, "TREND")
     )
 
     breakout_ok = (
         not result.get("breakout_blocked", True)
         and result["breakout_score"] >= SCANNER_MIN_BREAKOUT_SCORE
+        and _score_tier_allows(result, "BREAKOUT")
     )
 
     if trend_ok and breakout_ok:
-        strategy = "BREAKOUT" if result["breakout_score"] > result["trend_score"] else "TREND"
-    elif trend_ok:
-        strategy = "TREND"
+        strategy = (
+            "BREAKOUT"
+            if result["breakout_score"] >= result["trend_score"]
+            else "TREND"
+        )
     elif breakout_ok:
         strategy = "BREAKOUT"
+    elif trend_ok:
+        strategy = "TREND"
     else:
         return None
 
     result["strategy"] = strategy
+
     if strategy == "TREND":
         result["score"] = result["trend_score"]
         result["reasons"] = result["trend_reasons_final"]
@@ -1015,9 +1191,10 @@ def scanner_open_count():
         SELECT COUNT(*)
         FROM scanner_trades
         WHERE status = 'OPEN'
-          AND engine_version = 'V3'
+          AND engine_version = %s
           AND strategy IN ('TREND', 'BREAKOUT');
-        """
+        """,
+        (SCANNER_ENGINE_VERSION,),
     )
     count = cur.fetchone()[0]
     cur.close()
@@ -1033,7 +1210,7 @@ def scanner_can_open(symbol):
         SELECT id
         FROM scanner_trades
         WHERE symbol = %s
-          AND engine_version = 'V3'
+          AND engine_version = %s
           AND strategy IN ('TREND', 'BREAKOUT')
           AND (
               status = 'OPEN'
@@ -1042,7 +1219,7 @@ def scanner_can_open(symbol):
         ORDER BY signal_time DESC
         LIMIT 1;
         """,
-        (symbol, SCANNER_COOLDOWN_HOURS),
+        (symbol, SCANNER_ENGINE_VERSION, SCANNER_COOLDOWN_HOURS),
     )
     found = cur.fetchone()
     cur.close()
@@ -1050,17 +1227,18 @@ def scanner_can_open(symbol):
     return found is None
 
 
-def get_v3_closed_pnl():
+def get_engine_closed_pnl(engine_version=SCANNER_ENGINE_VERSION):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT COALESCE(SUM(sim_pnl_usdt), 0)
         FROM scanner_trades
-        WHERE engine_version = 'V3'
+        WHERE engine_version = %s
           AND status IN ('WIN', 'LOSS')
           AND sim_pnl_usdt IS NOT NULL;
-        """
+        """,
+        (engine_version,),
     )
     pnl = float(cur.fetchone()[0] or 0)
     cur.close()
@@ -1068,19 +1246,23 @@ def get_v3_closed_pnl():
     return pnl
 
 
+def get_v3_closed_pnl():
+    return get_engine_closed_pnl("V3")
+
+
 def scanner_risk_allows_new_trade():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Daily realized PnL (UTC; intentionally deterministic for the backend).
     cur.execute(
         """
         SELECT COALESCE(SUM(sim_pnl_usdt), 0)
         FROM scanner_trades
-        WHERE engine_version = 'V3'
+        WHERE engine_version = %s
           AND status IN ('WIN', 'LOSS')
           AND closed_at >= DATE_TRUNC('day', NOW());
-        """
+        """,
+        (SCANNER_ENGINE_VERSION,),
     )
     daily_pnl = float(cur.fetchone()[0] or 0)
 
@@ -1089,22 +1271,22 @@ def scanner_risk_allows_new_trade():
         conn.close()
         return False, f"DAILY_LOSS_LIMIT {daily_pnl:.2f}U"
 
-    # Consecutive losses from most recent closed trades.
     cur.execute(
         """
         SELECT status, closed_at
         FROM scanner_trades
-        WHERE engine_version = 'V3'
+        WHERE engine_version = %s
           AND status IN ('WIN', 'LOSS')
         ORDER BY closed_at DESC, id DESC
         LIMIT %s;
         """,
-        (max(SIM_MAX_CONSECUTIVE_LOSSES, 1),),
+        (SCANNER_ENGINE_VERSION, max(SIM_MAX_CONSECUTIVE_LOSSES, 1)),
     )
     rows = cur.fetchall()
 
     streak = 0
     most_recent_loss_time = None
+
     for status, closed_at in rows:
         if status == "LOSS":
             streak += 1
@@ -1114,10 +1296,7 @@ def scanner_risk_allows_new_trade():
             break
 
     if streak >= SIM_MAX_CONSECUTIVE_LOSSES and most_recent_loss_time is not None:
-        cur.execute(
-            "SELECT NOW() - %s;",
-            (most_recent_loss_time,),
-        )
+        cur.execute("SELECT NOW() - %s;", (most_recent_loss_time,))
         elapsed = cur.fetchone()[0]
         if elapsed.total_seconds() < SIM_PAUSE_HOURS_AFTER_STREAK * 3600:
             cur.close()
@@ -1127,7 +1306,7 @@ def scanner_risk_allows_new_trade():
     cur.close()
     conn.close()
 
-    balance = SIM_START_BALANCE + get_v3_closed_pnl()
+    balance = SIM_START_BALANCE + get_engine_closed_pnl()
     reserved = scanner_open_count() * SIM_MARGIN_USDT
     free_balance = balance - reserved
 
@@ -1139,10 +1318,18 @@ def scanner_risk_allows_new_trade():
 
 def create_simulated_trade(result):
     entry = float(result["price"])
-    tp1 = entry * (1 + SCANNER_TP1 / 100)
-    tp2 = entry * (1 + SCANNER_TP2 / 100)
-    tp3 = entry * (1 + SCANNER_TP3 / 100)
-    sl = entry * (1 - SCANNER_SL / 100)
+    side = result.get("side", "LONG").upper()
+
+    if side == "LONG":
+        tp1 = entry * (1 + SCANNER_TP1 / 100)
+        tp2 = entry * (1 + SCANNER_TP2 / 100)
+        tp3 = entry * (1 + SCANNER_TP3 / 100)
+        sl = entry * (1 - SCANNER_SL / 100)
+    else:
+        tp1 = entry * (1 - SCANNER_TP1 / 100)
+        tp2 = entry * (1 - SCANNER_TP2 / 100)
+        tp3 = entry * (1 - SCANNER_TP3 / 100)
+        sl = entry * (1 + SCANNER_SL / 100)
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1167,7 +1354,7 @@ def create_simulated_trade(result):
             last_checked_at
         )
         VALUES (
-            %s, 'LONG', %s, 'V3',
+            %s, %s, %s, %s,
             %s,
 
             %s, %s, %s,
@@ -1186,7 +1373,8 @@ def create_simulated_trade(result):
         RETURNING id;
         """,
         (
-            result["symbol"], result["strategy"], entry,
+            result["symbol"], side, result["strategy"], SCANNER_ENGINE_VERSION,
+            entry,
 
             result["score"], result["trend_score"], result["breakout_score"],
             result["rsi"], result["rsi_5m"],
@@ -1208,8 +1396,8 @@ def create_simulated_trade(result):
     conn.close()
 
     print(
-        "SIMULATED V3 TRADE:",
-        trade_id, result["strategy"], result["symbol"], result["score"],
+        f"SIMULATED {SCANNER_ENGINE_VERSION} TRADE:",
+        trade_id, side, result["strategy"], result["symbol"], result["score"],
         flush=True,
     )
     return trade_id
@@ -1250,6 +1438,12 @@ def calculate_net_result(gross_result_pct, margin_usdt=None, leverage=None):
     return net_result_pct, pnl_usdt
 
 
+def side_return_pct(side, entry, exit_price):
+    if side == "SHORT":
+        return (entry - exit_price) / entry * 100
+    return (exit_price - entry) / entry * 100
+
+
 def gross_result_for_stop(tp1_hit, tp2_hit, stop_return_pct):
     realized = 0.0
     remaining = 1.0
@@ -1273,7 +1467,7 @@ def full_tp3_gross_result():
     )
 
 
-def finalize_v3_trade(
+def finalize_trade(
     cur, trade_id, exit_price, gross_result_pct, exit_reason,
     tp1_hit, tp2_hit, tp3_hit, sl_hit,
     highest_price, lowest_price, margin_usdt, leverage,
@@ -1292,19 +1486,15 @@ def finalize_v3_trade(
             tp2_hit = %s,
             tp3_hit = %s,
             sl_hit = %s,
-
             highest_price = %s,
             lowest_price = %s,
-
             exit_price = %s,
             result_pct = %s,
             net_result_pct = %s,
             sim_pnl_usdt = %s,
-
             status = %s,
             exit_reason = %s,
             exit_detail = %s,
-
             last_checked_at = NOW(),
             closed_at = NOW()
         WHERE id = %s
@@ -1320,7 +1510,7 @@ def finalize_v3_trade(
     )
 
     print(
-        "V3 CLOSED:",
+        "TRADE CLOSED:",
         trade_id,
         exit_reason,
         f"gross={gross_result_pct:.2f}%",
@@ -1330,13 +1520,18 @@ def finalize_v3_trade(
     )
 
 
+# Compatibility name for the existing scanner_job.py import.
+def finalize_v3_trade(*args, **kwargs):
+    return finalize_trade(*args, **kwargs)
+
+
 # =========================================================
-# V2 LEGACY MONITOR (keeps old test logic intact)
+# V2 / V3 LEGACY MONITOR
 # =========================================================
 
 def update_v2_trade_current_price(cur, row, current_price):
     (
-        trade_id, symbol, engine_version, signal_time, entry,
+        trade_id, symbol, side, engine_version, signal_time, entry,
         tp1, tp2, tp3, sl,
         tp1_hit, tp2_hit, tp3_hit,
         highest_price, lowest_price,
@@ -1349,10 +1544,11 @@ def update_v2_trade_current_price(cur, row, current_price):
     new_tp1 = bool(tp1_hit or current_price >= tp1)
     new_tp2 = bool(tp2_hit or current_price >= tp2)
     new_tp3 = bool(tp3_hit or current_price >= tp3)
+
     if new_tp3:
         new_tp1 = True
         new_tp2 = True
-    if new_tp2:
+    elif new_tp2:
         new_tp1 = True
 
     sl_hit = current_price <= sl
@@ -1372,17 +1568,21 @@ def update_v2_trade_current_price(cur, row, current_price):
             """,
             (highest_price, lowest_price, current_price, gross, trade_id),
         )
+
     elif sl_hit:
         remaining = 1.0
         realized = 0.0
+
         if new_tp1:
             realized += (TP1_PCT / 100) * SCANNER_TP1
             remaining -= TP1_PCT / 100
         if new_tp2:
             realized += (TP2_PCT / 100) * SCANNER_TP2
             remaining -= TP2_PCT / 100
+
         gross = realized - remaining * SCANNER_SL
         status = "WIN" if gross > 0 else "LOSS"
+
         cur.execute(
             """
             UPDATE scanner_trades
@@ -1400,6 +1600,7 @@ def update_v2_trade_current_price(cur, row, current_price):
                 current_price, gross, status, trade_id,
             ),
         )
+
     else:
         cur.execute(
             """
@@ -1415,13 +1616,9 @@ def update_v2_trade_current_price(cur, row, current_price):
         )
 
 
-# =========================================================
-# V3 1-MINUTE REPLAY + PROTECTIVE STOPS
-# =========================================================
-
 def update_v3_trade_replay(cur, row, current_price):
     (
-        trade_id, symbol, engine_version, signal_time, entry,
+        trade_id, symbol, side, engine_version, signal_time, entry,
         tp1, tp2, tp3, sl,
         tp1_hit, tp2_hit, tp3_hit,
         highest_price, lowest_price,
@@ -1459,7 +1656,6 @@ def update_v3_trade_replay(cur, row, current_price):
         highest_price = max(highest_price, high)
         lowest_price = min(lowest_price, low)
 
-        # Stop active BEFORE this candle's new TP hits.
         if new_tp2:
             active_stop = tp1
             stop_return = SCANNER_TP1
@@ -1475,34 +1671,30 @@ def update_v3_trade_replay(cur, row, current_price):
 
         if low <= active_stop:
             gross = gross_result_for_stop(new_tp1, new_tp2, stop_return)
-            finalize_v3_trade(
+            finalize_trade(
                 cur, trade_id, active_stop, gross, stop_reason,
                 new_tp1, new_tp2, new_tp3,
                 stop_reason == "SL_EXIT",
                 highest_price, lowest_price,
                 margin_usdt, leverage,
-                "1m replay: protective stop hit before new TP credit",
+                "V3 legacy 1m replay",
             )
             return
 
-        # Determine new targets touched inside this candle.
         hit_tp1_now = (not new_tp1 and high >= tp1)
         hit_tp2_now = (not new_tp2 and high >= tp2)
         hit_tp3_now = (not new_tp3 and high >= tp3)
 
-        # Conservative ambiguity handling:
-        # after TP1 becomes active, if same candle also trades back to entry,
-        # close at breakeven rather than assuming the favorable path.
         if hit_tp1_now:
             new_tp1 = True
             if low <= entry:
                 gross = gross_result_for_stop(True, False, 0.0)
-                finalize_v3_trade(
+                finalize_trade(
                     cur, trade_id, entry, gross, "BREAKEVEN_EXIT",
                     True, False, False, False,
                     highest_price, lowest_price,
                     margin_usdt, leverage,
-                    "same 1m candle touched TP1 and breakeven; conservative sequence",
+                    "V3 same candle TP1 + breakeven",
                 )
                 return
 
@@ -1511,77 +1703,303 @@ def update_v3_trade_replay(cur, row, current_price):
             new_tp2 = True
             if low <= tp1:
                 gross = gross_result_for_stop(True, True, SCANNER_TP1)
-                finalize_v3_trade(
+                finalize_trade(
                     cur, trade_id, tp1, gross, "TP2_PROTECT_EXIT",
                     True, True, False, False,
                     highest_price, lowest_price,
                     margin_usdt, leverage,
-                    "same 1m candle touched TP2 and TP1 protection; conservative sequence",
+                    "V3 same candle TP2 + protection",
                 )
                 return
 
         if hit_tp3_now:
-            # Only credit TP3 if the candle did not also violate the TP2 protection.
             new_tp1 = True
             new_tp2 = True
+
             if low <= tp1:
                 gross = gross_result_for_stop(True, True, SCANNER_TP1)
-                finalize_v3_trade(
+                finalize_trade(
                     cur, trade_id, tp1, gross, "TP2_PROTECT_EXIT",
                     True, True, False, False,
                     highest_price, lowest_price,
                     margin_usdt, leverage,
-                    "same 1m candle touched TP3 and TP1 protection; conservative sequence",
+                    "V3 same candle TP3 + protection",
                 )
                 return
 
             new_tp3 = True
             gross = full_tp3_gross_result()
-            finalize_v3_trade(
+            finalize_trade(
                 cur, trade_id, tp3, gross, "TP3_EXIT",
                 True, True, True, False,
                 highest_price, lowest_price,
                 margin_usdt, leverage,
-                "1m replay TP3",
+                "V3 1m replay TP3",
             )
             return
 
-    # Current price fallback after replay.
     highest_price = max(highest_price, current_price)
     lowest_price = min(lowest_price, current_price)
 
     if new_tp2 and current_price <= tp1:
         gross = gross_result_for_stop(True, True, SCANNER_TP1)
-        finalize_v3_trade(
+        finalize_trade(
             cur, trade_id, tp1, gross, "TP2_PROTECT_EXIT",
             True, True, False, False,
             highest_price, lowest_price,
             margin_usdt, leverage,
-            "current price below TP2 protection",
+            "V3 current price protection",
         )
         return
 
     if new_tp1 and not new_tp2 and current_price <= entry:
         gross = gross_result_for_stop(True, False, 0.0)
-        finalize_v3_trade(
+        finalize_trade(
             cur, trade_id, entry, gross, "BREAKEVEN_EXIT",
             True, False, False, False,
             highest_price, lowest_price,
             margin_usdt, leverage,
-            "current price below breakeven protection",
+            "V3 current price breakeven",
         )
         return
 
     if not new_tp1 and current_price <= sl:
         gross = -SCANNER_SL
-        finalize_v3_trade(
+        finalize_trade(
             cur, trade_id, sl, gross, "SL_EXIT",
             False, False, False, True,
             highest_price, lowest_price,
             margin_usdt, leverage,
-            "current price below original SL",
+            "V3 current price SL",
         )
         return
+
+    cur.execute(
+        """
+        UPDATE scanner_trades
+        SET tp1_hit=%s, tp2_hit=%s, tp3_hit=%s,
+            highest_price=%s, lowest_price=%s,
+            last_checked_at=NOW()
+        WHERE id=%s AND status='OPEN';
+        """,
+        (
+            new_tp1, new_tp2, new_tp3,
+            highest_price, lowest_price,
+            trade_id,
+        ),
+    )
+
+
+# =========================================================
+# V4.2 LONG / SHORT 1-MINUTE REPLAY + TIMEOUT
+# =========================================================
+
+def _v42_stop_hit(side, candle_high, candle_low, stop_price):
+    if side == "SHORT":
+        return candle_high >= stop_price
+    return candle_low <= stop_price
+
+
+def _v42_tp_hit(side, candle_high, candle_low, target):
+    if side == "SHORT":
+        return candle_low <= target
+    return candle_high >= target
+
+
+def update_v42_trade_replay(cur, row, current_price):
+    (
+        trade_id, symbol, side, engine_version, signal_time, entry,
+        tp1, tp2, tp3, sl,
+        tp1_hit, tp2_hit, tp3_hit,
+        highest_price, lowest_price,
+        last_checked_at, margin_usdt, leverage
+    ) = row
+
+    side = (side or "LONG").upper()
+
+    highest_price = highest_price or entry
+    lowest_price = lowest_price or entry
+    new_tp1 = bool(tp1_hit)
+    new_tp2 = bool(tp2_hit)
+    new_tp3 = bool(tp3_hit)
+
+    # Timeout applies only before TP1.
+    if not new_tp1 and signal_time is not None:
+        age_hours = (time.time() - signal_time.timestamp()) / 3600.0
+
+        if age_hours >= V42_POSITION_TIMEOUT_HOURS:
+            highest_price = max(highest_price, current_price)
+            lowest_price = min(lowest_price, current_price)
+
+            gross = side_return_pct(side, entry, current_price)
+
+            finalize_trade(
+                cur, trade_id, current_price, gross, "TIMEOUT_EXIT",
+                False, False, False, False,
+                highest_price, lowest_price,
+                margin_usdt, leverage,
+                f"V4.2 timeout after {age_hours:.2f}h without TP1",
+            )
+            return
+
+    candles = get_klines(symbol, "1m", SIM_REPLAY_1M_LIMIT)
+
+    start_time = last_checked_at or signal_time
+    start_ms = int(start_time.timestamp() * 1000) if start_time else 0
+
+    relevant = [c for c in candles if int(c["time"]) >= start_ms]
+    relevant.sort(key=lambda x: x["time"])
+
+    if not relevant:
+        relevant = [{
+            "time": int(time.time() * 1000),
+            "open": current_price,
+            "high": current_price,
+            "low": current_price,
+            "close": current_price,
+            "volume": 0,
+        }]
+
+    for candle in relevant:
+        high = float(candle["high"])
+        low = float(candle["low"])
+
+        highest_price = max(highest_price, high)
+        lowest_price = min(lowest_price, low)
+
+        if new_tp2:
+            active_stop = tp1
+            stop_return = SCANNER_TP1
+            stop_reason = "TP2_PROTECT_EXIT"
+        elif new_tp1:
+            active_stop = entry
+            stop_return = 0.0
+            stop_reason = "BREAKEVEN_EXIT"
+        else:
+            active_stop = sl
+            stop_return = -SCANNER_SL
+            stop_reason = "SL_EXIT"
+
+        # Conservative path: if stop and a new TP are both inside the same 1m
+        # candle, credit the stop first.
+        if _v42_stop_hit(side, high, low, active_stop):
+            gross = gross_result_for_stop(new_tp1, new_tp2, stop_return)
+            finalize_trade(
+                cur, trade_id, active_stop, gross, stop_reason,
+                new_tp1, new_tp2, new_tp3,
+                stop_reason == "SL_EXIT",
+                highest_price, lowest_price,
+                margin_usdt, leverage,
+                "V4.2 conservative 1m replay: stop before new TP credit",
+            )
+            return
+
+        hit_tp1_now = (not new_tp1 and _v42_tp_hit(side, high, low, tp1))
+        hit_tp2_now = (not new_tp2 and _v42_tp_hit(side, high, low, tp2))
+        hit_tp3_now = (not new_tp3 and _v42_tp_hit(side, high, low, tp3))
+
+        if hit_tp1_now:
+            new_tp1 = True
+
+            # Same-candle conservative breakeven.
+            if _v42_stop_hit(side, high, low, entry):
+                gross = gross_result_for_stop(True, False, 0.0)
+                finalize_trade(
+                    cur, trade_id, entry, gross, "BREAKEVEN_EXIT",
+                    True, False, False, False,
+                    highest_price, lowest_price,
+                    margin_usdt, leverage,
+                    "V4.2 same candle TP1 + breakeven",
+                )
+                return
+
+        if hit_tp2_now:
+            new_tp1 = True
+            new_tp2 = True
+
+            if _v42_stop_hit(side, high, low, tp1):
+                gross = gross_result_for_stop(True, True, SCANNER_TP1)
+                finalize_trade(
+                    cur, trade_id, tp1, gross, "TP2_PROTECT_EXIT",
+                    True, True, False, False,
+                    highest_price, lowest_price,
+                    margin_usdt, leverage,
+                    "V4.2 same candle TP2 + TP1 protection",
+                )
+                return
+
+        if hit_tp3_now:
+            new_tp1 = True
+            new_tp2 = True
+
+            if _v42_stop_hit(side, high, low, tp1):
+                gross = gross_result_for_stop(True, True, SCANNER_TP1)
+                finalize_trade(
+                    cur, trade_id, tp1, gross, "TP2_PROTECT_EXIT",
+                    True, True, False, False,
+                    highest_price, lowest_price,
+                    margin_usdt, leverage,
+                    "V4.2 same candle TP3 + TP1 protection",
+                )
+                return
+
+            new_tp3 = True
+            gross = full_tp3_gross_result()
+
+            finalize_trade(
+                cur, trade_id, tp3, gross, "TP3_EXIT",
+                True, True, True, False,
+                highest_price, lowest_price,
+                margin_usdt, leverage,
+                "V4.2 1m replay TP3",
+            )
+            return
+
+    highest_price = max(highest_price, current_price)
+    lowest_price = min(lowest_price, current_price)
+
+    if new_tp2:
+        protection_hit = (
+            current_price >= tp1 if side == "SHORT" else current_price <= tp1
+        )
+        if protection_hit:
+            gross = gross_result_for_stop(True, True, SCANNER_TP1)
+            finalize_trade(
+                cur, trade_id, tp1, gross, "TP2_PROTECT_EXIT",
+                True, True, False, False,
+                highest_price, lowest_price,
+                margin_usdt, leverage,
+                "V4.2 current price TP2 protection",
+            )
+            return
+
+    if new_tp1 and not new_tp2:
+        breakeven_hit = (
+            current_price >= entry if side == "SHORT" else current_price <= entry
+        )
+        if breakeven_hit:
+            gross = gross_result_for_stop(True, False, 0.0)
+            finalize_trade(
+                cur, trade_id, entry, gross, "BREAKEVEN_EXIT",
+                True, False, False, False,
+                highest_price, lowest_price,
+                margin_usdt, leverage,
+                "V4.2 current price breakeven",
+            )
+            return
+
+    if not new_tp1:
+        sl_now = current_price >= sl if side == "SHORT" else current_price <= sl
+        if sl_now:
+            gross = -SCANNER_SL
+            finalize_trade(
+                cur, trade_id, sl, gross, "SL_EXIT",
+                False, False, False, True,
+                highest_price, lowest_price,
+                margin_usdt, leverage,
+                "V4.2 current price SL",
+            )
+            return
 
     cur.execute(
         """
@@ -1608,7 +2026,7 @@ def update_simulated_trades():
     cur.execute(
         """
         SELECT
-            id, symbol, engine_version, signal_time, entry_price,
+            id, symbol, side, engine_version, signal_time, entry_price,
             tp1, tp2, tp3, sl,
             tp1_hit, tp2_hit, tp3_hit,
             highest_price, lowest_price,
@@ -1626,18 +2044,19 @@ def update_simulated_trades():
     for row in rows:
         trade_id = row[0]
         symbol = row[1]
-        engine_version = row[2] or "V2"
+        engine_version = row[3] or "V2"
 
         if symbol not in prices:
             continue
 
         try:
-            if engine_version == "V3":
+            if engine_version == SCANNER_ENGINE_VERSION:
+                update_v42_trade_replay(cur, row, prices[symbol])
+            elif engine_version == "V3":
                 update_v3_trade_replay(cur, row, prices[symbol])
             else:
                 update_v2_trade_current_price(cur, row, prices[symbol])
 
-            # Commit each trade so one later API error does not lose all progress.
             conn.commit()
 
         except Exception as e:
@@ -1674,10 +2093,18 @@ def start_simulation_monitor():
 def calculate_performance_stats(results):
     if not results:
         return {
-            "closed": 0, "wins": 0, "losses": 0, "win_rate": 0,
-            "avg_result": 0, "avg_win": 0, "avg_loss": 0,
-            "reward_risk": 0, "profit_factor": 0, "expectancy": 0,
-            "total_result": 0, "max_winning_streak": 0,
+            "closed": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0,
+            "avg_result": 0,
+            "avg_win": 0,
+            "avg_loss": 0,
+            "reward_risk": 0,
+            "profit_factor": 0,
+            "expectancy": 0,
+            "total_result": 0,
+            "max_winning_streak": 0,
             "max_losing_streak": 0,
         }
 
@@ -1773,7 +2200,7 @@ def scanner_trades_page():
     cur.execute(
         """
         SELECT
-            id, symbol, strategy, engine_version, signal_time,
+            id, symbol, side, strategy, engine_version, signal_time,
             entry_price, score, trend_score, breakout_score,
             tp1, tp2, tp3, sl,
             tp1_hit, tp2_hit, tp3_hit, sl_hit,
@@ -1795,7 +2222,7 @@ def scanner_trades_page():
 
     for row in rows:
         (
-            trade_id, symbol, strategy, version, signal_time,
+            trade_id, symbol, side, strategy, version, signal_time,
             entry, score, trend_score, breakout_score,
             tp1, tp2, tp3, sl,
             tp1_hit, tp2_hit, tp3_hit, sl_hit,
@@ -1804,7 +2231,7 @@ def scanner_trades_page():
         ) = row
 
         lines.append(
-            f"#{trade_id} {symbol} | {version or '-'} | {strategy} | {status}"
+            f"#{trade_id} {symbol} | {version or '-'} | {side or 'LONG'} | {strategy} | {status}"
         )
         lines.append(f"Time: {signal_time}")
         lines.append(
@@ -1829,59 +2256,64 @@ def scanner_trades_page():
     return "<pre>" + "\n".join(lines) + "</pre>", 200
 
 
+def _load_engine_rows(cur, version):
+    cur.execute(
+        """
+        SELECT
+            id, side, strategy, score, status,
+            result_pct, net_result_pct, sim_pnl_usdt,
+            tp1_hit, tp2_hit, tp3_hit,
+            COALESCE(exit_reason,'UNKNOWN'),
+            closed_at
+        FROM scanner_trades
+        WHERE engine_version=%s
+          AND strategy IN ('TREND','BREAKOUT')
+          AND status IN ('WIN','LOSS')
+        ORDER BY closed_at ASC, id ASC;
+        """,
+        (version,),
+    )
+    return cur.fetchall()
+
+
 @app.route("/scanner-stats", methods=["GET"])
 def scanner_stats_page():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # V3 top-level counts
     cur.execute(
         """
         SELECT
             COUNT(*),
             SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END)
         FROM scanner_trades
-        WHERE engine_version='V3'
+        WHERE engine_version=%s
           AND strategy IN ('TREND','BREAKOUT');
-        """
+        """,
+        (SCANNER_ENGINE_VERSION,),
     )
     total, open_count = cur.fetchone()
     open_count = int(open_count or 0)
 
-    cur.execute(
-        """
-        SELECT
-            id, strategy, score, status,
-            result_pct, net_result_pct, sim_pnl_usdt,
-            tp1_hit, tp2_hit, tp3_hit,
-            COALESCE(exit_reason,'UNKNOWN'),
-            closed_at
-        FROM scanner_trades
-        WHERE engine_version='V3'
-          AND strategy IN ('TREND','BREAKOUT')
-          AND status IN ('WIN','LOSS')
-        ORDER BY closed_at ASC, id ASC;
-        """
-    )
-    rows = cur.fetchall()
+    rows = _load_engine_rows(cur, SCANNER_ENGINE_VERSION)
 
-    net_results = [float(r[5] or 0) for r in rows]
-    gross_results = [float(r[4] or 0) for r in rows]
-    pnls = [float(r[6] or 0) for r in rows]
+    net_results = [float(r[6] or 0) for r in rows]
+    gross_results = [float(r[5] or 0) for r in rows]
+    pnls = [float(r[7] or 0) for r in rows]
 
     net_stats = calculate_performance_stats(net_results)
     gross_stats = calculate_performance_stats(gross_results)
     balance, max_dd_u, max_dd_pct = calculate_equity_metrics(pnls)
 
     closed = len(rows)
-    tp1_hits = sum(1 for r in rows if r[7])
-    tp2_hits = sum(1 for r in rows if r[8])
-    tp3_hits = sum(1 for r in rows if r[9])
+    tp1_hits = sum(1 for r in rows if r[8])
+    tp2_hits = sum(1 for r in rows if r[9])
+    tp3_hits = sum(1 for r in rows if r[10])
 
-    # Strategy breakdown V3
     cur.execute(
         """
         SELECT
+            side,
             strategy,
             COUNT(*) AS total,
             SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) AS open_count,
@@ -1889,15 +2321,15 @@ def scanner_stats_page():
             SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END) AS losses,
             COALESCE(AVG(CASE WHEN net_result_pct IS NOT NULL THEN net_result_pct END),0)
         FROM scanner_trades
-        WHERE engine_version='V3'
+        WHERE engine_version=%s
           AND strategy IN ('TREND','BREAKOUT')
-        GROUP BY strategy
-        ORDER BY strategy;
-        """
+        GROUP BY side, strategy
+        ORDER BY side, strategy;
+        """,
+        (SCANNER_ENGINE_VERSION,),
     )
     strategy_rows = cur.fetchall()
 
-    # Score buckets V3
     cur.execute(
         """
         SELECT
@@ -1905,23 +2337,23 @@ def scanner_stats_page():
                 WHEN score >= 90 THEN '90+'
                 WHEN score >= 85 THEN '85-89'
                 WHEN score >= 80 THEN '80-84'
-                ELSE '75-79'
+                ELSE '<80'
             END AS bucket,
             COUNT(*) AS closed,
             SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END) AS wins,
             SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END) AS losses,
             COALESCE(AVG(net_result_pct),0)
         FROM scanner_trades
-        WHERE engine_version='V3'
+        WHERE engine_version=%s
           AND strategy IN ('TREND','BREAKOUT')
           AND status IN ('WIN','LOSS')
         GROUP BY bucket
         ORDER BY bucket DESC;
-        """
+        """,
+        (SCANNER_ENGINE_VERSION,),
     )
     score_rows = cur.fetchall()
 
-    # Exit reasons V3
     cur.execute(
         """
         SELECT
@@ -1931,28 +2363,18 @@ def scanner_stats_page():
             SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END),
             COALESCE(AVG(net_result_pct),0)
         FROM scanner_trades
-        WHERE engine_version='V3'
+        WHERE engine_version=%s
           AND status IN ('WIN','LOSS')
         GROUP BY COALESCE(exit_reason,'UNKNOWN')
         ORDER BY COUNT(*) DESC;
-        """
+        """,
+        (SCANNER_ENGINE_VERSION,),
     )
     exit_rows = cur.fetchall()
 
-    # V2 preserved summary
-    cur.execute(
-        """
-        SELECT
-            COUNT(*),
-            SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END)
-        FROM scanner_trades
-        WHERE engine_version='V2'
-          AND strategy IN ('TREND','BREAKOUT');
-        """
-    )
-    v2_total, v2_open, v2_wins, v2_losses = cur.fetchone()
+    v3_rows = _load_engine_rows(cur, "V3")
+    v3_net = [float(r[6] or 0) for r in v3_rows]
+    v3_stats = calculate_performance_stats(v3_net)
 
     cur.close()
     conn.close()
@@ -1966,20 +2388,31 @@ def scanner_stats_page():
         else f"{net_stats['profit_factor']:.2f}"
     )
 
-    roi = (balance - SIM_START_BALANCE) / SIM_START_BALANCE * 100 if SIM_START_BALANCE else 0
+    v3_pf = (
+        "INF"
+        if v3_stats["profit_factor"] == float("inf")
+        else f"{v3_stats['profit_factor']:.2f}"
+    )
+
+    roi = (
+        (balance - SIM_START_BALANCE) / SIM_START_BALANCE * 100
+        if SIM_START_BALANCE
+        else 0
+    )
+
     open_margin = open_count * SIM_MARGIN_USDT
     open_notional = open_margin * SIM_LEVERAGE
 
     lines = [
-        "BINGX SCANNER V3 - PRODUCTION SIMULATION",
+        "BINGX SCANNER V4.2 - PRODUCTION SIMULATION",
         "============================================================",
-        f"V3 Total signals: {int(total or 0)}",
+        f"V4.2 Total signals: {int(total or 0)}",
         f"Open: {open_count}",
         f"Closed: {closed}",
         f"Wins: {net_stats['wins']}",
         f"Losses: {net_stats['losses']}",
         "",
-        "NET PERFORMANCE (estimated fees + slippage included)",
+        "NET PERFORMANCE",
         "============================================================",
         f"Win rate: {net_stats['win_rate']:.2f}%",
         f"Average net result: {net_stats['avg_result']:.2f}%",
@@ -2003,37 +2436,27 @@ def scanner_stats_page():
         f"Open reserved margin: {open_margin:.2f} U",
         f"Open notional exposure: {open_notional:.2f} U",
         "",
-        "COST ASSUMPTIONS",
-        "============================================================",
-        f"Fee per side: {SIM_FEE_PCT:.3f}%",
-        f"Slippage per side: {SIM_SLIPPAGE_PCT:.3f}%",
-        f"Estimated round-trip friction: {estimated_round_trip_cost_pct():.3f}%",
-        "",
-        "GROSS STRATEGY RESULT (before estimated costs)",
-        "============================================================",
-        f"Average gross result: {gross_stats['avg_result']:.2f}%",
-        f"Cumulative gross result: {gross_stats['total_result']:.2f}%",
-        "",
-        "TP HIT RATE - CLOSED V3 TRADES",
+        "TP HIT RATE - CLOSED V4.2 TRADES",
         "============================================================",
         f"TP1: {tp1_hits}/{closed} | {rate(tp1_hits, closed):.2f}%",
         f"TP2: {tp2_hits}/{closed} | {rate(tp2_hits, closed):.2f}%",
         f"TP3: {tp3_hits}/{closed} | {rate(tp3_hits, closed):.2f}%",
         "",
-        "BY STRATEGY",
+        "BY SIDE / STRATEGY",
         "============================================================",
     ]
 
-    for strategy, stotal, sopen, swins, slosses, savg in strategy_rows:
+    for side, strategy, stotal, sopen, swins, slosses, savg in strategy_rows:
         resolved = int(swins or 0) + int(slosses or 0)
         wr = int(swins or 0) / resolved * 100 if resolved else 0
         lines.append(
-            f"{strategy}: {stotal} total | {int(sopen or 0)} open | "
+            f"{side} {strategy}: {stotal} total | {int(sopen or 0)} open | "
             f"{int(swins or 0)}W/{int(slosses or 0)}L | "
             f"Win {wr:.2f}% | Avg net {float(savg):.2f}%"
         )
 
     lines += ["", "BY SCORE", "============================================================"]
+
     for bucket, btotal, bwins, blosses, bavg in score_rows:
         resolved = int(bwins or 0) + int(blosses or 0)
         wr = int(bwins or 0) / resolved * 100 if resolved else 0
@@ -2043,6 +2466,7 @@ def scanner_stats_page():
         )
 
     lines += ["", "EXIT REASONS", "============================================================"]
+
     for reason, count, ewins, elosses, eavg in exit_rows:
         resolved = int(ewins or 0) + int(elosses or 0)
         wr = int(ewins or 0) / resolved * 100 if resolved else 0
@@ -2053,20 +2477,21 @@ def scanner_stats_page():
 
     lines += [
         "",
-        "RISK CONTROLS",
+        "V3 BENCHMARK",
         "============================================================",
+        f"V3 closed: {v3_stats['closed']}",
+        f"V3 win rate: {v3_stats['win_rate']:.2f}%",
+        f"V3 average net: {v3_stats['avg_result']:.2f}%",
+        f"V3 profit factor: {v3_pf}",
+        "",
+        "V4.2 RULES",
+        "============================================================",
+        f"90+ direct tier: >= {V42_MAIN_SCORE}",
+        f"Confirm tier: >= {V42_CONFIRM_SCORE}",
+        f"80-84 enabled: {V42_ENABLE_80_84}",
+        f"Timeout before TP1: {V42_POSITION_TIMEOUT_HOURS:.1f} hours",
         f"Max open trades: {SCANNER_MAX_OPEN}",
         f"Daily loss stop: {SIM_DAILY_MAX_LOSS_USDT:.2f} U",
-        f"Loss-streak pause: {SIM_MAX_CONSECUTIVE_LOSSES} losses",
-        f"Pause length: {SIM_PAUSE_HOURS_AFTER_STREAK} hours",
-        "",
-        "HISTORICAL V2 (excluded from V3 performance)",
-        "============================================================",
-        f"V2 total: {int(v2_total or 0)} | "
-        f"Open {int(v2_open or 0)} | "
-        f"{int(v2_wins or 0)}W/{int(v2_losses or 0)}L",
-        "",
-        "V3 target: collect 100 CLOSED trades without changing strategy rules.",
     ]
 
     return "<pre>" + "\n".join(lines) + "</pre>", 200
@@ -2080,7 +2505,7 @@ def scanner_status_page():
     ok, risk_reason = scanner_risk_allows_new_trade()
 
     lines = [
-        "BingX Scanner V3",
+        "BingX Scanner V4.2",
         "================================",
         f"Web full-scan running: {status['running']}",
         f"Phase: {status['phase']}",
@@ -2095,11 +2520,9 @@ def scanner_status_page():
 
 @app.route("/scan-now", methods=["GET"])
 def scan_now():
-    # Retained only as a compatibility message.
-    # Fast V3 radar is intentionally run by Render Cron to avoid web-sleep issues.
     return (
         "<pre>"
-        "V3 FAST RADAR IS CRON-MANAGED\n"
+        "V4.2 FAST RADAR IS CRON-MANAGED\n"
         "Use Render Cron: scanner_job.py\n"
         "Schedule: */5 * * * *\n"
         "</pre>",
@@ -2112,12 +2535,12 @@ def home():
     mode = "LIVE" if LIVE_TRADING else "TEST"
     return (
         "<pre>"
-        "LINE BingX Bot + Scanner V3\n"
+        "LINE BingX Bot + Scanner V4.2\n"
         "================================\n"
         f"LINE manual trading: {mode}\n"
         f"LINE leverage: {LEVERAGE}x\n"
         "Autonomous scanner: SIMULATION ONLY\n"
-        "Scanner version: V3\n"
+        "Scanner version: V4.2\n"
         "Scanner manager: Render Cron every 5 minutes\n\n"
         "Pages:\n"
         "/db-test\n"
@@ -2225,8 +2648,6 @@ try:
 except Exception as e:
     print("STARTUP DATABASE ERROR:", str(e), flush=True)
 
-# Important: disabled by default because Render Cron owns V3 monitoring.
-# This avoids app import -> duplicate daemon monitor inside scanner_job.
 if DATABASE_URL and ENABLE_WEB_SIM_MONITOR:
     try:
         start_simulation_monitor()
