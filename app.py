@@ -14232,3 +14232,7 @@ if (
             flush=True
 
         )
+
+from r2_manager import install_r2
+
+install_r2(globals())
