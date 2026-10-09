@@ -14236,3 +14236,333 @@ if (
 from r2_manager import install_r2
 
 install_r2(globals())
+
+# =========================================================
+# V4.3R2 INDEPENDENT PERFORMANCE REPORT
+# URL: /scanner-stats-r2
+# =========================================================
+
+@app.route("/scanner-stats-r2", methods=["GET"])
+def scanner_stats_r2_page():
+
+    version = "V4.3R2"
+
+    conn = get_db_connection()
+
+    try:
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT
+                id,
+                side,
+                strategy,
+                score,
+                status,
+                net_result_pct,
+                sim_pnl_usdt,
+                tp1_hit,
+                tp2_hit,
+                tp3_hit,
+                COALESCE(exit_reason, 'UNKNOWN'),
+                closed_at,
+                sideways_state
+            FROM scanner_trades
+            WHERE engine_version = %s
+              AND strategy IN ('TREND', 'BREAKOUT')
+            ORDER BY closed_at ASC NULLS LAST, id ASC
+        """, (version,))
+
+        all_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT
+                COALESCE(position_state, 'GREEN'),
+                COUNT(*)
+            FROM r2_position_states rs
+            JOIN scanner_trades st
+              ON st.id = rs.trade_id
+            WHERE st.engine_version = %s
+              AND st.status = 'OPEN'
+            GROUP BY position_state
+        """, (version,))
+
+        state_rows = cur.fetchall()
+
+    finally:
+        conn.close()
+
+    open_rows = [
+        r for r in all_rows
+        if r[4] == "OPEN"
+    ]
+
+    closed_rows = [
+        r for r in all_rows
+        if r[4] in ("WIN", "LOSS")
+    ]
+
+    net = [
+        float(r[5])
+        for r in closed_rows
+        if r[5] is not None
+    ]
+
+    pnls = [
+        float(r[6] or 0)
+        for r in closed_rows
+    ]
+
+    stats = calculate_performance_stats(net)
+
+    start_balance = SIM_START_BALANCE
+    balance, max_dd_u, max_dd_pct = (
+        calculate_equity_metrics(pnls)
+    )
+
+    realized_pnl = sum(pnls)
+
+    roi = (
+        realized_pnl / start_balance * 100
+        if start_balance else 0
+    )
+
+    closed_count = len(closed_rows)
+    open_count = len(open_rows)
+
+    def pct(n, total):
+        return n / total * 100 if total else 0.0
+
+    def fmt_pf(value):
+        if math.isinf(value):
+            return "INF"
+        return f"{value:.2f}"
+
+    tp1 = sum(bool(r[7]) for r in closed_rows)
+    tp2 = sum(bool(r[8]) for r in closed_rows)
+    tp3 = sum(bool(r[9]) for r in closed_rows)
+
+    lines = [
+        "BINGX SCANNER V4.3R2 - SIMULATION",
+        "=" * 55,
+        f"Engine: {version}",
+        f"Total signals: {len(all_rows)}",
+        f"Open: {open_count}",
+        f"Closed: {closed_count}",
+        f"Wins: {stats['wins']}",
+        f"Losses: {stats['losses']}",
+        "",
+        "500 TRADE VALIDATION",
+        "=" * 55,
+        f"Progress: {min(closed_count, 500)}/500",
+        f"Remaining: {max(0, 500 - closed_count)}",
+        "",
+        "NET PERFORMANCE",
+        "=" * 55,
+        f"Win rate: {stats['win_rate']:.2f}%",
+        f"Average net result: {stats['avg_result']:+.2f}%",
+        f"Average net win: {stats['avg_win']:+.2f}%",
+        f"Average net loss: {stats['avg_loss']:.2f}%",
+        f"Reward / Risk: {stats['reward_risk']:.2f}",
+        f"Profit Factor: {fmt_pf(stats['profit_factor'])}",
+        f"Expectancy / trade: {stats['expectancy']:+.2f}%",
+        f"Max winning streak: {stats['max_winning_streak']}",
+        f"Max losing streak: {stats['max_losing_streak']}",
+        "",
+        "SIMULATED ACCOUNT - R2 ONLY",
+        "=" * 55,
+        f"Starting balance assumption: {start_balance:.2f} U",
+        f"R2 realized balance: {balance:.2f} U",
+        f"R2 realized PnL: {realized_pnl:+.2f} U",
+        f"R2 realized ROI: {roi:+.2f}%",
+        f"Closed-trade drawdown: {max_dd_u:.2f} U "
+        f"({max_dd_pct:.2f}%)",
+        f"Margin per trade: {SIM_MARGIN_USDT:.2f} U",
+        f"Sim leverage: {SIM_LEVERAGE}x",
+        f"Open reserved margin: "
+        f"{open_count * SIM_MARGIN_USDT:.2f} U",
+        f"Open notional exposure: "
+        f"{open_count * SIM_MARGIN_USDT * SIM_LEVERAGE:.2f} U",
+        "",
+        "TP HIT RATE - CLOSED R2 TRADES",
+        "=" * 55,
+        f"TP1: {tp1}/{closed_count} | {pct(tp1, closed_count):.2f}%",
+        f"TP2: {tp2}/{closed_count} | {pct(tp2, closed_count):.2f}%",
+        f"TP3: {tp3}/{closed_count} | {pct(tp3, closed_count):.2f}%",
+        "",
+        "BY SIDE / STRATEGY",
+        "=" * 55,
+    ]
+
+    groups = sorted(set(
+        (r[1], r[2]) for r in all_rows
+    ))
+
+    for side, strategy in groups:
+        subset = [
+            r for r in all_rows
+            if r[1] == side and r[2] == strategy
+        ]
+        done = [
+            r for r in subset
+            if r[4] in ("WIN", "LOSS")
+        ]
+
+        wins = sum(r[4] == "WIN" for r in done)
+        losses = sum(r[4] == "LOSS" for r in done)
+        opened = sum(r[4] == "OPEN" for r in subset)
+
+        avg = (
+            sum(float(r[5] or 0) for r in done)
+            / len(done)
+            if done else 0
+        )
+
+        lines.append(
+            f"{side} {strategy}: "
+            f"{len(subset)} total | "
+            f"{opened} open | "
+            f"{wins}W/{losses}L | "
+            f"Win {pct(wins, len(done)):.2f}% | "
+            f"Avg net {avg:+.2f}%"
+        )
+
+    lines += [
+        "",
+        "BY SCORE",
+        "=" * 55,
+    ]
+
+    score_groups = [
+        ("90+", lambda s: s >= 90),
+        ("85-89", lambda s: 85 <= s < 90),
+        ("80-84", lambda s: 80 <= s < 85),
+        ("BELOW 80", lambda s: s < 80),
+    ]
+
+    for label, check in score_groups:
+        subset = [
+            r for r in closed_rows
+            if check(int(r[3] or 0))
+        ]
+
+        if not subset:
+            continue
+
+        wins = sum(r[4] == "WIN" for r in subset)
+        avg = (
+            sum(float(r[5] or 0) for r in subset)
+            / len(subset)
+        )
+
+        lines.append(
+            f"{label}: {len(subset)} closed | "
+            f"Win {pct(wins, len(subset)):.2f}% | "
+            f"Avg net {avg:+.2f}%"
+        )
+
+    lines += [
+        "",
+        "EXIT REASONS",
+        "=" * 55,
+    ]
+
+    reasons = sorted(set(r[10] for r in closed_rows))
+
+    for reason in reasons:
+        subset = [
+            r for r in closed_rows
+            if r[10] == reason
+        ]
+
+        wins = sum(r[4] == "WIN" for r in subset)
+        avg = (
+            sum(float(r[5] or 0) for r in subset)
+            / len(subset)
+        )
+
+        lines.append(
+            f"{reason}: {len(subset)} | "
+            f"Win {pct(wins, len(subset)):.2f}% | "
+            f"Avg net {avg:+.2f}%"
+        )
+
+    reversal_count = sum(
+        r[10] == "R2_REVERSAL_EXIT"
+        for r in closed_rows
+    )
+
+    lines += [
+        "",
+        "R2 MARKET REVERSAL MANAGEMENT",
+        "=" * 55,
+        f"R2 reversal exits: {reversal_count}",
+    ]
+
+    state_counts = dict(state_rows)
+
+    for state in ("GREEN", "YELLOW", "RED"):
+        lines.append(
+            f"{state}: {state_counts.get(state, 0)}"
+        )
+
+    unclassified = (
+        open_count - sum(state_counts.values())
+    )
+
+    lines.append(
+        f"No state record: {max(0, unclassified)}"
+    )
+
+    lines += [
+        "",
+        "SIDEWAYS STATE",
+        "=" * 55,
+    ]
+
+    for state in sorted(set(
+        str(r[12] or "UNKNOWN")
+        for r in all_rows
+    )):
+        subset = [
+            r for r in all_rows
+            if str(r[12] or "UNKNOWN") == state
+        ]
+
+        done = [
+            r for r in subset
+            if r[4] in ("WIN", "LOSS")
+        ]
+
+        wins = sum(r[4] == "WIN" for r in done)
+
+        avg = (
+            sum(float(r[5] or 0) for r in done)
+            / len(done)
+            if done else 0
+        )
+
+        lines.append(
+            f"{state}: {len(subset)} total | "
+            f"{pct(wins, len(done)):.2f}% win | "
+            f"Avg net {avg:+.2f}%"
+        )
+
+    lines += [
+        "",
+        "R2 REPORT NOTES",
+        "=" * 55,
+        "R1 trades are excluded from R2 performance.",
+        "Drawdown uses closed trades only.",
+        "Open floating PnL is not included.",
+        "Balance is a separate R2 1000U assumption.",
+        "Not an actual BingX account balance.",
+        "Profit and execution remain simulated.",
+    ]
+
+    from flask import Response
+
+    return Response(
+        "\n".join(lines),
+        mimetype="text/plain; charset=utf-8"
+    )
