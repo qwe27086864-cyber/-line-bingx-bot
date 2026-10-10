@@ -7425,6 +7425,20 @@ def finalize_trade(
 
     )
 
+    # R3 Stage 1: report success only after an OPEN row was updated.
+    # PostgreSQL's conditional UPDATE prevents an already-closed row
+    # from being settled a second time.
+    updated_rows = cur.rowcount
+    if updated_rows != 1:
+        print(
+            "TRADE CLOSE SKIPPED:",
+            trade_id,
+            "updated_rows=",
+            updated_rows,
+            flush=True,
+        )
+        return False
+
     print(
 
         "TRADE CLOSED:",
@@ -7448,6 +7462,8 @@ def finalize_trade(
         flush=True,
 
     )
+
+    return True
 
 def finalize_v3_trade(
 
