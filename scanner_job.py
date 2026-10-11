@@ -904,6 +904,14 @@ def run_fast_radar():
             flush=True
         )
 
+    # R2 close-only switch: keep all existing exit/TP management,
+    # but stop BEFORE the new-entry radar and create_simulated_trade().
+    # Set R2_CLOSE_ONLY=true in the R2 Cron Job environment.
+    if __import__("os").environ.get("R2_CLOSE_ONLY", "false").strip().lower() in ("1", "true", "yes", "on"):
+        print("R2 CLOSE-ONLY MODE: existing positions updated; NEW ENTRIES DISABLED", flush=True)
+        print("BINGX V4.3R2 RADAR COMPLETE (CLOSE ONLY)", flush=True)
+        return
+
     # 3. Existing R2 risk gate.
     allow_new, risk_reason = (
         scanner_risk_allows_new_trade()
