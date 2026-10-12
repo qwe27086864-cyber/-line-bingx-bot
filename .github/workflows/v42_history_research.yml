@@ -1,0 +1,50 @@
+name: V42 Historical Research (simulation only)
+
+on:
+  push:
+    branches:
+      - v42-historical-backtest
+    paths:
+      - '.github/workflows/v42_history_research.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out backtest branch
+        uses: actions/checkout@v4
+        with:
+          ref: v42-historical-backtest
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify input and run historical research (not live trading)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q v42_*.py
+          python v42_one_shot.py \
+            --symbols BTC-USDT ETH-USDT \
+            --start 2026-09-01T00:00:00Z \
+            --end 2026-09-08T00:00:00Z \
+            --workdir v42_study \
+            --plan-only
+          python v42_one_shot.py \
+            --symbols BTC-USDT ETH-USDT \
+            --start 2026-09-01T00:00:00Z \
+            --end 2026-09-08T00:00:00Z \
+            --workdir v42_study
+      - name: Preserve study files and diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v42-historical-research-output
+          path: v42_study/
+          if-no-files-found: warn
+          retention-days: 14
