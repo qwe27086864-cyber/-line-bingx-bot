@@ -1,5 +1,5 @@
 
-name: R1 Small Coin 30-Day Backtest
+name: R1 August Small Coin Data Check
 
 on:
   push:
@@ -13,9 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  backtest:
+  august-data-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 20
 
     steps:
       - name: Checkout research branch
@@ -28,31 +28,87 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run small coin historical backtest
+      - name: Check August historical candles
         shell: bash
         run: |
           set -euo pipefail
 
-          python -m compileall -q v42_*.py
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from v42_download_bingx_history import request_page
 
-          python v42_one_shot.py \
-            --symbols US-USDT TERMMAX-USDT BILL-USDT \
-            --start 2026-09-01T00:00:00Z \
-            --end 2026-10-01T00:00:00Z \
-            --workdir r1_smallcoin_study \
-            --plan-only
+          symbols = [
+              "US-USDT",
+              "TERMMAX-USDT",
+              "BILL-USDT",
+          ]
 
-          python v42_one_shot.py \
-            --symbols US-USDT TERMMAX-USDT BILL-USDT \
-            --start 2026-09-01T00:00:00Z \
-            --end 2026-10-01T00:00:00Z \
-            --workdir r1_smallcoin_study
+          dates = [
+              "2026-08-01T12:00:00Z",
+              "2026-08-15T12:00:00Z",
+              "2026-08-31T12:00:00Z",
+          ]
 
-      - name: Save backtest results
+          results = []
+
+          for symbol in symbols:
+              checks = []
+
+              for date in dates:
+                  start = int(
+                      datetime.fromisoformat(
+                          date.replace("Z", "+00:00")
+                      ).timestamp() * 1000
+                  )
+
+                  try:
+                      candles = request_page(
+                          symbol,
+                          start,
+                          start + 60 * 60000,
+                          limit=60,
+                          tries=2,
+                      )
+                      n = len(candles)
+                      status = (
+                          "PASS" if n == 60 else "INCOMPLETE"
+                      )
+                  except Exception as error:
+                      n = 0
+                      status = "ERROR"
+                      print(symbol, date, str(error), flush=True)
+
+                  checks.append({
+                      "date": date,
+                      "candles": n,
+                      "status": status,
+                  })
+
+                  print(symbol, date, status, n, flush=True)
+
+              results.append({
+                  "symbol": symbol,
+                  "checks": checks,
+                  "sample_pass": all(
+                      c["status"] == "PASS" for c in checks
+                  ),
+              })
+
+          Path("august_data_check.json").write_text(
+              json.dumps(results, indent=2),
+              encoding="utf-8",
+          )
+
+          print("AUGUST_CHECK_COMPLETE", flush=True)
+          PY
+
+      - name: Save diagnostic result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-smallcoin-30day-results
-          path: r1_smallcoin_study/
+          name: r1-august-data-check
+          path: august_data_check.json
           if-no-files-found: warn
           retention-days: 14
