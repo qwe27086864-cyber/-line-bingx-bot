@@ -1,5 +1,5 @@
 
-name: R1 August US BILL Backtest
+name: V6 July Historical Data Check
 
 on:
   push:
@@ -13,12 +13,12 @@ permissions:
   contents: read
 
 jobs:
-  backtest:
+  july-data-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout historical backtest branch
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: v42-historical-backtest
@@ -28,31 +28,89 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run August historical backtest
+      - name: Check July historical candles
         shell: bash
         run: |
           set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from datetime import datetime
+          from v42_download_bingx_history import request_page
 
-          python -m compileall -q v42_*.py
+          symbols = ["US-USDT", "BILL-USDT", "TERMMAX-USDT"]
+          dates = [
+              "2026-07-01T12:00:00Z",
+              "2026-07-15T12:00:00Z",
+              "2026-07-31T12:00:00Z",
+          ]
 
-          python v42_one_shot.py \
-            --symbols US-USDT BILL-USDT \
-            --start 2026-08-01T00:00:00Z \
-            --end 2026-09-01T00:00:00Z \
-            --workdir r1_august_study \
-            --plan-only
+          results = []
 
-          python v42_one_shot.py \
-            --symbols US-USDT BILL-USDT \
-            --start 2026-08-01T00:00:00Z \
-            --end 2026-09-01T00:00:00Z \
-            --workdir r1_august_study
+          for symbol in symbols:
+              checks = []
 
-      - name: Save August backtest results
+              for date in dates:
+                  start = int(
+                      datetime.fromisoformat(
+                          date.replace("Z", "+00:00")
+                      ).timestamp() * 1000
+                  )
+
+                  try:
+                      candles = request_page(
+                          symbol,
+                          start,
+                          start + 60 * 60000,
+                          limit=60,
+                          tries=2,
+                      )
+                      count = len(candles)
+                      status = (
+                          "PASS" if count == 60
+                          else "INCOMPLETE"
+                      )
+                  except Exception as error:
+                      count = 0
+                      status = "ERROR"
+                      print(
+                          symbol, date, str(error),
+                          flush=True,
+                      )
+
+                  checks.append({
+                      "date": date,
+                      "candles": count,
+                      "status": status,
+                  })
+
+                  print(
+                      symbol, date, status, count,
+                      flush=True,
+                  )
+
+              results.append({
+                  "symbol": symbol,
+                  "checks": checks,
+                  "sample_pass": all(
+                      item["status"] == "PASS"
+                      for item in checks
+                  ),
+              })
+
+          Path("july_data_check.json").write_text(
+              json.dumps(results, indent=2),
+              encoding="utf-8",
+          )
+
+          print("JULY_CHECK_COMPLETE", flush=True)
+          PY
+
+      - name: Save results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-august-us-bill-results
-          path: r1_august_study/
+          name: v6-july-data-check
+          path: july_data_check.json
           if-no-files-found: warn
           retention-days: 14
