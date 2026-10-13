@@ -1,7 +1,5 @@
 
-
-name: V42 Historical Research - 30 Days - Fix 2
-
+name: R1 Small Coin Historical Data Probe
 
 on:
   push:
@@ -15,46 +13,124 @@ permissions:
   contents: read
 
 jobs:
-  backtest:
+  smallcoin-probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 25
 
     steps:
-      - name: Check out backtest branch
+      - name: Checkout research branch
         uses: actions/checkout@v4
         with:
           ref: v42-historical-backtest
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Verify input and run 30-day historical research
+      - name: Check historical data availability
         shell: bash
         run: |
           set -euo pipefail
 
-          python -m compileall -q v42_*.py
+          python - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from v42_download_bingx_history import request_page
 
-          python v42_one_shot.py \
-            --symbols BTC-USDT ETH-USDT SOL-USDT LTC-USDT AAVE-USDT DOGE-USDT \
-            --start 2026-09-01T00:00:00Z \
-            --end 2026-10-01T00:00:00Z \
-            --workdir v42_study \
-            --plan-only
+          symbols = [
+              "US-USDT",
+              "TERMMAX-USDT",
+              "ORBIO-USDT",
+              "EACC-USDT",
+              "BILL-USDT",
+              "GPSOL-USDT",
+              "SOCK-USDT",
+              "OTC-USDT",
+              "USEPAID-USDT",
+              "ZCAT-USDT",
+          ]
 
-          python v42_one_shot.py \
-            --symbols BTC-USDT ETH-USDT SOL-USDT LTC-USDT AAVE-USDT DOGE-USDT \
-            --start 2026-09-01T00:00:00Z \
-            --end 2026-10-01T00:00:00Z \
-            --workdir v42_study
+          dates = [
+              "2026-09-01T12:00:00Z",
+              "2026-09-15T12:00:00Z",
+              "2026-09-30T12:00:00Z",
+          ]
 
-      - name: Preserve historical backtest results
+          def milliseconds(value):
+              dt = datetime.fromisoformat(
+                  value.replace("Z", "+00:00")
+              )
+              return int(dt.timestamp() * 1000)
+
+          results = []
+
+          for symbol in symbols:
+              checks = []
+              for date in dates:
+                  start = milliseconds(date)
+                  try:
+                      rows = request_page(
+                          symbol,
+                          start,
+                          start + 60 * 60000,
+                          limit=60,
+                          tries=2,
+                      )
+                      checks.append({
+                          "date": date,
+                          "candles": len(rows),
+                          "status": (
+                              "SAMPLE_PRESENT"
+                              if rows else "NO_SAMPLE"
+                          ),
+                      })
+                  except Exception as exc:
+                      checks.append({
+                          "date": date,
+                          "candles": 0,
+                          "status": "API_ERROR",
+                          "error": str(exc)[:250],
+                      })
+
+              status = (
+                  "ALL_SAMPLES_PRESENT"
+                  if all(
+                      c["status"] == "SAMPLE_PRESENT"
+                      and c["candles"] == 60
+                      for c in checks
+                  )
+                  else "NEEDS_REVIEW"
+              )
+
+              results.append({
+                  "symbol": symbol,
+                  "status": status,
+                  "checks": checks,
+              })
+              print(
+                  symbol,
+                  status,
+                  [c["candles"] for c in checks],
+                  flush=True,
+              )
+
+          Path("smallcoin_probe.json").write_text(
+              json.dumps(
+                  results, indent=2, ensure_ascii=False
+              ),
+              encoding="utf-8",
+          )
+
+          print("PROBE_COMPLETE", flush=True)
+          PY
+
+      - name: Save probe results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v42-30day-backtest-results
-          path: v42_study/
+          name: r1-smallcoin-data-probe
+          path: smallcoin_probe.json
           if-no-files-found: warn
           retention-days: 14
