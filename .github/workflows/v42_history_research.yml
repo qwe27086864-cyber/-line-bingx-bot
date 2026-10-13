@@ -1,5 +1,5 @@
 
-name: R1 Small Coin Historical Data Probe
+name: R1 Small Coin 30-Day Backtest
 
 on:
   push:
@@ -13,9 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  smallcoin-probe:
+  backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 90
 
     steps:
       - name: Checkout research branch
@@ -28,109 +28,31 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Check historical data availability
+      - name: Run small coin historical backtest
         shell: bash
         run: |
           set -euo pipefail
 
-          python - <<'PY'
-          import json
-          from datetime import datetime, timezone
-          from pathlib import Path
-          from v42_download_bingx_history import request_page
+          python -m compileall -q v42_*.py
 
-          symbols = [
-              "US-USDT",
-              "TERMMAX-USDT",
-              "ORBIO-USDT",
-              "EACC-USDT",
-              "BILL-USDT",
-              "GPSOL-USDT",
-              "SOCK-USDT",
-              "OTC-USDT",
-              "USEPAID-USDT",
-              "ZCAT-USDT",
-          ]
+          python v42_one_shot.py \
+            --symbols US-USDT TERMMAX-USDT BILL-USDT \
+            --start 2026-09-01T00:00:00Z \
+            --end 2026-10-01T00:00:00Z \
+            --workdir r1_smallcoin_study \
+            --plan-only
 
-          dates = [
-              "2026-09-01T12:00:00Z",
-              "2026-09-15T12:00:00Z",
-              "2026-09-30T12:00:00Z",
-          ]
+          python v42_one_shot.py \
+            --symbols US-USDT TERMMAX-USDT BILL-USDT \
+            --start 2026-09-01T00:00:00Z \
+            --end 2026-10-01T00:00:00Z \
+            --workdir r1_smallcoin_study
 
-          def milliseconds(value):
-              dt = datetime.fromisoformat(
-                  value.replace("Z", "+00:00")
-              )
-              return int(dt.timestamp() * 1000)
-
-          results = []
-
-          for symbol in symbols:
-              checks = []
-              for date in dates:
-                  start = milliseconds(date)
-                  try:
-                      rows = request_page(
-                          symbol,
-                          start,
-                          start + 60 * 60000,
-                          limit=60,
-                          tries=2,
-                      )
-                      checks.append({
-                          "date": date,
-                          "candles": len(rows),
-                          "status": (
-                              "SAMPLE_PRESENT"
-                              if rows else "NO_SAMPLE"
-                          ),
-                      })
-                  except Exception as exc:
-                      checks.append({
-                          "date": date,
-                          "candles": 0,
-                          "status": "API_ERROR",
-                          "error": str(exc)[:250],
-                      })
-
-              status = (
-                  "ALL_SAMPLES_PRESENT"
-                  if all(
-                      c["status"] == "SAMPLE_PRESENT"
-                      and c["candles"] == 60
-                      for c in checks
-                  )
-                  else "NEEDS_REVIEW"
-              )
-
-              results.append({
-                  "symbol": symbol,
-                  "status": status,
-                  "checks": checks,
-              })
-              print(
-                  symbol,
-                  status,
-                  [c["candles"] for c in checks],
-                  flush=True,
-              )
-
-          Path("smallcoin_probe.json").write_text(
-              json.dumps(
-                  results, indent=2, ensure_ascii=False
-              ),
-              encoding="utf-8",
-          )
-
-          print("PROBE_COMPLETE", flush=True)
-          PY
-
-      - name: Save probe results
+      - name: Save backtest results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-smallcoin-data-probe
-          path: smallcoin_probe.json
+          name: r1-smallcoin-30day-results
+          path: r1_smallcoin_study/
           if-no-files-found: warn
           retention-days: 14
