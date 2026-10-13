@@ -1,5 +1,5 @@
 
-name: V6 July Historical Data Check
+name: V6 July R1 Baseline Backtest
 
 on:
   push:
@@ -13,9 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  july-data-check:
+  july-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -28,89 +28,31 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Check July historical candles
+      - name: Run July R1 historical backtest
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          from datetime import datetime
-          from v42_download_bingx_history import request_page
 
-          symbols = ["US-USDT", "BILL-USDT", "TERMMAX-USDT"]
-          dates = [
-              "2026-07-01T12:00:00Z",
-              "2026-07-15T12:00:00Z",
-              "2026-07-31T12:00:00Z",
-          ]
+          python -m compileall -q v42_*.py
 
-          results = []
+          python v42_one_shot.py \
+            --symbols US-USDT BILL-USDT \
+            --start 2026-07-01T00:00:00Z \
+            --end 2026-08-01T00:00:00Z \
+            --workdir r1_july_study \
+            --plan-only
 
-          for symbol in symbols:
-              checks = []
+          python v42_one_shot.py \
+            --symbols US-USDT BILL-USDT \
+            --start 2026-07-01T00:00:00Z \
+            --end 2026-08-01T00:00:00Z \
+            --workdir r1_july_study
 
-              for date in dates:
-                  start = int(
-                      datetime.fromisoformat(
-                          date.replace("Z", "+00:00")
-                      ).timestamp() * 1000
-                  )
-
-                  try:
-                      candles = request_page(
-                          symbol,
-                          start,
-                          start + 60 * 60000,
-                          limit=60,
-                          tries=2,
-                      )
-                      count = len(candles)
-                      status = (
-                          "PASS" if count == 60
-                          else "INCOMPLETE"
-                      )
-                  except Exception as error:
-                      count = 0
-                      status = "ERROR"
-                      print(
-                          symbol, date, str(error),
-                          flush=True,
-                      )
-
-                  checks.append({
-                      "date": date,
-                      "candles": count,
-                      "status": status,
-                  })
-
-                  print(
-                      symbol, date, status, count,
-                      flush=True,
-                  )
-
-              results.append({
-                  "symbol": symbol,
-                  "checks": checks,
-                  "sample_pass": all(
-                      item["status"] == "PASS"
-                      for item in checks
-                  ),
-              })
-
-          Path("july_data_check.json").write_text(
-              json.dumps(results, indent=2),
-              encoding="utf-8",
-          )
-
-          print("JULY_CHECK_COMPLETE", flush=True)
-          PY
-
-      - name: Save results
+      - name: Save July results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v6-july-data-check
-          path: july_data_check.json
+          name: r1-july-us-bill-results
+          path: r1_july_study/
           if-no-files-found: warn
           retention-days: 14
