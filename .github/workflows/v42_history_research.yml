@@ -1,5 +1,7 @@
 
-name: V42 Historical Research - 30 Days
+
+name: V42 Historical Research - 30 Days - Fix 2
+
 
 on:
   push:
