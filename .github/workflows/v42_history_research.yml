@@ -1,5 +1,5 @@
 
-name: R1 September Universe API Repair
+name: R1 September Historical Radar Batch 01
 
 on:
   push:
@@ -14,327 +14,220 @@ permissions:
   actions: read
 
 jobs:
-  repair:
+  historical-radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: v42-historical-backtest
 
-      - uses: actions/setup-python@v5
+      - name: Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Download previous evidence
-        shell: bash
+      - name: Load repaired universe
         run: |
           set -euo pipefail
-          mkdir -p previous repaired
 
-          gh run download 38530532287 \
-            -n r1-september-universe-evidence \
-            -D previous
+          mkdir -p research/universe
+          mkdir -p research/raw
+          mkdir -p research/original
+          mkdir -p research/report
 
-          test -s previous/evidence.csv
+          gh run download 38532806846 \
+            -n r1-september-universe-repaired \
+            -D research/universe
 
-      - name: Retry failed API requests only
-        shell: bash
+          test -s \
+            research/universe/evidence_repaired.csv
+
+      - name: Select historical candidate batch
         run: |
           python - <<'PY'
           import csv
+          import hashlib
           import json
-          import random
-          import time
-          import urllib.request
-          import urllib.error
-
-          from collections import Counter
-          from datetime import datetime
           from pathlib import Path
-          from urllib.parse import urlencode
 
-          source = Path("previous/evidence.csv")
-          output = Path("repaired")
-          output.mkdir(exist_ok=True)
-
-          with source.open(
-              newline="",
+          with open(
+              "research/universe/evidence_repaired.csv",
               encoding="utf-8-sig",
           ) as f:
               rows = list(csv.DictReader(f))
 
-          assert len(rows) == 4848, (
-              f"Unexpected input count: {len(rows)}"
+          candidates = {
+              r["symbol"]
+              for r in rows
+              if r["day"] == "2026-09-01"
+              and r["status"] == "HAS_HISTORY"
+          }
+
+          candidates = sorted(
+              candidates,
+              key=lambda s: hashlib.sha256(
+                  ("R1-SEP-2026:" + s).encode()
+              ).hexdigest(),
           )
 
-          fields = [
-              "symbol",
-              "day",
-              "status",
-              "bars",
-              "detail",
-          ]
+          assert len(candidates) >= 20
 
-          def is_paused(detail):
-              value = detail.lower()
-              return (
-                  "pause currently" in value
-                  or "suspended" in value
-                  or "not support" in value
-              )
+          selected = candidates[:20]
 
-          def request_history(symbol, day):
-              start = int(
-                  datetime.fromisoformat(
-                      day + "T12:00:00+00:00"
-                  ).timestamp() * 1000
-              )
+          Path(
+              "research/selected.json"
+          ).write_text(
+              json.dumps({
+                  "candidate_count": len(candidates),
+                  "selected": selected,
+                  "selection_method":
+                      "Deterministic sample, not R1 signals",
+              }, indent=2),
+              encoding="utf-8",
+          )
 
-              params = urlencode({
-                  "symbol": symbol,
-                  "interval": "1m",
-                  "startTime": start,
-                  "endTime": start + 3600000 - 1,
-                  "limit": 60,
-              })
+          print("Candidates:", len(candidates))
+          print("Selected:", selected)
+          PY
 
-              url = (
-                  "https://open-api.bingx.com"
-                  "/openApi/swap/v3/quote/klines?"
-                  + params
-              )
+      - name: Download complete 1m history
+        run: |
+          python - <<'PY'
+          import csv
+          import json
+          import time
 
-              request = urllib.request.Request(
-                  url,
-                  headers={
-                      "User-Agent":
-                      "R1-Universe-Repair/1.0"
-                  },
-              )
+          from pathlib import Path
 
-              with urllib.request.urlopen(
-                  request,
-                  timeout=30,
-              ) as response:
-                  data = json.load(response)
+          from v42_download_bingx_history import (
+              download,
+              parse_utc,
+              FIELDS,
+          )
 
-              if str(data.get("code")) != "0":
-                  detail = str(data.get("msg", ""))
+          symbols = json.loads(
+              Path(
+                  "research/selected.json"
+              ).read_text()
+          )["selected"]
 
-                  if is_paused(detail):
-                      return (
-                          "PAUSED",
-                          0,
-                          detail[:150],
-                      )
+          start = parse_utc(
+              "2026-09-01T00:00:00Z"
+          )
 
-                  return (
-                      "API_ERROR",
-                      0,
-                      detail[:150],
+          end = parse_utc(
+              "2026-09-11T00:00:00Z"
+          )
+
+          results = []
+
+          for i, symbol in enumerate(symbols, 1):
+              try:
+                  bars, missing = download(
+                      symbol,
+                      start,
+                      end,
                   )
 
-              stamps = set()
-
-              for bar in data.get("data") or []:
-                  if isinstance(bar, list):
-                      stamp = bar[0]
-                  else:
-                      stamp = bar.get(
-                          "time",
-                          bar.get("openTime"),
-                      )
-
-                  if stamp is None:
+                  if missing or len(bars) != 14400:
+                      results.append({
+                          "symbol": symbol,
+                          "status": "INCOMPLETE",
+                          "bars": len(bars),
+                          "missing": len(missing),
+                      })
                       continue
 
-                  stamp = int(stamp)
+                  with open(
+                      "research/raw/" + symbol + ".csv",
+                      "w",
+                      newline="",
+                  ) as f:
+                      writer = csv.DictWriter(
+                          f,
+                          fieldnames=FIELDS,
+                      )
+                      writer.writeheader()
+                      writer.writerows(bars)
 
-                  if stamp < 10**11:
-                      stamp *= 1000
+                  results.append({
+                      "symbol": symbol,
+                      "status": "COMPLETE",
+                      "bars": len(bars),
+                  })
 
-                  if start <= stamp < start + 3600000:
-                      stamps.add(stamp)
+              except Exception as error:
+                  results.append({
+                      "symbol": symbol,
+                      "status": "ERROR",
+                      "detail": str(error)[:250],
+                  })
 
-              return (
-                  "HAS_HISTORY" if stamps
-                  else "NO_BARS",
-                  len(stamps),
-                  "",
+              print(
+                  i,
+                  "/",
+                  len(symbols),
+                  results[-1],
+                  flush=True,
               )
-
-          original = Counter(
-              r["status"] for r in rows
-          )
-
-          repaired_count = 0
-          paused_count = 0
-          still_failed = 0
-
-          for index, row in enumerate(rows):
-              if row["status"] not in (
-                  "ERROR",
-                  "API_ERROR",
-              ):
-                  continue
-
-              if is_paused(row["detail"]):
-                  row["status"] = "PAUSED"
-                  paused_count += 1
-                  continue
-
-              result = None
-
-              for attempt in range(5):
-                  try:
-                      result = request_history(
-                          row["symbol"],
-                          row["day"],
-                      )
-
-                      if result[0] not in (
-                          "ERROR",
-                          "API_ERROR",
-                      ):
-                          break
-
-                  except Exception as error:
-                      result = (
-                          "ERROR",
-                          0,
-                          str(error)[:150],
-                      )
-
-                  if attempt < 4:
-                      delay = min(
-                          30,
-                          2 ** attempt
-                          + random.uniform(0, 1),
-                      )
-                      time.sleep(delay)
-
-              row["status"] = result[0]
-              row["bars"] = str(result[1])
-              row["detail"] = result[2]
-
-              if result[0] in (
-                  "ERROR",
-                  "API_ERROR",
-              ):
-                  still_failed += 1
-              elif result[0] == "PAUSED":
-                  paused_count += 1
-              else:
-                  repaired_count += 1
 
               time.sleep(0.5)
 
-              if index % 100 == 0:
-                  print(
-                      "Progress:",
-                      index,
-                      "/",
-                      len(rows),
-                      flush=True,
-                  )
-
-          with (
-              output / "evidence_repaired.csv"
-          ).open(
-              "w",
-              newline="",
-              encoding="utf-8",
-          ) as f:
-              writer = csv.DictWriter(
-                  f,
-                  fieldnames=fields,
-              )
-              writer.writeheader()
-              writer.writerows(rows)
-
-          dates = [
-              "2026-09-01",
-              "2026-09-10",
-              "2026-09-20",
-              "2026-09-30",
-          ]
-
-          eligible = {
-              day: sorted(
-                  r["symbol"]
-                  for r in rows
-                  if r["day"] == day
-                  and r["status"] == "HAS_HISTORY"
-              )
-              for day in dates
-          }
-
-          final = Counter(
-              r["status"] for r in rows
-          )
-
-          report = {
-              "input_records": len(rows),
-              "original_status": dict(original),
-              "final_status": dict(final),
-              "repaired_requests": repaired_count,
-              "paused_requests": paused_count,
-              "remaining_api_errors": still_failed,
-              "checkpoint_counts": {
-                  day: len(eligible[day])
-                  for day in dates
-              },
-              "eligible_by_checkpoint": eligible,
-              "limitations": [
-                  "Current contract list is not "
-                  "an archived September listing.",
-                  "Delisted symbols may be absent.",
-                  "Four hourly samples do not "
-                  "prove full-month availability.",
-                  "Paused status observed now "
-                  "does not prove historical "
-                  "suspension on that date.",
-                  "Historical spread unavailable.",
-                  "No trading performed.",
-              ],
-          }
-
-          (
-              output / "repair_report.json"
+          Path(
+              "research/download_manifest.json"
           ).write_text(
-              json.dumps(
-                  report,
-                  indent=2,
-                  ensure_ascii=False,
-              ),
+              json.dumps(results, indent=2),
               encoding="utf-8",
           )
 
-          print(
-              json.dumps(
-                  {
-                      "original": dict(original),
-                      "final": dict(final),
-                      "repaired": repaired_count,
-                      "remaining_errors": still_failed,
-                      "checkpoint_counts":
-                          report["checkpoint_counts"],
-                  },
-                  indent=2,
-              ),
-              flush=True,
+          completed = sum(
+              r["status"] == "COMPLETE"
+              for r in results
+          )
+
+          assert completed >= 2, (
+              "Insufficient historical data"
           )
           PY
 
-      - name: Upload repaired evidence
+      - name: Load original R1 source
+        run: |
+          python v42_prepare_sources.py \
+            --out research/original
+
+      - name: Prepare assumed spread
+        run: |
+          python v42_cost_scenario.py \
+            --source research/raw \
+            --out research/spread \
+            --spread-pct 0.15
+
+      - name: Run R1 historical replay
+        run: |
+          python v42_run_offline_phase5.py \
+            --original-app \
+              research/original/original_app.py \
+            --original-scanner \
+              research/original/original_scanner_job.py \
+            --candles research/spread \
+            --out research/report
+
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-september-universe-repaired
-          path: repaired/
+          name: r1-september-historical-radar-batch01
+          path: |
+            research/selected.json
+            research/download_manifest.json
+            research/report/
+            research/original/source_manifest.json
           retention-days: 14
           if-no-files-found: warn
