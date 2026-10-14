@@ -1,7 +1,12 @@
 
-name: R1 September Historical OHLCV Download Check
+name: R1 September 12-Coin Historical Data Check
 
 on:
+  push:
+    branches:
+      - v42-historical-backtest
+    paths:
+      - '.github/workflows/v42_history_research.yml'
   workflow_dispatch:
 
 permissions:
@@ -10,29 +15,45 @@ permissions:
 jobs:
   download-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout research branch
+        uses: actions/checkout@v4
         with:
           ref: v42-historical-backtest
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Download September pilot including indicator warmup
+      - name: Download historical 1m candles
         shell: bash
         run: |
           set -euo pipefail
 
+          mkdir -p r1_september_pilot
+
           python v42_download_bingx_history.py \
-            --symbols 0G-USDT 1000BONK-USDT 1000PEPE-USDT 1INCH-USDT AAVE-USDT ADA-USDT AERO-USDT AEVO-USDT AGLD-USDT AIO-USDT AIXBT-USDT AKE-USDT \
+            --symbols \
+              0G-USDT \
+              1000BONK-USDT \
+              1000PEPE-USDT \
+              1INCH-USDT \
+              AAVE-USDT \
+              ADA-USDT \
+              AERO-USDT \
+              AEVO-USDT \
+              AGLD-USDT \
+              AIO-USDT \
+              AIXBT-USDT \
+              AKE-USDT \
             --start 2026-08-29T00:00:00Z \
             --end 2026-09-08T00:00:00Z \
             --out r1_september_pilot
 
-      - name: Summarize data completeness
+      - name: Check data completeness
         if: always()
         shell: bash
         run: |
@@ -41,42 +62,77 @@ jobs:
           import json
           from pathlib import Path
 
-          p = Path('r1_september_pilot')
-          p.mkdir(exist_ok=True)
+          folder = Path("r1_september_pilot")
+          folder.mkdir(exist_ok=True)
 
-          result = []
+          expected = 14400
+          symbols = [
+              "0G-USDT",
+              "1000BONK-USDT",
+              "1000PEPE-USDT",
+              "1INCH-USDT",
+              "AAVE-USDT",
+              "ADA-USDT",
+              "AERO-USDT",
+              "AEVO-USDT",
+              "AGLD-USDT",
+              "AIO-USDT",
+              "AIXBT-USDT",
+              "AKE-USDT",
+          ]
 
-          for f in sorted(p.glob('*-USDT.csv')):
-              with f.open(newline='') as h:
-                  reader = csv.DictReader(h)
-                  count = sum(1 for _ in reader)
+          results = []
 
-              result.append({
-                  'symbol': f.stem,
-                  'bars': count,
-                  'expected_bars': 14400,
-                  'complete': count == 14400
+          for symbol in symbols:
+              path = folder / (symbol + ".csv")
+
+              count = 0
+              if path.exists():
+                  with path.open(
+                      newline="", encoding="utf-8"
+                  ) as f:
+                      count = sum(
+                          1 for _ in csv.DictReader(f)
+                      )
+
+              results.append({
+                  "symbol": symbol,
+                  "bars": count,
+                  "expected": expected,
+                  "complete": count == expected,
               })
 
           summary = {
-              'scope': 'PIPELINE_TEST_NOT_BACKTEST',
-              'period_utc': '2026-08-29 through 2026-09-08',
-              'symbols': result,
-              'no_trading': True
+              "mode": "HISTORICAL_DATA_CHECK_ONLY",
+              "period_start": "2026-08-29T00:00:00Z",
+              "period_end": "2026-09-08T00:00:00Z",
+              "expected_bars_per_symbol": expected,
+              "complete_symbols": sum(
+                  r["complete"] for r in results
+              ),
+              "tested_symbols": len(symbols),
+              "results": results,
+              "trading_enabled": False,
+              "backtest_executed": False,
           }
 
-          (p / 'pilot_summary.json').write_text(
-              json.dumps(summary, indent=2)
+          (folder / "pilot_summary.json").write_text(
+              json.dumps(
+                  summary,
+                  indent=2,
+                  ensure_ascii=False
+              ),
+              encoding="utf-8"
           )
 
-          print(json.dumps(result, indent=2))
+          print(json.dumps(summary, indent=2))
           PY
 
-      - name: Upload historical data and completeness report
+      - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-september-1m-pilot-data
+          name: r1-september-12coin-history
           path: r1_september_pilot/
           if-no-files-found: warn
           retention-days: 14
