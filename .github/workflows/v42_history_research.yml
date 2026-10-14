@@ -1,21 +1,16 @@
 
-name: R1 Historical Multi-Coin Universe Probe
+name: R1 September Historical OHLCV Download Check
 
 on:
-  push:
-    branches:
-      - v42-historical-backtest
-    paths:
-      - '.github/workflows/v42_history_research.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  probe:
+  download-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
 
     steps:
       - uses: actions/checkout@v4
@@ -26,241 +21,62 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Discover currently listed contracts and probe historic 1m data
+      - name: Download September pilot including indicator warmup
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p r1_universe_probe
 
+          python v42_download_bingx_history.py \
+            --symbols 0G-USDT 1000BONK-USDT 1000PEPE-USDT 1INCH-USDT AAVE-USDT ADA-USDT AERO-USDT AEVO-USDT AGLD-USDT AIO-USDT AIXBT-USDT AKE-USDT \
+            --start 2026-08-29T00:00:00Z \
+            --end 2026-09-08T00:00:00Z \
+            --out r1_september_pilot
+
+      - name: Summarize data completeness
+        if: always()
+        shell: bash
+        run: |
           python - <<'PY'
           import csv
           import json
-          import time
-          import urllib.request
-          from datetime import datetime, timezone
           from pathlib import Path
-          from v42_download_bingx_history import request_page
 
-          OUT = Path('r1_universe_probe')
+          p = Path('r1_september_pilot')
+          p.mkdir(exist_ok=True)
 
-          # Current listing is not the full historical universe.
-          # This is data coverage research, not a strategy backtest.
-          URL = 'https://open-api.bingx.com/openApi/swap/v2/quote/contracts'
+          result = []
 
-          dates = {
-              'July': '2026-07-15T12:00:00Z',
-              'August': '2026-08-15T12:00:00Z',
-              'September': '2026-09-15T12:00:00Z',
-          }
+          for f in sorted(p.glob('*-USDT.csv')):
+              with f.open(newline='') as h:
+                  reader = csv.DictReader(h)
+                  count = sum(1 for _ in reader)
 
-          fallback = [
-              'BTC-USDT', 'ETH-USDT', 'SOL-USDT',
-              'XRP-USDT', 'DOGE-USDT', 'LTC-USDT',
-              'ADA-USDT', 'LINK-USDT', 'AVAX-USDT',
-              'DOT-USDT', 'AAVE-USDT', 'SUI-USDT',
-              'APT-USDT', 'ARB-USDT', 'OP-USDT',
-              'INJ-USDT', 'ATOM-USDT', 'UNI-USDT',
-              'NEAR-USDT', 'FIL-USDT', 'PEPE-USDT',
-              'WIF-USDT', 'BONK-USDT', 'SEI-USDT',
-              'TIA-USDT', 'US-USDT', 'BILL-USDT',
-              'TERMMAX-USDT'
-          ]
-
-          source = 'current_contract_list'
-
-          try:
-              req = urllib.request.Request(
-                  URL,
-                  headers={
-                      'User-Agent': 'R1ResearchProbe/1.0'
-                  }
-              )
-
-              with urllib.request.urlopen(
-                  req, timeout=20
-              ) as response:
-                  obj = json.load(response)
-
-              if str(obj.get('code')) != '0':
-                  raise ValueError(
-                      'Contracts API returned code '
-                      + str(obj.get('code'))
-                  )
-
-              body = obj.get('data', [])
-
-              if isinstance(body, dict):
-                  body = body.get(
-                      'contracts',
-                      body.get('list', [])
-                  )
-
-              if not isinstance(body, list):
-                  raise ValueError(
-                      'Invalid contracts response'
-                  )
-
-              symbols = sorted({
-                  str(x.get('symbol', '')).upper()
-                  for x in body
-                  if isinstance(x, dict)
-                  and str(
-                      x.get('symbol', '')
-                  ).upper().endswith('-USDT')
+              result.append({
+                  'symbol': f.stem,
+                  'bars': count,
+                  'expected_bars': 14400,
+                  'complete': count == 14400
               })
 
-              if not symbols:
-                  raise ValueError(
-                      'Empty contracts list'
-                  )
-
-              # Bounded diagnostic sample, not full
-              # historical strategy selection.
-              symbols = symbols[:60]
-
-          except Exception as exc:
-              source = 'explicit_fallback_symbols'
-              symbols = fallback
-
-              print(
-                  'CONTRACT_DISCOVERY_WARNING',
-                  str(exc),
-                  flush=True
-              )
-
-          print(
-              'PROBE_SYMBOLS',
-              len(symbols),
-              'SOURCE',
-              source,
-              flush=True
-          )
-
-          rows = []
-
-          for index, sym in enumerate(symbols, 1):
-              row = {'symbol': sym}
-
-              for month, point in dates.items():
-                  start = int(
-                      datetime.fromisoformat(
-                          point.replace('Z', '+00:00')
-                      ).timestamp() * 1000
-                  )
-
-                  try:
-                      candles = request_page(
-                          sym,
-                          start,
-                          start + 60 * 60000,
-                          limit=60,
-                          tries=2
-                      )
-
-                      row[month + '_bars'] = len(candles)
-
-                      row[month + '_status'] = (
-                          'SAMPLE_PASS'
-                          if len(candles) == 60
-                          else 'SAMPLE_INCOMPLETE'
-                      )
-
-                  except Exception as exc:
-                      row[month + '_bars'] = 0
-                      row[month + '_status'] = (
-                          'API_ERROR'
-                      )
-                      row[month + '_error'] = (
-                          str(exc)[:150]
-                      )
-
-              rows.append(row)
-
-              print(
-                  f'{index}/{len(symbols)}',
-                  sym,
-                  *(
-                      row[month + '_status']
-                      for month in dates
-                  ),
-                  flush=True
-              )
-
-              time.sleep(.13)
-
-          fields = ['symbol'] + [
-              x
-              for m in dates
-              for x in (
-                  m + '_bars',
-                  m + '_status',
-                  m + '_error'
-              )
-          ]
-
-          with (
-              OUT / 'sample_coverage.csv'
-          ).open(
-              'w',
-              newline='',
-              encoding='utf-8'
-          ) as f:
-              w = csv.DictWriter(
-                  f,
-                  fieldnames=fields,
-                  extrasaction='ignore'
-              )
-
-              w.writeheader()
-              w.writerows(rows)
-
-          counts = {
-              m: sum(
-                  r[m + '_status'] == 'SAMPLE_PASS'
-                  for r in rows
-              )
-              for m in dates
-          }
-
           summary = {
-              'research_only': True,
-              'discovery_source': source,
-              'tested_symbols': len(symbols),
-              'sample_pass_by_month': counts,
-              'dates': dates,
-              'limitations': [
-                  'Three spot checks only',
-                  'Not proof of complete monthly data',
-                  'Current listings exclude delisted coins',
-                  'Historical ticker snapshots unavailable',
-                  'Historical spreads unavailable',
-                  'No trades simulated',
-                  'No strategy performance calculated'
-              ]
+              'scope': 'PIPELINE_TEST_NOT_BACKTEST',
+              'period_utc': '2026-08-29 through 2026-09-08',
+              'symbols': result,
+              'no_trading': True
           }
 
-          (
-              OUT / 'summary.json'
-          ).write_text(
-              json.dumps(
-                  summary,
-                  indent=2
-              ),
-              encoding='utf-8'
+          (p / 'pilot_summary.json').write_text(
+              json.dumps(summary, indent=2)
           )
 
-          print(
-              'COVERAGE_SUMMARY',
-              json.dumps(summary),
-              flush=True
-          )
+          print(json.dumps(result, indent=2))
           PY
 
-      - name: Save research results
+      - name: Upload historical data and completeness report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-jul-sep-multicoin-universe-probe
-          path: r1_universe_probe/
+          name: r1-september-1m-pilot-data
+          path: r1_september_pilot/
           if-no-files-found: warn
           retention-days: 14
