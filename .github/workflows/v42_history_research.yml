@@ -1,19 +1,21 @@
 
-name: R1 20 Trades 1m Boundary Audit
+name: R1 Historical Multi-Coin Universe Probe
 
 on:
   push:
-    branches: [v42-historical-backtest]
-    paths: ['.github/workflows/v42_history_research.yml']
+    branches:
+      - v42-historical-backtest
+    paths:
+      - '.github/workflows/v42_history_research.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  audit:
+  probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -24,341 +26,241 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Audit historical minute boundaries and touched levels
+      - name: Discover currently listed contracts and probe historic 1m data
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p r1_universe_probe
+
           python - <<'PY'
           import csv
           import json
           import time
-          from pathlib import Path
+          import urllib.request
           from datetime import datetime, timezone
+          from pathlib import Path
           from v42_download_bingx_history import request_page
 
-          # Read-only sample of 20 R1 simulated trades.
-          SAMPLE = """2070 RESOLV-USDT LONG 2026-10-13T17:46:04.260146Z 2026-10-13T21:50:15.228401Z 0.01836 TIMEOUT_EXIT
-          2109 ZZZRH-USDT LONG 2026-10-13T21:30:58.659916Z 2026-10-13T21:45:11.352732Z 0.01386 SL_EXIT
-          2076 ARGUS-USDT SHORT 2026-10-13T18:05:49.654488Z 2026-10-13T21:30:21.704556Z 0.00759 TREND_EXIT
-          2085 RATS-USDT SHORT 2026-10-13T19:15:52.456431Z 2026-10-13T21:15:08.779273Z 0.0000178 TP2_PROTECT_EXIT
-          2098 US-USDT SHORT 2026-10-13T20:20:53.556618Z 2026-10-13T21:00:10.824988Z 0.008599 BREAKEVEN_EXIT
-          2104 ZC-USDT LONG 2026-10-13T20:41:00.473818Z 2026-10-13T20:50:08.556953Z 0.0041 TP3_EXIT
-          2101 EACC-USDT SHORT 2026-10-13T20:35:55.057357Z 2026-10-13T20:40:10.816369Z 0.00114 BREAKEVEN_EXIT
-          2092 FONE-USDT SHORT 2026-10-13T19:50:59.360843Z 2026-10-13T20:40:10.578907Z 0.004493 BREAKEVEN_EXIT
-          2080 SI-USDT SHORT 2026-10-13T18:31:22.761718Z 2026-10-13T20:30:06.652677Z 0.0167 TP3_EXIT
-          2058 KOMA-USDT LONG 2026-10-13T16:35:52.759184Z 2026-10-13T20:30:06.398279Z 0.020507 BREAKEVEN_EXIT
-          2056 EVAA-USDT LONG 2026-10-13T16:25:56.167164Z 2026-10-13T20:30:06.355451Z 0.6349 TIMEOUT_EXIT
-          2089 OTC-USDT LONG 2026-10-13T19:41:10.564818Z 2026-10-13T20:25:05.703449Z 0.006705 BREAKEVEN_EXIT
-          2095 ARC-USDT SHORT 2026-10-13T20:05:34.061342Z 2026-10-13T20:20:08.747802Z 0.03204 BREAKEVEN_EXIT
-          2086 ZCAT-USDT LONG 2026-10-13T19:25:56.265064Z 2026-10-13T20:20:08.609317Z 0.04885 TP3_EXIT
-          2059 OP-USDT LONG 2026-10-13T16:40:57.363829Z 2026-10-13T20:15:13.407178Z 0.14387 TP3_EXIT
-          2093 SHROOM-USDT LONG 2026-10-13T20:00:45.161465Z 2026-10-13T20:10:11.243108Z 0.006104 BREAKEVEN_EXIT
-          2091 DARKSWAP-USDT SHORT 2026-10-13T19:45:46.662812Z 2026-10-13T20:05:08.013537Z 0.002024 SL_EXIT
-          2090 NCSKKOPN2USD-USDT LONG 2026-10-13T19:41:11.960936Z 2026-10-13T20:05:07.978911Z 4.225 BREAKEVEN_EXIT
-          2052 NEAR-USDT SHORT 2026-10-13T15:56:12.156333Z 2026-10-13T20:00:09.988351Z 5.019 TIMEOUT_EXIT
-          2087 TRUTH-USDT LONG 2026-10-13T19:30:54.958823Z 2026-10-13T19:50:11.229545Z 0.019012 BREAKEVEN_EXIT"""
+          OUT = Path('r1_universe_probe')
 
-          def stamp(s):
-              return int(
-                  datetime.fromisoformat(
-                      s.replace("Z", "+00:00")
-                  ).timestamp() * 1000
+          # Current listing is not the full historical universe.
+          # This is data coverage research, not a strategy backtest.
+          URL = 'https://open-api.bingx.com/openApi/swap/v2/quote/contracts'
+
+          dates = {
+              'July': '2026-07-15T12:00:00Z',
+              'August': '2026-08-15T12:00:00Z',
+              'September': '2026-09-15T12:00:00Z',
+          }
+
+          fallback = [
+              'BTC-USDT', 'ETH-USDT', 'SOL-USDT',
+              'XRP-USDT', 'DOGE-USDT', 'LTC-USDT',
+              'ADA-USDT', 'LINK-USDT', 'AVAX-USDT',
+              'DOT-USDT', 'AAVE-USDT', 'SUI-USDT',
+              'APT-USDT', 'ARB-USDT', 'OP-USDT',
+              'INJ-USDT', 'ATOM-USDT', 'UNI-USDT',
+              'NEAR-USDT', 'FIL-USDT', 'PEPE-USDT',
+              'WIF-USDT', 'BONK-USDT', 'SEI-USDT',
+              'TIA-USDT', 'US-USDT', 'BILL-USDT',
+              'TERMMAX-USDT'
+          ]
+
+          source = 'current_contract_list'
+
+          try:
+              req = urllib.request.Request(
+                  URL,
+                  headers={
+                      'User-Agent': 'R1ResearchProbe/1.0'
+                  }
               )
 
-          def download(sym, start, end):
-              data = {}
-              cursor = start
+              with urllib.request.urlopen(
+                  req, timeout=20
+              ) as response:
+                  obj = json.load(response)
 
-              while cursor < end:
-                  nxt = min(
-                      cursor + 1000 * 60000,
-                      end
-                  )
-                  data.update(
-                      request_page(
-                          sym,
-                          cursor,
-                          nxt,
-                          limit=1000,
-                          tries=3
-                      )
-                  )
-                  cursor = nxt
-                  time.sleep(.15)
-
-              return data
-
-          def touches(side, bar, level, kind):
-              lo = float(bar["low"])
-              hi = float(bar["high"])
-
-              if kind == "tp":
-                  return (
-                      hi >= level
-                      if side == "LONG"
-                      else lo <= level
+              if str(obj.get('code')) != '0':
+                  raise ValueError(
+                      'Contracts API returned code '
+                      + str(obj.get('code'))
                   )
 
-              return (
-                  lo <= level
-                  if side == "LONG"
-                  else hi >= level
-              )
+              body = obj.get('data', [])
 
-          rows = []
-          detail = []
-
-          for line in SAMPLE.splitlines():
-              (
-                  rid,
-                  symbol,
-                  side,
-                  entrystr,
-                  exitstr,
-                  px,
-                  reason,
-              ) = line.split()
-
-              entry = float(px)
-              e = stamp(entrystr)
-              x = stamp(exitstr)
-              direction = 1 if side == "LONG" else -1
-
-              levels = {
-                  "TP1": entry * (1 + direction * .02),
-                  "TP2": entry * (1 + direction * .04),
-                  "TP3": entry * (1 + direction * .08),
-                  "SL": entry * (1 - direction * .025),
-                  "BE": entry,
-              }
-
-              begin = e // 60000 * 60000
-              finish = (x // 60000 + 1) * 60000
-
-              info = {
-                  "id": rid,
-                  "symbol": symbol,
-                  "side": side,
-                  "recorded_exit": reason,
-                  "entry": entrystr,
-                  "exit": exitstr,
-              }
-
-              try:
-                  data = download(
-                      symbol,
-                      begin,
-                      finish
+              if isinstance(body, dict):
+                  body = body.get(
+                      'contracts',
+                      body.get('list', [])
                   )
 
-                  keys = list(
-                      range(begin, finish, 60000)
+              if not isinstance(body, list):
+                  raise ValueError(
+                      'Invalid contracts response'
                   )
 
-                  missing = [
-                      k for k in keys
-                      if k not in data
-                  ]
+              symbols = sorted({
+                  str(x.get('symbol', '')).upper()
+                  for x in body
+                  if isinstance(x, dict)
+                  and str(
+                      x.get('symbol', '')
+                  ).upper().endswith('-USDT')
+              })
 
-                  info["missing_candles"] = len(missing)
+              if not symbols:
+                  raise ValueError(
+                      'Empty contracts list'
+                  )
 
-                  if missing:
-                      info["finding"] = "DATA_INCOMPLETE"
+              # Bounded diagnostic sample, not full
+              # historical strategy selection.
+              symbols = symbols[:60]
 
-                  else:
-                      first = {
-                          key: None
-                          for key in levels
-                      }
-
-                      times = []
-
-                      for k in keys:
-                          bar = data[k]
-
-                          entry_boundary = (
-                              k == e // 60000 * 60000
-                          )
-
-                          exit_boundary = (
-                              k == x // 60000 * 60000
-                          )
-
-                          hits = {
-                              name: touches(
-                                  side,
-                                  bar,
-                                  price,
-                                  "sl"
-                                  if name in ("SL", "BE")
-                                  else "tp"
-                              )
-                              for name, price
-                              in levels.items()
-                          }
-
-                          for name, ok in hits.items():
-                              if (
-                                  ok
-                                  and first[name] is None
-                              ):
-                                  first[name] = (
-                                      datetime.fromtimestamp(
-                                          k / 1000,
-                                          timezone.utc
-                                      ).isoformat()
-                                  )
-
-                          if (
-                              any(hits.values())
-                              or entry_boundary
-                              or exit_boundary
-                          ):
-                              times.append({
-                                  "id": rid,
-                                  "symbol": symbol,
-                                  "minute_utc":
-                                      datetime.fromtimestamp(
-                                          k / 1000,
-                                          timezone.utc
-                                      ).isoformat(),
-                                  "entry_boundary":
-                                      entry_boundary,
-                                  "exit_boundary":
-                                      exit_boundary,
-                                  "open": bar["open"],
-                                  "high": bar["high"],
-                                  "low": bar["low"],
-                                  "close": bar["close"],
-                                  **{
-                                      "hit_" + a.lower(): b
-                                      for a, b in hits.items()
-                                  }
-                              })
-
-                      detail.extend(times)
-
-                      for key, val in first.items():
-                          info[
-                              "first_" + key.lower()
-                              + "_minute"
-                          ] = val or ""
-
-                      needed = {
-                          "SL_EXIT": ["SL"],
-                          "BREAKEVEN_EXIT":
-                              ["TP1", "BE"],
-                          "TP2_PROTECT_EXIT":
-                              ["TP1", "TP2"],
-                          "TP3_EXIT":
-                              ["TP1", "TP2", "TP3"],
-                      }.get(reason)
-
-                      if needed is None:
-                          info["finding"] = (
-                              "EXIT_LOGIC_REQUIRES_RUNTIME_DATA"
-                          )
-                      elif any(
-                          first[k] is None
-                          for k in needed
-                      ):
-                          info["finding"] = (
-                              "REQUIRED_PRICE_LEVEL_MISSING"
-                          )
-                      else:
-                          info["finding"] = (
-                              "LEVELS_TOUCHED_ORDER_UNVERIFIED"
-                          )
-
-                      info["boundary_risk"] = (
-                          "YES: entry/exit minute OHLC "
-                          "includes seconds outside "
-                          "holding period"
-                      )
-
-              except Exception as err:
-                  info["finding"] = "DOWNLOAD_ERROR"
-                  info["detail"] = str(err)[:200]
-
-              rows.append(info)
+          except Exception as exc:
+              source = 'explicit_fallback_symbols'
+              symbols = fallback
 
               print(
-                  rid,
-                  symbol,
-                  info["finding"],
+                  'CONTRACT_DISCOVERY_WARNING',
+                  str(exc),
                   flush=True
               )
 
-          out = Path("r1_replay_audit")
-          out.mkdir(exist_ok=True)
+          print(
+              'PROBE_SYMBOLS',
+              len(symbols),
+              'SOURCE',
+              source,
+              flush=True
+          )
 
-          def writecsv(path, data):
-              if not data:
-                  return
+          rows = []
 
-              cols = sorted({
-                  k
-                  for v in data
-                  for k in v
-              })
+          for index, sym in enumerate(symbols, 1):
+              row = {'symbol': sym}
 
-              with (
-                  out / path
-              ).open(
-                  "w",
-                  newline="",
-                  encoding="utf-8"
-              ) as f:
-                  w = csv.DictWriter(
-                      f,
-                      fieldnames=cols
+              for month, point in dates.items():
+                  start = int(
+                      datetime.fromisoformat(
+                          point.replace('Z', '+00:00')
+                      ).timestamp() * 1000
                   )
-                  w.writeheader()
-                  w.writerows(data)
 
-          writecsv("audit.csv", rows)
-          writecsv("touch_minutes.csv", detail)
+                  try:
+                      candles = request_page(
+                          sym,
+                          start,
+                          start + 60 * 60000,
+                          limit=60,
+                          tries=2
+                      )
 
-          count = {
-              k: sum(
-                  r["finding"] == k
+                      row[month + '_bars'] = len(candles)
+
+                      row[month + '_status'] = (
+                          'SAMPLE_PASS'
+                          if len(candles) == 60
+                          else 'SAMPLE_INCOMPLETE'
+                      )
+
+                  except Exception as exc:
+                      row[month + '_bars'] = 0
+                      row[month + '_status'] = (
+                          'API_ERROR'
+                      )
+                      row[month + '_error'] = (
+                          str(exc)[:150]
+                      )
+
+              rows.append(row)
+
+              print(
+                  f'{index}/{len(symbols)}',
+                  sym,
+                  *(
+                      row[month + '_status']
+                      for month in dates
+                  ),
+                  flush=True
+              )
+
+              time.sleep(.13)
+
+          fields = ['symbol'] + [
+              x
+              for m in dates
+              for x in (
+                  m + '_bars',
+                  m + '_status',
+                  m + '_error'
+              )
+          ]
+
+          with (
+              OUT / 'sample_coverage.csv'
+          ).open(
+              'w',
+              newline='',
+              encoding='utf-8'
+          ) as f:
+              w = csv.DictWriter(
+                  f,
+                  fieldnames=fields,
+                  extrasaction='ignore'
+              )
+
+              w.writeheader()
+              w.writerows(rows)
+
+          counts = {
+              m: sum(
+                  r[m + '_status'] == 'SAMPLE_PASS'
                   for r in rows
               )
-              for k in sorted({
-                  r["finding"]
-                  for r in rows
-              })
+              for m in dates
+          }
+
+          summary = {
+              'research_only': True,
+              'discovery_source': source,
+              'tested_symbols': len(symbols),
+              'sample_pass_by_month': counts,
+              'dates': dates,
+              'limitations': [
+                  'Three spot checks only',
+                  'Not proof of complete monthly data',
+                  'Current listings exclude delisted coins',
+                  'Historical ticker snapshots unavailable',
+                  'Historical spreads unavailable',
+                  'No trades simulated',
+                  'No strategy performance calculated'
+              ]
           }
 
           (
-              out / "summary.json"
+              OUT / 'summary.json'
           ).write_text(
-              json.dumps({
-                  "total": len(rows),
-                  "counts": count,
-                  "warning":
-                      "1m OHLC cannot establish "
-                      "tick order, exact fill, "
-                      "or prices within partial "
-                      "entry/exit minutes. "
-                      "Level touch is not a "
-                      "verified trade.",
-              }, indent=2),
-              encoding="utf-8"
+              json.dumps(
+                  summary,
+                  indent=2
+              ),
+              encoding='utf-8'
           )
 
           print(
-              "AUDIT_SUMMARY",
-              json.dumps(count),
+              'COVERAGE_SUMMARY',
+              json.dumps(summary),
               flush=True
           )
           PY
 
-      - name: Save read-only audit
+      - name: Save research results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-20trades-boundary-audit
-          path: r1_replay_audit/
+          name: r1-jul-sep-multicoin-universe-probe
+          path: r1_universe_probe/
           if-no-files-found: warn
           retention-days: 14
