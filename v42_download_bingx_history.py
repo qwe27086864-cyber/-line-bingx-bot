@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """Download historical BingX swap 1m OHLCV, without fabricating bid/ask spreads.
 No exchange keys, order endpoints, database, or trading operations.
@@ -70,6 +71,10 @@ def download(symbol,start_ms,end_ms,request=request_page,limit=1000):
             if t in collected and collected[t]!=row:raise ValueError('Conflicting overlapping candle')
             collected[t]=row
         cursor=end
+        pages_done=(cursor-start_ms+limit*60000-1)//(limit*60000)
+        total_pages=(end_ms-start_ms+limit*60000-1)//(limit*60000)
+        if pages_done==1 or pages_done%10==0 or cursor>=end_ms:
+            print(f'[download] {symbol} pages {pages_done}/{total_pages} candles {len(collected)}',flush=True)
     expected=set(range(start_ms,end_ms,60000));missing=sorted(expected-set(collected))
     return [collected[k] for k in sorted(collected)],missing
 
