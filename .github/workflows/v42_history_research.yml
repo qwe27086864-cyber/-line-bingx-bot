@@ -1,5 +1,5 @@
 
-name: R1 12-Coin Original Signal Pilot
+name: R1 September Historical Universe Probe
 
 on:
   push:
@@ -11,16 +11,11 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
-  original-r1-pilot:
+  september-universe:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
+    timeout-minutes: 90
 
     steps:
       - name: Checkout research branch
@@ -33,104 +28,51 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Reuse previously downloaded historical data
-        shell: bash
+      - name: Check Python syntax
         run: |
-          set -euo pipefail
-          mkdir -p study/raw
+          python -m py_compile \
+            r1_september_universe_probe.py
 
-          gh run download 38526388381 \
-            -n r1-september-12coin-history \
-            -D study/raw
+      - name: Scan September historical coin universe
+        run: |
+          python -u r1_september_universe_probe.py \
+            --out r1_september_universe \
+            --max-symbols 0 \
+            --workers 5
 
+      - name: Show checkpoint summary
+        if: success()
+        run: |
           python - <<'PY'
-          import csv
-          from pathlib import Path
+          import json
 
-          files = sorted(
-              Path("study/raw").glob("*-USDT.csv")
+          with open(
+              "r1_september_universe/universe_evidence.json",
+              encoding="utf-8",
+          ) as f:
+              data = json.load(f)
+
+          print(
+              "Total symbols:",
+              data["total_symbols_checked"],
           )
 
-          assert len(files) == 12, (
-              f"Expected 12 coins, got {len(files)}"
+          for day, count in data[
+              "checkpoint_counts"
+          ].items():
+              print(day, count)
+
+          print(
+              "API errors:",
+              len(data["errors"]),
           )
-
-          for file in files:
-              with file.open(newline="") as f:
-                  count = sum(
-                      1 for _ in csv.DictReader(f)
-                  )
-
-              assert count == 14400, (
-                  f"{file.name}: {count} bars"
-              )
-
-          print("12 coins verified")
           PY
 
-      - name: Get original R1 strategy source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python v42_prepare_sources.py \
-            --out study/original
-
-      - name: Prepare assumed spread research data
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python v42_cost_scenario.py \
-            --source study/raw \
-            --out study/assumed_spread \
-            --spread-pct 0.15
-
-      - name: Run original R1 historical signal replay
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python v42_run_offline_phase5.py \
-            --original-app \
-              study/original/original_app.py \
-            --original-scanner \
-              study/original/original_scanner_job.py \
-            --candles study/assumed_spread \
-            --out study/report
-
-      - name: Add research limitations
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p study/report
-
-          cat > study/report/READ_ME_FIRST.txt <<'EOF'
-          R1 historical research pilot.
-
-          Period: 2026-08-29 to 2026-09-08 UTC
-          Symbols: 12 fixed test symbols
-
-          Uses original V4.2R1 signal functions.
-
-          Historical ticker data is reconstructed.
-          Spread of 0.15% is assumed, not observed.
-          Execution remains a historical proxy.
-
-          This is NOT a full-market R1 backtest.
-          This is NOT proof of profitability.
-          No live trading is enabled.
-          Existing Render services are unchanged.
-          EOF
-
-      - name: Upload R1 research results
+      - name: Upload historical universe evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-12coin-original-signal-pilot
-          path: |
-            study/report/
-            study/original/source_manifest.json
-            study/assumed_spread/ASSUMED_SPREAD_MANIFEST.json
+          name: r1-september-universe-evidence
+          path: r1_september_universe/
           retention-days: 14
           if-no-files-found: warn
