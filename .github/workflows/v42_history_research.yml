@@ -1,53 +1,43 @@
 
-name: R1 20 Trades 1m Price Validation
+name: R1 20 Trades 1m Boundary Audit
 
 on:
   push:
-    branches:
-      - v42-historical-backtest
-    paths:
-      - '.github/workflows/v42_history_research.yml'
+    branches: [v42-historical-backtest]
+    paths: ['.github/workflows/v42_history_research.yml']
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  validate:
+  audit:
     runs-on: ubuntu-latest
     timeout-minutes: 50
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: v42-historical-backtest
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Compare R1 trades against BingX 1m candles
+      - name: Audit historical minute boundaries and touched levels
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p r1_replay20
-
           python - <<'PY'
           import csv
           import json
           import time
-          from datetime import datetime
           from pathlib import Path
-
+          from datetime import datetime, timezone
           from v42_download_bingx_history import request_page
 
-          # 20 closed R1 simulated trades.
-          # Research only. No live trading.
-
-          sample = """
-          2070 RESOLV-USDT LONG 2026-10-13T17:46:04.260146Z 2026-10-13T21:50:15.228401Z 0.01836 TIMEOUT_EXIT
+          # Read-only sample of 20 R1 simulated trades.
+          SAMPLE = """2070 RESOLV-USDT LONG 2026-10-13T17:46:04.260146Z 2026-10-13T21:50:15.228401Z 0.01836 TIMEOUT_EXIT
           2109 ZZZRH-USDT LONG 2026-10-13T21:30:58.659916Z 2026-10-13T21:45:11.352732Z 0.01386 SL_EXIT
           2076 ARGUS-USDT SHORT 2026-10-13T18:05:49.654488Z 2026-10-13T21:30:21.704556Z 0.00759 TREND_EXIT
           2085 RATS-USDT SHORT 2026-10-13T19:15:52.456431Z 2026-10-13T21:15:08.779273Z 0.0000178 TP2_PROTECT_EXIT
@@ -66,337 +56,309 @@ jobs:
           2091 DARKSWAP-USDT SHORT 2026-10-13T19:45:46.662812Z 2026-10-13T20:05:08.013537Z 0.002024 SL_EXIT
           2090 NCSKKOPN2USD-USDT LONG 2026-10-13T19:41:11.960936Z 2026-10-13T20:05:07.978911Z 4.225 BREAKEVEN_EXIT
           2052 NEAR-USDT SHORT 2026-10-13T15:56:12.156333Z 2026-10-13T20:00:09.988351Z 5.019 TIMEOUT_EXIT
-          2087 TRUTH-USDT LONG 2026-10-13T19:30:54.958823Z 2026-10-13T19:50:11.229545Z 0.019012 BREAKEVEN_EXIT
-          """
+          2087 TRUTH-USDT LONG 2026-10-13T19:30:54.958823Z 2026-10-13T19:50:11.229545Z 0.019012 BREAKEVEN_EXIT"""
 
-          def milliseconds(value):
+          def stamp(s):
               return int(
                   datetime.fromisoformat(
-                      value.replace("Z", "+00:00")
+                      s.replace("Z", "+00:00")
                   ).timestamp() * 1000
               )
 
-          def price_levels(side, entry):
-              direction = 1 if side == "LONG" else -1
-
-              return {
-                  "tp1": entry * (1 + direction * .02),
-                  "tp2": entry * (1 + direction * .04),
-                  "tp3": entry * (1 + direction * .08),
-                  "sl": entry * (1 - direction * .025),
-              }
-
-          def download_candles(symbol, start, end):
-              bars = {}
+          def download(sym, start, end):
+              data = {}
               cursor = start
 
               while cursor < end:
-                  upper = min(
-                      end,
-                      cursor + 1000 * 60000
+                  nxt = min(
+                      cursor + 1000 * 60000,
+                      end
+                  )
+                  data.update(
+                      request_page(
+                          sym,
+                          cursor,
+                          nxt,
+                          limit=1000,
+                          tries=3
+                      )
+                  )
+                  cursor = nxt
+                  time.sleep(.15)
+
+              return data
+
+          def touches(side, bar, level, kind):
+              lo = float(bar["low"])
+              hi = float(bar["high"])
+
+              if kind == "tp":
+                  return (
+                      hi >= level
+                      if side == "LONG"
+                      else lo <= level
                   )
 
-                  page = request_page(
-                      symbol,
-                      cursor,
-                      upper,
-                      limit=1000,
-                      tries=3,
-                  )
+              return (
+                  lo <= level
+                  if side == "LONG"
+                  else hi >= level
+              )
 
-                  bars.update(page)
-                  cursor = upper
+          rows = []
+          detail = []
 
-                  time.sleep(.18)
-
-              return bars
-
-          results = []
-
-          for line in sample.strip().splitlines():
+          for line in SAMPLE.splitlines():
               (
-                  trade_id,
+                  rid,
                   symbol,
                   side,
-                  entry_time,
-                  exit_time,
-                  entry_value,
-                  exit_reason,
+                  entrystr,
+                  exitstr,
+                  px,
+                  reason,
               ) = line.split()
 
-              entry = float(entry_value)
-              levels = price_levels(side, entry)
+              entry = float(px)
+              e = stamp(entrystr)
+              x = stamp(exitstr)
+              direction = 1 if side == "LONG" else -1
 
-              # Exclude partial entry minute.
-              begin = (
-                  milliseconds(entry_time) // 60000 + 1
-              ) * 60000
+              levels = {
+                  "TP1": entry * (1 + direction * .02),
+                  "TP2": entry * (1 + direction * .04),
+                  "TP3": entry * (1 + direction * .08),
+                  "SL": entry * (1 - direction * .025),
+                  "BE": entry,
+              }
 
-              # Include the recorded exit minute.
-              finish = (
-                  milliseconds(exit_time) // 60000 + 1
-              ) * 60000
+              begin = e // 60000 * 60000
+              finish = (x // 60000 + 1) * 60000
 
-              result = {
-                  "id": int(trade_id),
+              info = {
+                  "id": rid,
                   "symbol": symbol,
                   "side": side,
-                  "entry_time": entry_time,
-                  "exit_time": exit_time,
-                  "entry_price": entry,
-                  "recorded_exit": exit_reason,
-                  **levels,
+                  "recorded_exit": reason,
+                  "entry": entrystr,
+                  "exit": exitstr,
               }
 
               try:
-                  if finish <= begin:
-                      raise ValueError(
-                          "NO_FULL_MINUTE_AFTER_ENTRY"
-                      )
-
-                  bars = download_candles(
+                  data = download(
                       symbol,
                       begin,
-                      finish,
+                      finish
                   )
 
-                  expected = (finish - begin) // 60000
-                  missing = expected - len(bars)
+                  keys = list(
+                      range(begin, finish, 60000)
+                  )
 
-                  result.update({
-                      "candles": len(bars),
-                      "expected": expected,
-                      "missing": missing,
-                  })
+                  missing = [
+                      k for k in keys
+                      if k not in data
+                  ]
+
+                  info["missing_candles"] = len(missing)
 
                   if missing:
-                      result.update({
-                          "status": "DATA_INCOMPLETE",
-                          "detail": "Missing 1m candles",
-                      })
+                      info["finding"] = "DATA_INCOMPLETE"
 
                   else:
-                      ordered = [
-                          bars[t]
-                          for t in range(
-                              begin,
-                              finish,
-                              60000
-                          )
-                      ]
+                      first = {
+                          key: None
+                          for key in levels
+                      }
 
-                      def hit_target(bar, value):
-                          if side == "LONG":
-                              return float(bar["high"]) >= value
-                          return float(bar["low"]) <= value
+                      times = []
 
-                      def hit_stop(bar, value):
-                          if side == "LONG":
-                              return float(bar["low"]) <= value
-                          return float(bar["high"]) >= value
+                      for k in keys:
+                          bar = data[k]
 
-                      tp1 = False
-                      tp2 = False
-                      tp3 = False
-                      stopped = None
-                      ambiguous = False
-
-                      for bar in ordered:
-                          if not tp1:
-                              stop = levels["sl"]
-                          elif not tp2:
-                              stop = entry
-                          else:
-                              stop = levels["tp1"]
-
-                          stop_now = hit_stop(bar, stop)
-
-                          if tp2:
-                              next_tp = levels["tp3"]
-                          elif tp1:
-                              next_tp = levels["tp2"]
-                          else:
-                              next_tp = levels["tp1"]
-
-                          next_now = hit_target(
-                              bar,
-                              next_tp,
+                          entry_boundary = (
+                              k == e // 60000 * 60000
                           )
 
-                          if stop_now and next_now:
-                              ambiguous = True
+                          exit_boundary = (
+                              k == x // 60000 * 60000
+                          )
 
-                          # Conservative stop-first replay.
-                          if stop_now:
-                              if not tp1:
-                                  stopped = "SL_EXIT"
-                              elif not tp2:
-                                  stopped = "BREAKEVEN_EXIT"
-                              else:
-                                  stopped = "TP2_PROTECT_EXIT"
-                              break
+                          hits = {
+                              name: touches(
+                                  side,
+                                  bar,
+                                  price,
+                                  "sl"
+                                  if name in ("SL", "BE")
+                                  else "tp"
+                              )
+                              for name, price
+                              in levels.items()
+                          }
 
-                          if hit_target(
-                              bar,
-                              levels["tp1"]
+                          for name, ok in hits.items():
+                              if (
+                                  ok
+                                  and first[name] is None
+                              ):
+                                  first[name] = (
+                                      datetime.fromtimestamp(
+                                          k / 1000,
+                                          timezone.utc
+                                      ).isoformat()
+                                  )
+
+                          if (
+                              any(hits.values())
+                              or entry_boundary
+                              or exit_boundary
                           ):
-                              tp1 = True
+                              times.append({
+                                  "id": rid,
+                                  "symbol": symbol,
+                                  "minute_utc":
+                                      datetime.fromtimestamp(
+                                          k / 1000,
+                                          timezone.utc
+                                      ).isoformat(),
+                                  "entry_boundary":
+                                      entry_boundary,
+                                  "exit_boundary":
+                                      exit_boundary,
+                                  "open": bar["open"],
+                                  "high": bar["high"],
+                                  "low": bar["low"],
+                                  "close": bar["close"],
+                                  **{
+                                      "hit_" + a.lower(): b
+                                      for a, b in hits.items()
+                                  }
+                              })
 
-                          if hit_target(
-                              bar,
-                              levels["tp2"]
-                          ):
-                              tp2 = True
-                              tp1 = True
+                      detail.extend(times)
 
-                          if hit_target(
-                              bar,
-                              levels["tp3"]
-                          ):
-                              tp3 = True
-                              tp2 = True
-                              tp1 = True
-                              break
+                      for key, val in first.items():
+                          info[
+                              "first_" + key.lower()
+                              + "_minute"
+                          ] = val or ""
 
-                      result.update({
-                          "replay_tp1": tp1,
-                          "replay_tp2": tp2,
-                          "replay_tp3": tp3,
-                          "replay_stop": stopped,
-                          "ambiguous": ambiguous,
-                      })
+                      needed = {
+                          "SL_EXIT": ["SL"],
+                          "BREAKEVEN_EXIT":
+                              ["TP1", "BE"],
+                          "TP2_PROTECT_EXIT":
+                              ["TP1", "TP2"],
+                          "TP3_EXIT":
+                              ["TP1", "TP2", "TP3"],
+                      }.get(reason)
 
-                      if ambiguous:
-                          result.update({
-                              "status": "AMBIGUOUS",
-                              "detail": "Same-minute stop and target",
-                          })
-
-                      elif exit_reason == "TP3_EXIT":
-                          result.update({
-                              "status": (
-                                  "PRICE_PATH_SUPPORTS"
-                                  if tp3
-                                  else "PRICE_PATH_DIFFERS"
-                              ),
-                              "detail": "TP3 price path check",
-                          })
-
-                      elif exit_reason in (
-                          "SL_EXIT",
-                          "BREAKEVEN_EXIT",
-                          "TP2_PROTECT_EXIT",
+                      if needed is None:
+                          info["finding"] = (
+                              "EXIT_LOGIC_REQUIRES_RUNTIME_DATA"
+                          )
+                      elif any(
+                          first[k] is None
+                          for k in needed
                       ):
-                          result.update({
-                              "status": (
-                                  "PRICE_PATH_SUPPORTS"
-                                  if stopped == exit_reason
-                                  else "PRICE_PATH_DIFFERS"
-                              ),
-                              "detail": (
-                                  f"Replay stop: {stopped}"
-                              ),
-                          })
-
+                          info["finding"] = (
+                              "REQUIRED_PRICE_LEVEL_MISSING"
+                          )
                       else:
-                          result.update({
-                              "status": "NOT_DETERMINABLE",
-                              "detail": (
-                                  "Trend/timeout needs exact "
-                                  "runtime timing validation"
-                              ),
-                          })
+                          info["finding"] = (
+                              "LEVELS_TOUCHED_ORDER_UNVERIFIED"
+                          )
 
-                  print(
-                      trade_id,
-                      symbol,
-                      result["status"],
-                      flush=True,
-                  )
+                      info["boundary_risk"] = (
+                          "YES: entry/exit minute OHLC "
+                          "includes seconds outside "
+                          "holding period"
+                      )
 
-              except Exception as error:
-                  result.update({
-                      "status": "DOWNLOAD_OR_API_ERROR",
-                      "detail": str(error)[:300],
-                  })
+              except Exception as err:
+                  info["finding"] = "DOWNLOAD_ERROR"
+                  info["detail"] = str(err)[:200]
 
-                  print(
-                      trade_id,
-                      symbol,
-                      "ERROR",
-                      str(error),
-                      flush=True,
-                  )
+              rows.append(info)
 
-              results.append(result)
-
-          output = Path("r1_replay20")
-
-          with (
-              output / "results.csv"
-          ).open(
-              "w",
-              newline="",
-              encoding="utf-8",
-          ) as file:
-              columns = sorted({
-                  key
-                  for row in results
-                  for key in row
-              })
-
-              writer = csv.DictWriter(
-                  file,
-                  fieldnames=columns,
+              print(
+                  rid,
+                  symbol,
+                  info["finding"],
+                  flush=True
               )
 
-              writer.writeheader()
-              writer.writerows(results)
+          out = Path("r1_replay_audit")
+          out.mkdir(exist_ok=True)
 
-          counts = {
-              status: sum(
-                  row["status"] == status
-                  for row in results
-              )
-              for status in sorted({
-                  row["status"]
-                  for row in results
+          def writecsv(path, data):
+              if not data:
+                  return
+
+              cols = sorted({
+                  k
+                  for v in data
+                  for k in v
               })
-          }
 
-          summary = {
-              "sample_size": len(results),
-              "counts": counts,
-              "note": (
-                  "Research-only 1m price-path screening. "
-                  "Not a verified live-fill backtest. "
-                  "Partial minutes and intrabar ordering "
-                  "may be ambiguous."
-              ),
+              with (
+                  out / path
+              ).open(
+                  "w",
+                  newline="",
+                  encoding="utf-8"
+              ) as f:
+                  w = csv.DictWriter(
+                      f,
+                      fieldnames=cols
+                  )
+                  w.writeheader()
+                  w.writerows(data)
+
+          writecsv("audit.csv", rows)
+          writecsv("touch_minutes.csv", detail)
+
+          count = {
+              k: sum(
+                  r["finding"] == k
+                  for r in rows
+              )
+              for k in sorted({
+                  r["finding"]
+                  for r in rows
+              })
           }
 
           (
-              output / "summary.json"
+              out / "summary.json"
           ).write_text(
-              json.dumps(
-                  summary,
-                  indent=2,
-              ),
-              encoding="utf-8",
+              json.dumps({
+                  "total": len(rows),
+                  "counts": count,
+                  "warning":
+                      "1m OHLC cannot establish "
+                      "tick order, exact fill, "
+                      "or prices within partial "
+                      "entry/exit minutes. "
+                      "Level touch is not a "
+                      "verified trade.",
+              }, indent=2),
+              encoding="utf-8"
           )
 
           print(
-              "VALIDATION_SUMMARY",
-              json.dumps(counts),
-              flush=True,
+              "AUDIT_SUMMARY",
+              json.dumps(count),
+              flush=True
           )
           PY
 
-      - name: Save validation report
+      - name: Save read-only audit
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-20trades-bingx-1m-validation
-          path: r1_replay20/
+          name: r1-20trades-boundary-audit
+          path: r1_replay_audit/
           if-no-files-found: warn
           retention-days: 14
