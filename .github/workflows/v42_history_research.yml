@@ -1,5 +1,5 @@
 
-name: V6 July R1 Baseline Backtest
+name: R1 20 Trades 1m Price Validation
 
 on:
   push:
@@ -13,9 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  july-backtest:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 50
 
     steps:
       - name: Checkout
@@ -28,31 +28,375 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run July R1 historical backtest
+      - name: Compare R1 trades against BingX 1m candles
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p r1_replay20
 
-          python -m compileall -q v42_*.py
+          python - <<'PY'
+          import csv
+          import json
+          import time
+          from datetime import datetime
+          from pathlib import Path
 
-          python v42_one_shot.py \
-            --symbols US-USDT BILL-USDT \
-            --start 2026-07-01T00:00:00Z \
-            --end 2026-08-01T00:00:00Z \
-            --workdir r1_july_study \
-            --plan-only
+          from v42_download_bingx_history import request_page
 
-          python v42_one_shot.py \
-            --symbols US-USDT BILL-USDT \
-            --start 2026-07-01T00:00:00Z \
-            --end 2026-08-01T00:00:00Z \
-            --workdir r1_july_study
+          # 20 closed R1 simulated trades.
+          # Research only. No live trading.
 
-      - name: Save July results
+          sample = """
+          2070 RESOLV-USDT LONG 2026-10-13T17:46:04.260146Z 2026-10-13T21:50:15.228401Z 0.01836 TIMEOUT_EXIT
+          2109 ZZZRH-USDT LONG 2026-10-13T21:30:58.659916Z 2026-10-13T21:45:11.352732Z 0.01386 SL_EXIT
+          2076 ARGUS-USDT SHORT 2026-10-13T18:05:49.654488Z 2026-10-13T21:30:21.704556Z 0.00759 TREND_EXIT
+          2085 RATS-USDT SHORT 2026-10-13T19:15:52.456431Z 2026-10-13T21:15:08.779273Z 0.0000178 TP2_PROTECT_EXIT
+          2098 US-USDT SHORT 2026-10-13T20:20:53.556618Z 2026-10-13T21:00:10.824988Z 0.008599 BREAKEVEN_EXIT
+          2104 ZC-USDT LONG 2026-10-13T20:41:00.473818Z 2026-10-13T20:50:08.556953Z 0.0041 TP3_EXIT
+          2101 EACC-USDT SHORT 2026-10-13T20:35:55.057357Z 2026-10-13T20:40:10.816369Z 0.00114 BREAKEVEN_EXIT
+          2092 FONE-USDT SHORT 2026-10-13T19:50:59.360843Z 2026-10-13T20:40:10.578907Z 0.004493 BREAKEVEN_EXIT
+          2080 SI-USDT SHORT 2026-10-13T18:31:22.761718Z 2026-10-13T20:30:06.652677Z 0.0167 TP3_EXIT
+          2058 KOMA-USDT LONG 2026-10-13T16:35:52.759184Z 2026-10-13T20:30:06.398279Z 0.020507 BREAKEVEN_EXIT
+          2056 EVAA-USDT LONG 2026-10-13T16:25:56.167164Z 2026-10-13T20:30:06.355451Z 0.6349 TIMEOUT_EXIT
+          2089 OTC-USDT LONG 2026-10-13T19:41:10.564818Z 2026-10-13T20:25:05.703449Z 0.006705 BREAKEVEN_EXIT
+          2095 ARC-USDT SHORT 2026-10-13T20:05:34.061342Z 2026-10-13T20:20:08.747802Z 0.03204 BREAKEVEN_EXIT
+          2086 ZCAT-USDT LONG 2026-10-13T19:25:56.265064Z 2026-10-13T20:20:08.609317Z 0.04885 TP3_EXIT
+          2059 OP-USDT LONG 2026-10-13T16:40:57.363829Z 2026-10-13T20:15:13.407178Z 0.14387 TP3_EXIT
+          2093 SHROOM-USDT LONG 2026-10-13T20:00:45.161465Z 2026-10-13T20:10:11.243108Z 0.006104 BREAKEVEN_EXIT
+          2091 DARKSWAP-USDT SHORT 2026-10-13T19:45:46.662812Z 2026-10-13T20:05:08.013537Z 0.002024 SL_EXIT
+          2090 NCSKKOPN2USD-USDT LONG 2026-10-13T19:41:11.960936Z 2026-10-13T20:05:07.978911Z 4.225 BREAKEVEN_EXIT
+          2052 NEAR-USDT SHORT 2026-10-13T15:56:12.156333Z 2026-10-13T20:00:09.988351Z 5.019 TIMEOUT_EXIT
+          2087 TRUTH-USDT LONG 2026-10-13T19:30:54.958823Z 2026-10-13T19:50:11.229545Z 0.019012 BREAKEVEN_EXIT
+          """
+
+          def milliseconds(value):
+              return int(
+                  datetime.fromisoformat(
+                      value.replace("Z", "+00:00")
+                  ).timestamp() * 1000
+              )
+
+          def price_levels(side, entry):
+              direction = 1 if side == "LONG" else -1
+
+              return {
+                  "tp1": entry * (1 + direction * .02),
+                  "tp2": entry * (1 + direction * .04),
+                  "tp3": entry * (1 + direction * .08),
+                  "sl": entry * (1 - direction * .025),
+              }
+
+          def download_candles(symbol, start, end):
+              bars = {}
+              cursor = start
+
+              while cursor < end:
+                  upper = min(
+                      end,
+                      cursor + 1000 * 60000
+                  )
+
+                  page = request_page(
+                      symbol,
+                      cursor,
+                      upper,
+                      limit=1000,
+                      tries=3,
+                  )
+
+                  bars.update(page)
+                  cursor = upper
+
+                  time.sleep(.18)
+
+              return bars
+
+          results = []
+
+          for line in sample.strip().splitlines():
+              (
+                  trade_id,
+                  symbol,
+                  side,
+                  entry_time,
+                  exit_time,
+                  entry_value,
+                  exit_reason,
+              ) = line.split()
+
+              entry = float(entry_value)
+              levels = price_levels(side, entry)
+
+              # Exclude partial entry minute.
+              begin = (
+                  milliseconds(entry_time) // 60000 + 1
+              ) * 60000
+
+              # Include the recorded exit minute.
+              finish = (
+                  milliseconds(exit_time) // 60000 + 1
+              ) * 60000
+
+              result = {
+                  "id": int(trade_id),
+                  "symbol": symbol,
+                  "side": side,
+                  "entry_time": entry_time,
+                  "exit_time": exit_time,
+                  "entry_price": entry,
+                  "recorded_exit": exit_reason,
+                  **levels,
+              }
+
+              try:
+                  if finish <= begin:
+                      raise ValueError(
+                          "NO_FULL_MINUTE_AFTER_ENTRY"
+                      )
+
+                  bars = download_candles(
+                      symbol,
+                      begin,
+                      finish,
+                  )
+
+                  expected = (finish - begin) // 60000
+                  missing = expected - len(bars)
+
+                  result.update({
+                      "candles": len(bars),
+                      "expected": expected,
+                      "missing": missing,
+                  })
+
+                  if missing:
+                      result.update({
+                          "status": "DATA_INCOMPLETE",
+                          "detail": "Missing 1m candles",
+                      })
+
+                  else:
+                      ordered = [
+                          bars[t]
+                          for t in range(
+                              begin,
+                              finish,
+                              60000
+                          )
+                      ]
+
+                      def hit_target(bar, value):
+                          if side == "LONG":
+                              return float(bar["high"]) >= value
+                          return float(bar["low"]) <= value
+
+                      def hit_stop(bar, value):
+                          if side == "LONG":
+                              return float(bar["low"]) <= value
+                          return float(bar["high"]) >= value
+
+                      tp1 = False
+                      tp2 = False
+                      tp3 = False
+                      stopped = None
+                      ambiguous = False
+
+                      for bar in ordered:
+                          if not tp1:
+                              stop = levels["sl"]
+                          elif not tp2:
+                              stop = entry
+                          else:
+                              stop = levels["tp1"]
+
+                          stop_now = hit_stop(bar, stop)
+
+                          if tp2:
+                              next_tp = levels["tp3"]
+                          elif tp1:
+                              next_tp = levels["tp2"]
+                          else:
+                              next_tp = levels["tp1"]
+
+                          next_now = hit_target(
+                              bar,
+                              next_tp,
+                          )
+
+                          if stop_now and next_now:
+                              ambiguous = True
+
+                          # Conservative stop-first replay.
+                          if stop_now:
+                              if not tp1:
+                                  stopped = "SL_EXIT"
+                              elif not tp2:
+                                  stopped = "BREAKEVEN_EXIT"
+                              else:
+                                  stopped = "TP2_PROTECT_EXIT"
+                              break
+
+                          if hit_target(
+                              bar,
+                              levels["tp1"]
+                          ):
+                              tp1 = True
+
+                          if hit_target(
+                              bar,
+                              levels["tp2"]
+                          ):
+                              tp2 = True
+                              tp1 = True
+
+                          if hit_target(
+                              bar,
+                              levels["tp3"]
+                          ):
+                              tp3 = True
+                              tp2 = True
+                              tp1 = True
+                              break
+
+                      result.update({
+                          "replay_tp1": tp1,
+                          "replay_tp2": tp2,
+                          "replay_tp3": tp3,
+                          "replay_stop": stopped,
+                          "ambiguous": ambiguous,
+                      })
+
+                      if ambiguous:
+                          result.update({
+                              "status": "AMBIGUOUS",
+                              "detail": "Same-minute stop and target",
+                          })
+
+                      elif exit_reason == "TP3_EXIT":
+                          result.update({
+                              "status": (
+                                  "PRICE_PATH_SUPPORTS"
+                                  if tp3
+                                  else "PRICE_PATH_DIFFERS"
+                              ),
+                              "detail": "TP3 price path check",
+                          })
+
+                      elif exit_reason in (
+                          "SL_EXIT",
+                          "BREAKEVEN_EXIT",
+                          "TP2_PROTECT_EXIT",
+                      ):
+                          result.update({
+                              "status": (
+                                  "PRICE_PATH_SUPPORTS"
+                                  if stopped == exit_reason
+                                  else "PRICE_PATH_DIFFERS"
+                              ),
+                              "detail": (
+                                  f"Replay stop: {stopped}"
+                              ),
+                          })
+
+                      else:
+                          result.update({
+                              "status": "NOT_DETERMINABLE",
+                              "detail": (
+                                  "Trend/timeout needs exact "
+                                  "runtime timing validation"
+                              ),
+                          })
+
+                  print(
+                      trade_id,
+                      symbol,
+                      result["status"],
+                      flush=True,
+                  )
+
+              except Exception as error:
+                  result.update({
+                      "status": "DOWNLOAD_OR_API_ERROR",
+                      "detail": str(error)[:300],
+                  })
+
+                  print(
+                      trade_id,
+                      symbol,
+                      "ERROR",
+                      str(error),
+                      flush=True,
+                  )
+
+              results.append(result)
+
+          output = Path("r1_replay20")
+
+          with (
+              output / "results.csv"
+          ).open(
+              "w",
+              newline="",
+              encoding="utf-8",
+          ) as file:
+              columns = sorted({
+                  key
+                  for row in results
+                  for key in row
+              })
+
+              writer = csv.DictWriter(
+                  file,
+                  fieldnames=columns,
+              )
+
+              writer.writeheader()
+              writer.writerows(results)
+
+          counts = {
+              status: sum(
+                  row["status"] == status
+                  for row in results
+              )
+              for status in sorted({
+                  row["status"]
+                  for row in results
+              })
+          }
+
+          summary = {
+              "sample_size": len(results),
+              "counts": counts,
+              "note": (
+                  "Research-only 1m price-path screening. "
+                  "Not a verified live-fill backtest. "
+                  "Partial minutes and intrabar ordering "
+                  "may be ambiguous."
+              ),
+          }
+
+          (
+              output / "summary.json"
+          ).write_text(
+              json.dumps(
+                  summary,
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+
+          print(
+              "VALIDATION_SUMMARY",
+              json.dumps(counts),
+              flush=True,
+          )
+          PY
+
+      - name: Save validation report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-july-us-bill-results
-          path: r1_july_study/
+          name: r1-20trades-bingx-1m-validation
+          path: r1_replay20/
           if-no-files-found: warn
           retention-days: 14
