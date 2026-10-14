@@ -1,20 +1,19 @@
 
-name: R1 Three Month Historical Replay
+name: R1 Full Market July August September Backtest
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - v42-historical-backtest
     paths:
-      - '.github/workflows/v42_history_research.yml'
-  workflow_dispatch:
+      - ".github/workflows/v42_history_research.yml"
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
-  historical-replay:
+  r1-backtest:
     name: R1 ${{ matrix.month }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -34,44 +33,41 @@ jobs:
             end: "2026-10-01T00:00:00Z"
 
     env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
       MONTH: ${{ matrix.month }}
       START: ${{ matrix.start }}
       END: ${{ matrix.end }}
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Checkout R1 research branch
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: v42-historical-backtest
 
-      - name: Setup Python
+      - name: Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Prepare folders
+      - name: Prepare research
         run: |
           mkdir -p research/raw
           mkdir -p research/spread
           mkdir -p research/original
           mkdir -p research/report
 
-      - name: Discover historically available coins
+      - name: Discover historical candidates
         run: |
           python - <<'PY'
           import json
           import os
           import time
-          import urllib.parse
           import urllib.request
-          from datetime import datetime, timezone
+          import urllib.parse
           from pathlib import Path
+          from datetime import datetime, timedelta, timezone
 
           BASE = "https://open-api.bingx.com"
-          START = os.environ["START"]
-          END = os.environ["END"]
 
           def api(path, params=None):
               url = BASE + path
@@ -79,17 +75,17 @@ jobs:
                   url += "?" + urllib.parse.urlencode(params)
               req = urllib.request.Request(
                   url,
-                  headers={"User-Agent": "R1-Historical-Research/1.0"}
+                  headers={"User-Agent": "R1-Research/1.0"}
               )
               for attempt in range(5):
                   try:
                       with urllib.request.urlopen(
                           req, timeout=30
                       ) as response:
-                          result = json.load(response)
-                      if str(result.get("code")) != "0":
-                          raise RuntimeError(str(result.get("msg")))
-                      return result.get("data")
+                          body = json.load(response)
+                      if str(body.get("code")) != "0":
+                          raise RuntimeError(str(body))
+                      return body.get("data")
                   except Exception:
                       if attempt == 4:
                           raise
@@ -98,80 +94,88 @@ jobs:
           contracts = api(
               "/openApi/swap/v2/quote/contracts"
           )
+
           symbols = sorted({
-              x["symbol"]
-              for x in contracts
-              if isinstance(x, dict)
-              and x.get("symbol", "").endswith("-USDT")
+              item["symbol"]
+              for item in contracts
+              if isinstance(item, dict)
+              and item.get("symbol", "").endswith("-USDT")
           })
 
-          start_ms = int(
-              datetime.fromisoformat(
-                  START.replace("Z", "+00:00")
-              ).timestamp() * 1000
+          # Include warmup history before the month.
+          start = datetime.fromisoformat(
+              os.environ["START"].replace("Z", "+00:00")
           )
+          warmup = start - timedelta(hours=72)
+          probe_ms = int(warmup.timestamp() * 1000)
 
-          # Probe the beginning of each month.
-          # A successful probe does not prove full-month
-          # historical listing or liquidity.
-          checked = []
-          for index, symbol in enumerate(symbols):
+          available = []
+          unavailable = []
+          errors = []
+
+          for i, symbol in enumerate(symbols, 1):
               try:
                   data = api(
                       "/openApi/swap/v3/quote/klines",
                       {
                           "symbol": symbol,
                           "interval": "1m",
-                          "startTime": start_ms,
-                          "endTime": start_ms + 3600000 - 1,
-                          "limit": 60,
-                      },
+                          "startTime": probe_ms,
+                          "endTime": probe_ms + 3600000 - 1,
+                          "limit": 60
+                      }
                   )
                   if data:
-                      checked.append(symbol)
-              except Exception:
-                  pass
+                      available.append(symbol)
+                  else:
+                      unavailable.append(symbol)
+              except Exception as error:
+                  errors.append({
+                      "symbol": symbol,
+                      "error": str(error)[:200]
+                  })
 
-              time.sleep(0.15)
-              if (index + 1) % 100 == 0:
+              if i % 100 == 0:
                   print(
-                      "Checked",
-                      index + 1,
-                      "/",
-                      len(symbols),
-                      flush=True,
+                      "Probed", i, "/", len(symbols),
+                      "available", len(available),
+                      flush=True
                   )
-
-          # Research capacity limit, not a complete
-          # historical R1 market universe.
-          selected = checked[:30]
+              time.sleep(0.12)
 
           manifest = {
               "month": os.environ["MONTH"],
-              "current_contracts_checked": len(symbols),
-              "historical_probe_success": len(checked),
-              "selected": selected,
-              "complete_market_replay": False,
-              "selection_limit": 30,
+              "current_contract_count": len(symbols),
+              "probe_available": len(available),
+              "probe_unavailable": len(unavailable),
+              "probe_errors": errors,
+              "symbols": available,
+              "historical_universe_complete": False,
               "limitations": [
-                  "Current contract list excludes some delisted coins",
-                  "One-hour probe cannot establish full-month eligibility",
-                  "Thirty-coin research capacity limit",
-                  "No historical bid/ask observations",
-              ],
+                  "Delisted historical contracts may be missing",
+                  "A warmup probe is not a complete listing history",
+                  "Historical bid/ask spreads are unavailable"
+              ]
           }
 
           Path("research/universe.json").write_text(
               json.dumps(manifest, indent=2),
-              encoding="utf-8",
+              encoding="utf-8"
           )
 
-          print(json.dumps(manifest, indent=2))
-          if not selected:
-              raise RuntimeError("No historical candidates")
+          print("Available:", len(available))
+          print("Errors:", len(errors))
+
+          if errors:
+              print("Some probes failed; see manifest.")
+
+          if not available:
+              raise RuntimeError(
+                  "No historical candidates available"
+              )
           PY
 
-      - name: Download month OHLCV
+      - name: Download historical 1m candles
         run: |
           python - <<'PY'
           import csv
@@ -179,24 +183,31 @@ jobs:
           import os
           import time
           from pathlib import Path
+          from datetime import datetime, timedelta, timezone
 
           from v42_download_bingx_history import (
-              FIELDS,
               download,
               parse_utc,
+              FIELDS
           )
 
-          selected = json.loads(
+          manifest = json.loads(
               Path("research/universe.json").read_text()
-          )["selected"]
+          )
 
-          start = parse_utc(os.environ["START"])
+          symbols = manifest["symbols"]
+          month_start = datetime.fromisoformat(
+              os.environ["START"].replace("Z", "+00:00")
+          )
+          warmup = month_start - timedelta(hours=72)
+
+          start = int(warmup.timestamp() * 1000)
           end = parse_utc(os.environ["END"])
           expected = (end - start) // 60000
 
           results = []
 
-          for index, symbol in enumerate(selected, 1):
+          for i, symbol in enumerate(symbols, 1):
               try:
                   bars, missing = download(
                       symbol, start, end
@@ -207,15 +218,16 @@ jobs:
                           "symbol": symbol,
                           "status": "INCOMPLETE",
                           "bars": len(bars),
-                          "missing": len(missing),
+                          "missing": len(missing)
                       })
                       continue
 
-                  with open(
-                      f"research/raw/{symbol}.csv",
-                      "w",
-                      newline="",
-                      encoding="utf-8",
+                  path = Path(
+                      "research/raw"
+                  ) / (symbol + ".csv")
+
+                  with path.open(
+                      "w", newline="", encoding="utf-8"
                   ) as file:
                       writer = csv.DictWriter(
                           file, fieldnames=FIELDS
@@ -226,55 +238,57 @@ jobs:
                   results.append({
                       "symbol": symbol,
                       "status": "COMPLETE",
-                      "bars": len(bars),
+                      "bars": len(bars)
                   })
 
               except Exception as error:
                   results.append({
                       "symbol": symbol,
                       "status": "ERROR",
-                      "detail": str(error)[:300],
+                      "detail": str(error)[:300]
                   })
 
               print(
-                  index,
-                  "/",
-                  len(selected),
+                  i, "/", len(symbols),
                   results[-1],
-                  flush=True,
+                  flush=True
               )
-              time.sleep(0.5)
+              time.sleep(0.3)
 
-          Path("research/download_manifest.json").write_text(
+          Path(
+              "research/download_manifest.json"
+          ).write_text(
               json.dumps(results, indent=2),
-              encoding="utf-8",
+              encoding="utf-8"
           )
 
           complete = sum(
-              r["status"] == "COMPLETE"
-              for r in results
+              x["status"] == "COMPLETE"
+              for x in results
           )
-          print("Complete symbols:", complete)
 
-          if complete < 2:
+          print("Complete:", complete)
+          print("Attempted:", len(symbols))
+
+          if complete == 0:
               raise RuntimeError(
-                  "Insufficient complete historical candles"
+                  "No complete historical datasets"
               )
           PY
 
-      - name: Retrieve original R1 source
+      - name: Retrieve original R1 code
         run: |
           python v42_prepare_sources.py \
             --out research/original
 
-      - name: Apply research spread assumption
+      - name: Prepare assumed spread
         run: |
           python v42_cost_scenario.py \
             --source research/raw \
             --out research/spread \
             --spread-pct 0.15
 
-      - name: Replay original R1 signals and exits
+      - name: Run original R1 historical replay
         run: |
           python -u v42_run_offline_phase5.py \
             --original-app \
@@ -284,31 +298,57 @@ jobs:
             --candles research/spread \
             --out research/report
 
-      - name: Print monthly results
+      - name: Mark research limitations
         if: success()
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
-          report = json.loads(
-              Path("research/report/report.json").read_text()
+          path = Path("research/report/report.json")
+          report = json.loads(path.read_text())
+          universe = json.loads(
+              Path("research/universe.json").read_text()
+          )
+          downloads = json.loads(
+              Path("research/download_manifest.json").read_text()
           )
 
-          print("MONTHLY R1 RESEARCH RESULT")
+          complete = sum(
+              r["status"] == "COMPLETE"
+              for r in downloads
+          )
+
+          report["research_validation"] = {
+              "historical_full_market_proven": False,
+              "original_R1_signal_functions": True,
+              "execution_parity_verified": False,
+              "candidate_symbols": len(universe["symbols"]),
+              "complete_symbols": complete,
+              "spread": "Assumed 0.15%, not observed",
+              "warning":
+                  "Research proxy; not verified live-R1 parity"
+          }
+
+          path.write_text(
+              json.dumps(
+                  report, indent=2, ensure_ascii=False
+              ),
+              encoding="utf-8"
+          )
+
           print(json.dumps(
-              report.get("overall", {}),
+              report["overall"],
               indent=2,
-              ensure_ascii=False,
+              ensure_ascii=False
           ))
-          print("This is a limited-universe proxy.")
           PY
 
-      - name: Preserve all research evidence
+      - name: Save results and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-history-${{ matrix.month }}
+          name: r1-three-month-${{ matrix.month }}
           path: |
             research/universe.json
             research/download_manifest.json
