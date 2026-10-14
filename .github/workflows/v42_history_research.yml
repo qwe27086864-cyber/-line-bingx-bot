@@ -1,5 +1,5 @@
 
-name: R1 September Historical Radar Batch 01
+name: R1 Three Month Historical Replay
 
 on:
   push:
@@ -14,129 +14,195 @@ permissions:
   actions: read
 
 jobs:
-  historical-radar:
+  historical-replay:
+    name: R1 ${{ matrix.month }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - month: "2026-07"
+            start: "2026-07-01T00:00:00Z"
+            end: "2026-08-01T00:00:00Z"
+          - month: "2026-08"
+            start: "2026-08-01T00:00:00Z"
+            end: "2026-09-01T00:00:00Z"
+          - month: "2026-09"
+            start: "2026-09-01T00:00:00Z"
+            end: "2026-10-01T00:00:00Z"
 
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      MONTH: ${{ matrix.month }}
+      START: ${{ matrix.start }}
+      END: ${{ matrix.end }}
 
     steps:
-      - name: Checkout
+      - name: Checkout R1 research branch
         uses: actions/checkout@v4
         with:
           ref: v42-historical-backtest
 
-      - name: Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Load repaired universe
+      - name: Prepare folders
         run: |
-          set -euo pipefail
-
-          mkdir -p research/universe
           mkdir -p research/raw
+          mkdir -p research/spread
           mkdir -p research/original
           mkdir -p research/report
 
-          gh run download 38532806846 \
-            -n r1-september-universe-repaired \
-            -D research/universe
-
-          test -s \
-            research/universe/evidence_repaired.csv
-
-      - name: Select historical candidate batch
+      - name: Discover historically available coins
         run: |
           python - <<'PY'
-          import csv
-          import hashlib
           import json
+          import os
+          import time
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
           from pathlib import Path
 
-          with open(
-              "research/universe/evidence_repaired.csv",
-              encoding="utf-8-sig",
-          ) as f:
-              rows = list(csv.DictReader(f))
+          BASE = "https://open-api.bingx.com"
+          START = os.environ["START"]
+          END = os.environ["END"]
 
-          candidates = {
-              r["symbol"]
-              for r in rows
-              if r["day"] == "2026-09-01"
-              and r["status"] == "HAS_HISTORY"
-          }
+          def api(path, params=None):
+              url = BASE + path
+              if params:
+                  url += "?" + urllib.parse.urlencode(params)
+              req = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "R1-Historical-Research/1.0"}
+              )
+              for attempt in range(5):
+                  try:
+                      with urllib.request.urlopen(
+                          req, timeout=30
+                      ) as response:
+                          result = json.load(response)
+                      if str(result.get("code")) != "0":
+                          raise RuntimeError(str(result.get("msg")))
+                      return result.get("data")
+                  except Exception:
+                      if attempt == 4:
+                          raise
+                      time.sleep(min(20, 2 ** attempt))
 
-          candidates = sorted(
-              candidates,
-              key=lambda s: hashlib.sha256(
-                  ("R1-SEP-2026:" + s).encode()
-              ).hexdigest(),
+          contracts = api(
+              "/openApi/swap/v2/quote/contracts"
+          )
+          symbols = sorted({
+              x["symbol"]
+              for x in contracts
+              if isinstance(x, dict)
+              and x.get("symbol", "").endswith("-USDT")
+          })
+
+          start_ms = int(
+              datetime.fromisoformat(
+                  START.replace("Z", "+00:00")
+              ).timestamp() * 1000
           )
 
-          assert len(candidates) >= 20
+          # Probe the beginning of each month.
+          # A successful probe does not prove full-month
+          # historical listing or liquidity.
+          checked = []
+          for index, symbol in enumerate(symbols):
+              try:
+                  data = api(
+                      "/openApi/swap/v3/quote/klines",
+                      {
+                          "symbol": symbol,
+                          "interval": "1m",
+                          "startTime": start_ms,
+                          "endTime": start_ms + 3600000 - 1,
+                          "limit": 60,
+                      },
+                  )
+                  if data:
+                      checked.append(symbol)
+              except Exception:
+                  pass
 
-          selected = candidates[:20]
+              time.sleep(0.15)
+              if (index + 1) % 100 == 0:
+                  print(
+                      "Checked",
+                      index + 1,
+                      "/",
+                      len(symbols),
+                      flush=True,
+                  )
 
-          Path(
-              "research/selected.json"
-          ).write_text(
-              json.dumps({
-                  "candidate_count": len(candidates),
-                  "selected": selected,
-                  "selection_method":
-                      "Deterministic sample, not R1 signals",
-              }, indent=2),
+          # Research capacity limit, not a complete
+          # historical R1 market universe.
+          selected = checked[:30]
+
+          manifest = {
+              "month": os.environ["MONTH"],
+              "current_contracts_checked": len(symbols),
+              "historical_probe_success": len(checked),
+              "selected": selected,
+              "complete_market_replay": False,
+              "selection_limit": 30,
+              "limitations": [
+                  "Current contract list excludes some delisted coins",
+                  "One-hour probe cannot establish full-month eligibility",
+                  "Thirty-coin research capacity limit",
+                  "No historical bid/ask observations",
+              ],
+          }
+
+          Path("research/universe.json").write_text(
+              json.dumps(manifest, indent=2),
               encoding="utf-8",
           )
 
-          print("Candidates:", len(candidates))
-          print("Selected:", selected)
+          print(json.dumps(manifest, indent=2))
+          if not selected:
+              raise RuntimeError("No historical candidates")
           PY
 
-      - name: Download complete 1m history
+      - name: Download month OHLCV
         run: |
           python - <<'PY'
           import csv
           import json
+          import os
           import time
-
           from pathlib import Path
 
           from v42_download_bingx_history import (
+              FIELDS,
               download,
               parse_utc,
-              FIELDS,
           )
 
-          symbols = json.loads(
-              Path(
-                  "research/selected.json"
-              ).read_text()
+          selected = json.loads(
+              Path("research/universe.json").read_text()
           )["selected"]
 
-          start = parse_utc(
-              "2026-09-01T00:00:00Z"
-          )
-
-          end = parse_utc(
-              "2026-09-11T00:00:00Z"
-          )
+          start = parse_utc(os.environ["START"])
+          end = parse_utc(os.environ["END"])
+          expected = (end - start) // 60000
 
           results = []
 
-          for i, symbol in enumerate(symbols, 1):
+          for index, symbol in enumerate(selected, 1):
               try:
                   bars, missing = download(
-                      symbol,
-                      start,
-                      end,
+                      symbol, start, end
                   )
 
-                  if missing or len(bars) != 14400:
+                  if missing or len(bars) != expected:
                       results.append({
                           "symbol": symbol,
                           "status": "INCOMPLETE",
@@ -146,13 +212,13 @@ jobs:
                       continue
 
                   with open(
-                      "research/raw/" + symbol + ".csv",
+                      f"research/raw/{symbol}.csv",
                       "w",
                       newline="",
-                  ) as f:
+                      encoding="utf-8",
+                  ) as file:
                       writer = csv.DictWriter(
-                          f,
-                          fieldnames=FIELDS,
+                          file, fieldnames=FIELDS
                       )
                       writer.writeheader()
                       writer.writerows(bars)
@@ -167,51 +233,50 @@ jobs:
                   results.append({
                       "symbol": symbol,
                       "status": "ERROR",
-                      "detail": str(error)[:250],
+                      "detail": str(error)[:300],
                   })
 
               print(
-                  i,
+                  index,
                   "/",
-                  len(symbols),
+                  len(selected),
                   results[-1],
                   flush=True,
               )
-
               time.sleep(0.5)
 
-          Path(
-              "research/download_manifest.json"
-          ).write_text(
+          Path("research/download_manifest.json").write_text(
               json.dumps(results, indent=2),
               encoding="utf-8",
           )
 
-          completed = sum(
+          complete = sum(
               r["status"] == "COMPLETE"
               for r in results
           )
+          print("Complete symbols:", complete)
 
-          assert completed >= 2, (
-              "Insufficient historical data"
-          )
+          if complete < 2:
+              raise RuntimeError(
+                  "Insufficient complete historical candles"
+              )
           PY
 
-      - name: Load original R1 source
+      - name: Retrieve original R1 source
         run: |
           python v42_prepare_sources.py \
             --out research/original
 
-      - name: Prepare assumed spread
+      - name: Apply research spread assumption
         run: |
           python v42_cost_scenario.py \
             --source research/raw \
             --out research/spread \
             --spread-pct 0.15
 
-      - name: Run R1 historical replay
+      - name: Replay original R1 signals and exits
         run: |
-          python v42_run_offline_phase5.py \
+          python -u v42_run_offline_phase5.py \
             --original-app \
               research/original/original_app.py \
             --original-scanner \
@@ -219,15 +284,35 @@ jobs:
             --candles research/spread \
             --out research/report
 
-      - name: Upload results
+      - name: Print monthly results
+        if: success()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(
+              Path("research/report/report.json").read_text()
+          )
+
+          print("MONTHLY R1 RESEARCH RESULT")
+          print(json.dumps(
+              report.get("overall", {}),
+              indent=2,
+              ensure_ascii=False,
+          ))
+          print("This is a limited-universe proxy.")
+          PY
+
+      - name: Preserve all research evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: r1-september-historical-radar-batch01
+          name: r1-history-${{ matrix.month }}
           path: |
-            research/selected.json
+            research/universe.json
             research/download_manifest.json
-            research/report/
             research/original/source_manifest.json
+            research/report/
           retention-days: 14
           if-no-files-found: warn
