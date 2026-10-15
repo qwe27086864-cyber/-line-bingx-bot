@@ -1,6 +1,7 @@
 """V6 isolated forward paper scanner. No live orders. Uses R1 signal analysis.
 Requires DATABASE_URL and runs every five minutes; independent V6 tables.
 V6 exit rules are experimental, not a byte-for-byte R1 execution replica.
+Shadow TP flags are observational only; they never trigger an exit.
 """
 import os
 os.environ['LIVE_TRADING'] = 'false'
@@ -31,10 +32,19 @@ def setup(cur):
         CHECK (status IN ('OPEN','CLOSED')))''')
     cur.execute('''CREATE UNIQUE INDEX IF NOT EXISTS v6_one_open_per_symbol
         ON v6_paper_trades(symbol) WHERE status='OPEN' ''')
+    # Additive, non-destructive migration: preserve all existing paper trades.
+    cur.execute('''ALTER TABLE v6_paper_trades
+        ADD COLUMN IF NOT EXISTS shadow_tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS shadow_tp2_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS shadow_tp3_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS shadow_tp1_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS shadow_tp2_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS shadow_tp3_at TIMESTAMPTZ''')
 
 
 def update_trades(cur, prices):
-    cur.execute("SELECT id,symbol,side,entry_price,entry_time,highest_price,lowest_price FROM v6_paper_trades WHERE status='OPEN' FOR UPDATE")
+    cur.execute("""SELECT id,symbol,side,entry_price,entry_time,highest_price,lowest_price
+        FROM v6_paper_trades WHERE status='OPEN' FOR UPDATE""")
     for tid,sym,side,entry,started,hi,lo in cur.fetchall():
         p = prices.get(sym)
         if not p or p <= 0: continue
@@ -42,16 +52,35 @@ def update_trades(cur, prices):
         direction=1 if side=='LONG' else -1
         gross=direction*(p/entry-1)*100
         hours=(datetime.now(timezone.utc)-started).total_seconds()/3600
+        # Only observed scanner prices count as shadow TP hits. No intrabar inference.
+        hit1=gross>=2.0
+        hit2=gross>=4.0
+        hit3=gross>=8.0
+        # Original V6 exit decision is unchanged.
         reason='SL' if gross<=-2.5 else ('TP3' if gross>=8 else ('TIMEOUT' if hours>=4 else None))
         if reason:
             net=gross-FEE_ROUNDTRIP_PCT-SLIPPAGE_ROUNDTRIP_PCT
             cur.execute('''UPDATE v6_paper_trades SET status='CLOSED',exit_price=%s,
                 exit_time=NOW(),exit_reason=%s,net_pct=%s,highest_price=%s,
-                lowest_price=%s,last_checked_at=NOW() WHERE id=%s''',(p,reason,net,hi,lo,tid))
+                lowest_price=%s,last_checked_at=NOW(),
+                shadow_tp1_hit=shadow_tp1_hit OR %s,
+                shadow_tp2_hit=shadow_tp2_hit OR %s,
+                shadow_tp3_hit=shadow_tp3_hit OR %s,
+                shadow_tp1_at=CASE WHEN %s THEN COALESCE(shadow_tp1_at,NOW()) ELSE shadow_tp1_at END,
+                shadow_tp2_at=CASE WHEN %s THEN COALESCE(shadow_tp2_at,NOW()) ELSE shadow_tp2_at END,
+                shadow_tp3_at=CASE WHEN %s THEN COALESCE(shadow_tp3_at,NOW()) ELSE shadow_tp3_at END
+                WHERE id=%s''',(p,reason,net,hi,lo,hit1,hit2,hit3,hit1,hit2,hit3,tid))
             print('V6 PAPER CLOSE',tid,sym,reason,round(net,4),flush=True)
         else:
             cur.execute('''UPDATE v6_paper_trades SET highest_price=%s,lowest_price=%s,
-                last_checked_at=NOW() WHERE id=%s''',(hi,lo,tid))
+                last_checked_at=NOW(),
+                shadow_tp1_hit=shadow_tp1_hit OR %s,
+                shadow_tp2_hit=shadow_tp2_hit OR %s,
+                shadow_tp3_hit=shadow_tp3_hit OR %s,
+                shadow_tp1_at=CASE WHEN %s THEN COALESCE(shadow_tp1_at,NOW()) ELSE shadow_tp1_at END,
+                shadow_tp2_at=CASE WHEN %s THEN COALESCE(shadow_tp2_at,NOW()) ELSE shadow_tp2_at END,
+                shadow_tp3_at=CASE WHEN %s THEN COALESCE(shadow_tp3_at,NOW()) ELSE shadow_tp3_at END
+                WHERE id=%s''',(hi,lo,hit1,hit2,hit3,hit1,hit2,hit3,tid))
 
 
 def run():
