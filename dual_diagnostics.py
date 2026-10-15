@@ -1,3 +1,4 @@
+
 """R1/V6 independent PAPER diagnostic recorder. No orders, no strategy changes.
 Run every five minutes as a Render cron job: python dual_diagnostics.py
 Requires DATABASE_URL. Retains all old trades; records only post-cutoff entries.
@@ -77,7 +78,7 @@ def main():
                            unrealized_gross_pct,btc_change_24h,eth_change_24h,symbol_change_24h,
                            symbol_quote_volume,spread_pct,holding_minutes,exit_reason,
                            realized_net_pct,entry_score,strategy,entry_reasons)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                           (version,tid,sym,side,status,entry_time,entry_price,price,gross,
                            btc.get('change_24h'),eth.get('change_24h'),
                            ticker.get('change_24h') if ticker else None,
