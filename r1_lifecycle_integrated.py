@@ -42,8 +42,10 @@ def transition(current, nxt, *, exchange_confirmed=False, protective_stop_confir
         raise ValueError('Exchange flat confirmation required')
     return nxt
 
-def allocate(original_qty, step_sizes=('0.30','0.40','0.30')):
+def allocate(original_qty, step_sizes=None):
     q = num(original_qty)
+    if step_sizes is None:
+        raise ValueError('R1 TP allocation requires explicitly verified weights')
     weights = [num(w) for w in step_sizes]
     if q <= 0 or len(weights)!=3 or any(w<=0 for w in weights) or sum(weights)!=1:
         raise ValueError('Invalid quantity/weights')
@@ -133,7 +135,8 @@ def self_test():
     rejects(lambda:transition('CLOSING','CLOSED'))
     ok(transition('CLOSING','CLOSED',exchange_confirmed=True)=='CLOSED')
     rejects(lambda:transition('CLOSED','SUBMITTING'))
-    ok(allocate('10')==(Decimal('3.00'),Decimal('4.00'),Decimal('3.00')))
+    rejects(lambda:allocate('10'))
+    ok(allocate('10',('0.30','0.40','0.30'))==(Decimal('3.00'),Decimal('4.00'),Decimal('3.00')))
     rejects(lambda:allocate('NaN'))
     rejects(lambda:allocate(10,('0.3','0.3','0.3')))
     p={'symbol':'BTC-USDT','side':'LONG','quantity':'1','stop_price':'97500'}
