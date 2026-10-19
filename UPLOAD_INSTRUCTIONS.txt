@@ -1,0 +1,13 @@
+R1 staged integration batch — 2026-10-19
+Branch: r1-line-live-staging
+Upload these NEW files together (GitHub Add file -> Upload files):
+  r1_atomic_reservation.py
+  r1_db_intent_engine.py
+  r1_stop_coverage.py
+  r1_lifecycle_integrated.py
+Do not overwrite other files or deploy to production/main.
+After upload, set staging Render command to:
+  python r1_lifecycle_integrated.py --self-test
+Leave LIVE_TRADING=false and the DB kill switch ON.
+This is NOT a live trading executor. There are no exchange write calls.
+Pending: official BingX signed trade/conditional-order adapter, exchange stop placement & verification, order fills, real daily PnL, restart reconciliation, test orders.
