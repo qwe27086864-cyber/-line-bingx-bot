@@ -2417,23 +2417,128 @@ def _r1_create_live_trade_unlocked(result):
 
 
 def _r1_replace_stop(trade_id, symbol, side, old_stop_id, quantity, stop_price, qp, pp, stage):
+    """Move the live protective stop without creating a second closePosition SL."""
     if quantity <= 0:
-        return None
-    # New stop first, old stop second: there is never an intentional unprotected gap.
+        return None, False
+
+    # If the desired stop already exists, adopt it and remove a stale old stop.
     new_id = _r1_find_matching_open_order(
         symbol, side, "STOP_MARKET", stop_price, quantity, qp, pp
     )
-    if not new_id:
+    if new_id:
+        _r1_persist_fields(
+            trade_id, sl_order_id=new_id, remaining_qty=quantity, stop_stage=stage
+        )
+        if old_stop_id and str(old_stop_id) != str(new_id):
+            _r1_cancel_best_effort(symbol, old_stop_id)
+        return new_id, True
+
+    if not old_stop_id:
+        # No known old protection: install the desired stop directly.
         new_id = _r1_place_conditional(
             symbol, side, quantity, stop_price, "STOP_MARKET", qp, pp,
-            close_position=True
+            close_position=True,
         )
-    _r1_persist_fields(
-        trade_id, sl_order_id=new_id, remaining_qty=quantity, stop_stage=stage
+        _r1_persist_fields(
+            trade_id, sl_order_id=new_id, remaining_qty=quantity, stop_stage=stage
+        )
+        return new_id, True
+
+    # BingX can reject a second closePosition SL with code 110406. Use its
+    # atomic cancel-and-replace endpoint so the old protection is replaced in
+    # one exchange operation rather than submitting a duplicate SL first.
+    params = {
+        "symbol": symbol,
+        "cancelOrderId": str(old_stop_id),
+        "side": _r1_close_side(side),
+        "positionSide": side,
+        "type": "STOP_MARKET",
+        "quantity": format_number(quantity, qp),
+        "stopPrice": format_number(stop_price, pp),
+        "workingType": "MARK_PRICE",
+        "closePosition": "true",
+        "cancelReplaceMode": "STOP_ON_FAILURE",
+    }
+
+    replace_error = None
+    try:
+        result = _r1_private_request(
+            "POST", "/openApi/swap/v1/trade/cancelReplace", params
+        )
+        if result.get("code") != 0:
+            replace_error = f"cancelReplace failed: {result}"
+        else:
+            data = result.get("data", {})
+            if not isinstance(data, dict):
+                data = {}
+            cancel_result = str(data.get("cancelResult", "")).upper()
+            new_result = str(data.get("newOrderResult", "")).upper()
+            value = data.get("newOrderId", data.get("newOrderID"))
+            new_id = str(value) if value not in (None, "") else None
+
+            if cancel_result == "SUCCESS" and new_result == "SUCCESS" and new_id:
+                _r1_persist_fields(
+                    trade_id,
+                    sl_order_id=new_id,
+                    remaining_qty=quantity,
+                    stop_stage=stage,
+                )
+                return new_id, True
+
+            replace_error = (
+                f"cancelReplace incomplete: cancel={cancel_result or 'UNKNOWN'} "
+                f"new={new_result or 'UNKNOWN'} data={data}"
+            )
+    except Exception as e:
+        replace_error = f"cancelReplace exception: {e}"
+
+    # Reconcile exchange state before any emergency action. If the desired stop
+    # was actually created despite an ambiguous response, adopt it.
+    recovered = _r1_find_matching_open_order(
+        symbol, side, "STOP_MARKET", stop_price, quantity, qp, pp
     )
-    if old_stop_id and str(old_stop_id) != str(new_id):
-        _r1_cancel_best_effort(symbol, old_stop_id)
-    return new_id
+    if recovered:
+        _r1_persist_fields(
+            trade_id, sl_order_id=recovered, remaining_qty=quantity, stop_stage=stage
+        )
+        return recovered, True
+
+    # If the original SL is still open, keep it in place and retry the move on
+    # the next manager pass instead of flattening a still-protected position.
+    try:
+        for order in _r1_open_orders_strict(symbol):
+            oid = order.get("orderID", order.get("orderId"))
+            if oid not in (None, "") and str(oid) == str(old_stop_id):
+                _r1_persist_fields(
+                    trade_id, sl_order_id=str(old_stop_id), remaining_qty=quantity
+                )
+                print(
+                    "R1 STOP REPLACE RETRY:",
+                    trade_id, symbol, side, replace_error,
+                    flush=True,
+                )
+                return str(old_stop_id), False
+    except Exception:
+        pass
+
+    old = _r1_query_order_safe(symbol, order_id=old_stop_id)
+    if old and _r1_order_status(old) in ("NEW", "PARTIALLY_FILLED"):
+        _r1_persist_fields(
+            trade_id, sl_order_id=str(old_stop_id), remaining_qty=quantity
+        )
+        print(
+            "R1 STOP REPLACE RETRY:",
+            trade_id, symbol, side, replace_error,
+            flush=True,
+        )
+        return str(old_stop_id), False
+
+    # Neither the requested stop nor the previous stop can be confirmed. The
+    # caller will fail closed by flattening the position, which is safer than
+    # leaving a live position with no confirmed exchange-side protection.
+    raise RuntimeError(
+        replace_error or "R1 stop replacement left no confirmed protection"
+    )
 
 
 def r1_cancel_all_exit_orders(symbol, order_ids):
@@ -2802,11 +2907,12 @@ def _r1_manage_live_trades_unlocked():
             if desired_stage > int(stop_stage or 0):
                 target_stop = float(tp1) if desired_stage == 2 else float(entry_price)
                 try:
-                    sl_oid = _r1_replace_stop(
+                    sl_oid, stop_applied = _r1_replace_stop(
                         trade_id, symbol, side, sl_oid, current_qty,
                         target_stop, qp, pp, desired_stage,
                     )
-                    stop_stage = desired_stage
+                    if stop_applied:
+                        stop_stage = desired_stage
                 except Exception as stop_error:
                     reason = "TP2_PROTECT_EXIT" if desired_stage == 2 else "BREAKEVEN_EXIT"
                     r1_close_live_trade_market(
