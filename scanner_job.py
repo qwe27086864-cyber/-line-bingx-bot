@@ -25,6 +25,7 @@ from app import (
     r1_release_execution_lock,
     R1_LIVE_TRADING,
     R1_MAX_OPEN,
+    R1_MAX_CHASE_PCT,
     get_all_prices,
     get_klines,
     calculate_ema,
@@ -330,6 +331,8 @@ def deep_analyze(radar):
         0,
         f"é·é5m {radar['radar_move']:+.2f}% | {side}"
     )
+    # Freeze the executable signal reference at radar-detection time.
+    chosen["signal_price"] = float(radar["radar_price"])
 
     return chosen
 
@@ -698,6 +701,10 @@ def run_fast_radar():
         reverse=True,
     )
 
+    # One fresh market snapshot after all analysis. Both paper and live entries
+    # use this same executable price basis, eliminating the stale 15m-close fill.
+    fresh_prices = get_all_prices() if qualified else {}
+
     created = 0
     for result in qualified:
         if created >= SCANNER_MAX_NEW_PER_SCAN:
@@ -723,6 +730,47 @@ def run_fast_radar():
         if not can_open:
             print("COOLDOWN:", result["symbol"], result["side"], flush=True)
             continue
+
+        signal_price = float(result.get("signal_price") or 0)
+        fresh_price = float(fresh_prices.get(result["symbol"], 0) or 0)
+        if signal_price <= 0 or fresh_price <= 0:
+            print(
+                "ENTRY SKIP NO FRESH PRICE:",
+                result["symbol"], result["side"],
+                signal_price, fresh_price,
+                flush=True,
+            )
+            continue
+
+        if result["side"] == "SHORT":
+            chase_pct = (signal_price - fresh_price) / signal_price * 100.0
+        else:
+            chase_pct = (fresh_price - signal_price) / signal_price * 100.0
+
+        # Favorable movement (negative chase) is allowed. Only adverse chasing is capped.
+        adverse_chase_pct = max(0.0, chase_pct)
+        if adverse_chase_pct > R1_MAX_CHASE_PCT:
+            print(
+                "ENTRY SKIP CHASE:",
+                result["symbol"], result["side"],
+                f"signal={signal_price}", f"fresh={fresh_price}",
+                f"chase={adverse_chase_pct:.3f}%",
+                f"max={R1_MAX_CHASE_PCT:.3f}%",
+                flush=True,
+            )
+            continue
+
+        result["analysis_price"] = result.get("price")
+        result["price"] = fresh_price
+        result["fresh_price"] = fresh_price
+        result["chase_pct"] = adverse_chase_pct
+
+        print(
+            "ENTRY PRICE OK:", result["symbol"], result["side"],
+            f"signal={signal_price}", f"fresh={fresh_price}",
+            f"chase={adverse_chase_pct:.3f}%",
+            flush=True,
+        )
 
         try:
             if R1_LIVE_TRADING:

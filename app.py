@@ -91,6 +91,7 @@ R1_TP1_SHARE = 35.0
 R1_TP2_SHARE = 40.0
 R1_TP3_SHARE = 25.0
 R1_MONITOR_SEC = int(os.environ.get("R1_MONITOR_SEC", "5"))
+R1_MAX_CHASE_PCT = float(os.environ.get("R1_MAX_CHASE_PCT", "0.75"))
 R1_LIVE_MONITOR = os.environ.get(
     "R1_LIVE_MONITOR", "true" if R1_LIVE_TRADING else "false"
 ).strip().lower() == "true"
@@ -1076,6 +1077,7 @@ def analyze_15m_detail(fast):
     result = dict(fast)
     result.update({
         "price": price,
+        "analysis_price_15m": price,
         "rsi": rsi,
         "volume_ratio": volume_ratio,
         "momentum_pct": momentum,
@@ -1614,6 +1616,10 @@ def init_r1_live_database():
                 entry_client_id VARCHAR(64) UNIQUE NOT NULL,
                 entry_order_id VARCHAR(80),
                 entry_price DOUBLE PRECISION,
+                signal_price DOUBLE PRECISION,
+                fresh_price DOUBLE PRECISION,
+                chase_pct DOUBLE PRECISION,
+                entry_mode VARCHAR(20),
                 quantity DOUBLE PRECISION,
                 remaining_qty DOUBLE PRECISION,
                 quantity_precision INTEGER,
@@ -1650,6 +1656,10 @@ def init_r1_live_database():
         )
         # Safe migration for an earlier staging copy of this table.
         cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS stop_stage INTEGER DEFAULT 0;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS signal_price DOUBLE PRECISION;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS fresh_price DOUBLE PRECISION;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS chase_pct DOUBLE PRECISION;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS entry_mode VARCHAR(20);")
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_r1_live_open
@@ -1729,8 +1739,8 @@ def r1_assert_live_configuration(force=False):
         raise RuntimeError("R1 live margin must be exactly 10 USDT")
     if R1_LEVERAGE != 8:
         raise RuntimeError("R1 live leverage must be exactly 8x")
-    if R1_MAX_OPEN < 1 or R1_MAX_OPEN > 20:
-        raise RuntimeError("R1 live max open must be between 1 and 20")
+    if R1_MAX_OPEN < 0 or R1_MAX_OPEN > 20:
+        raise RuntimeError("R1 live max open must be between 0 and 20")
     if abs((R1_TP1_SHARE + R1_TP2_SHARE + R1_TP3_SHARE) - 100.0) > 1e-9:
         raise RuntimeError("R1 TP shares must total 100%")
 
@@ -2147,6 +2157,33 @@ def _r1_wait_market_fill(symbol, order_id, client_order_id, side, fallback_price
     raise RuntimeError(f"R1 market entry fill not confirmed: {last}")
 
 
+def _r1_wait_ioc_fill(symbol, order_id, client_order_id, side, fallback_price):
+    """Wait briefly for an IOC entry. Partial fills are accepted and protected."""
+    deadline = time.time() + 4.0
+    last = None
+    while time.time() < deadline:
+        result = _r1_query_order_safe(
+            symbol, order_id=order_id, client_order_id=client_order_id
+        )
+        if result:
+            last = result
+            status = _r1_order_status(result)
+            executed = _r1_order_executed_qty(result)
+            avg_price = _r1_order_avg_price(result)
+            if executed > 0 and status in (
+                "FILLED", "PARTIALLY_FILLED", "CANCELED", "CANCELLED", "EXPIRED"
+            ):
+                return executed, (avg_price or fallback_price), result
+            if status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                raise RuntimeError(f"R1_ENTRY_MISSED {status}")
+        time.sleep(0.25)
+
+    pos = r1_get_position(symbol, side)
+    if pos and pos["quantity"] > 0:
+        return pos["quantity"], (pos["avg_price"] or fallback_price), last
+    raise RuntimeError("R1_ENTRY_MISSED IOC not filled")
+
+
 def _r1_emergency_close_position(symbol, side, qp):
     """Fail closed if an entry exists without an exchange stop."""
     pos = r1_get_position(symbol, side)
@@ -2299,6 +2336,26 @@ def _r1_create_live_trade_unlocked(result):
     min_qty = _r1_float(contract.get("tradeMinQuantity", 0))
     min_usdt = _r1_float(contract.get("tradeMinUSDT", 0))
     reference_price = float(result["price"])
+    signal_price = float(result.get("signal_price") or reference_price)
+    chase_pct = float(result.get("chase_pct") or 0.0)
+    if signal_price <= 0 or reference_price <= 0:
+        raise RuntimeError("R1 invalid signal/fresh price")
+    if chase_pct > R1_MAX_CHASE_PCT + 1e-9:
+        raise RuntimeError(
+            f"R1 chase blocked: {chase_pct:.3f}% > {R1_MAX_CHASE_PCT:.3f}%"
+        )
+
+    raw_limit_price = (
+        signal_price * (1 + R1_MAX_CHASE_PCT / 100.0)
+        if side == "LONG"
+        else signal_price * (1 - R1_MAX_CHASE_PCT / 100.0)
+    )
+    if side == "LONG":
+        entry_limit_price = floor_number(raw_limit_price, pp)
+    else:
+        factor = 10 ** pp
+        entry_limit_price = math.ceil(raw_limit_price * factor) / factor
+
     notional = R1_MARGIN_USDT * R1_LEVERAGE
     quantity = floor_number(notional / reference_price, qp)
     if quantity <= 0 or (min_qty > 0 and quantity < min_qty):
@@ -2317,15 +2374,17 @@ def _r1_create_live_trade_unlocked(result):
             """
             INSERT INTO r1_live_trades (
                 symbol, side, strategy, engine_version, entry_client_id,
+                signal_price, fresh_price, chase_pct, entry_mode,
                 quantity, remaining_qty, quantity_precision, price_precision,
                 score, trend_score, breakout_score, status, last_checked_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ENTRY_PENDING',NOW())
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ENTRY_PENDING',NOW())
             ON CONFLICT (entry_client_id) DO NOTHING
             RETURNING id;
             """,
             (
                 symbol, side, result.get("strategy"), SCANNER_ENGINE_VERSION,
-                client_order_id, quantity, quantity, qp, pp,
+                client_order_id, signal_price, reference_price, chase_pct, "LIMIT_IOC",
+                quantity, quantity, qp, pp,
                 result.get("score"), result.get("trend_score"), result.get("breakout_score"),
             ),
         )
@@ -2346,8 +2405,10 @@ def _r1_create_live_trade_unlocked(result):
             "symbol": symbol,
             "side": "BUY" if side == "LONG" else "SELL",
             "positionSide": side,
-            "type": "MARKET",
+            "type": "LIMIT",
             "quantity": format_number(quantity, qp),
+            "price": format_number(entry_limit_price, pp),
+            "timeInForce": "IOC",
             "clientOrderId": client_order_id,
         }
         entry_result = _r1_private_request("POST", "/openApi/swap/v2/trade/order", params)
@@ -2360,7 +2421,7 @@ def _r1_create_live_trade_unlocked(result):
         # Persist the entry ID before waiting for the fill so a restarted process can recover it.
         _r1_persist_fields(trade_id, entry_order_id=entry_order_id)
 
-        filled_qty, avg_price, _ = _r1_wait_market_fill(
+        filled_qty, avg_price, _ = _r1_wait_ioc_fill(
             symbol, entry_order_id, client_order_id, side, reference_price
         )
         entry_confirmed = True
@@ -2369,12 +2430,35 @@ def _r1_create_live_trade_unlocked(result):
         print(
             "R1 LIVE OPEN:", trade_id, symbol, side,
             f"entry={avg_price}", f"qty={filled_qty}",
+            f"signal={signal_price}", f"fresh={reference_price}",
+            f"chase={chase_pct:.3f}%", "mode=LIMIT_IOC",
             f"margin={R1_MARGIN_USDT}U", f"lev={R1_LEVERAGE}x",
             flush=True,
         )
         return trade_id
 
     except Exception as e:
+        if (not entry_confirmed) and str(e).startswith("R1_ENTRY_MISSED"):
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    UPDATE r1_live_trades
+                    SET status='SKIPPED', exit_reason='ENTRY_MISSED',
+                        exit_detail=%s, remaining_qty=0,
+                        last_checked_at=NOW(), closed_at=NOW()
+                    WHERE id=%s;
+                    """,
+                    (str(e), trade_id),
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            print("R1 ENTRY MISSED:", trade_id, symbol, side, str(e), flush=True)
+            return None
+
         # If there is a position and no stop, flatten it immediately. If the stop
         # was already installed, leave it protected and let the monitor repair TP orders.
         conn = get_db_connection()
