@@ -77,6 +77,25 @@ SIM_PAUSE_HOURS_AFTER_STREAK = int(os.environ.get("SIM_PAUSE_HOURS_AFTER_STREAK"
 
 SIM_REPLAY_1M_LIMIT = int(os.environ.get("SIM_REPLAY_1M_LIMIT", "240"))
 
+
+# =========================================================
+# R1 LIVE TRADING SETTINGS
+# =========================================================
+
+# Keep LINE live trading and R1 live trading independently switchable.
+R1_LIVE_TRADING = os.environ.get("R1_LIVE_TRADING", "false").strip().lower() == "true"
+R1_MARGIN_USDT = float(os.environ.get("R1_MARGIN_USDT", "10"))
+R1_LEVERAGE = int(os.environ.get("R1_LEVERAGE", "8"))
+R1_MAX_OPEN = int(os.environ.get("R1_MAX_OPEN", str(SCANNER_MAX_OPEN)))
+R1_TP1_SHARE = 35.0
+R1_TP2_SHARE = 40.0
+R1_TP3_SHARE = 25.0
+R1_MONITOR_SEC = int(os.environ.get("R1_MONITOR_SEC", "5"))
+R1_LIVE_MONITOR = os.environ.get(
+    "R1_LIVE_MONITOR", "true" if R1_LIVE_TRADING else "false"
+).strip().lower() == "true"
+
+
 ENABLE_WEB_SIM_MONITOR = os.environ.get(
     "ENABLE_WEB_SIM_MONITOR", "false"
 ).strip().lower() == "true"
@@ -1552,6 +1571,1302 @@ def get_live_open_position_count():
     return count
 
 
+
+# =========================================================
+# R1 LIVE EXECUTION (BINGX PERPETUAL FUTURES)
+# =========================================================
+
+_R1_PRIVATE_API_LOCK = threading.Lock()
+_R1_LAST_PRIVATE_CALL = 0.0
+_R1_HEDGE_CHECK_AT = 0.0
+
+
+def _r1_private_pause(min_interval=0.23):
+    """Throttle private calls below the tightest endpoints used by this worker."""
+    global _R1_LAST_PRIVATE_CALL
+    with _R1_PRIVATE_API_LOCK:
+        now = time.time()
+        wait = min_interval - (now - _R1_LAST_PRIVATE_CALL)
+        if wait > 0:
+            time.sleep(wait)
+        _R1_LAST_PRIVATE_CALL = time.time()
+
+
+def _r1_private_request(method, path, params=None):
+    _r1_private_pause()
+    return bingx_private_request(method, path, params)
+
+
+def init_r1_live_database():
+    """R1 live state is deliberately separate from scanner_trades (paper R1)."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS r1_live_trades (
+                id SERIAL PRIMARY KEY,
+                symbol VARCHAR(50) NOT NULL,
+                side VARCHAR(10) NOT NULL,
+                strategy VARCHAR(30),
+                engine_version VARCHAR(20) NOT NULL DEFAULT 'V4.2R1',
+                signal_time TIMESTAMPTZ DEFAULT NOW(),
+                entry_client_id VARCHAR(64) UNIQUE NOT NULL,
+                entry_order_id VARCHAR(80),
+                entry_price DOUBLE PRECISION,
+                quantity DOUBLE PRECISION,
+                remaining_qty DOUBLE PRECISION,
+                quantity_precision INTEGER,
+                price_precision INTEGER,
+                score INTEGER,
+                trend_score INTEGER,
+                breakout_score INTEGER,
+                tp1 DOUBLE PRECISION,
+                tp2 DOUBLE PRECISION,
+                tp3 DOUBLE PRECISION,
+                sl DOUBLE PRECISION,
+                tp1_qty DOUBLE PRECISION,
+                tp2_qty DOUBLE PRECISION,
+                tp3_qty DOUBLE PRECISION,
+                tp1_order_id VARCHAR(80),
+                tp2_order_id VARCHAR(80),
+                tp3_order_id VARCHAR(80),
+                sl_order_id VARCHAR(80),
+                stop_stage INTEGER DEFAULT 0,
+                tp1_hit BOOLEAN DEFAULT FALSE,
+                tp2_hit BOOLEAN DEFAULT FALSE,
+                tp3_hit BOOLEAN DEFAULT FALSE,
+                sl_hit BOOLEAN DEFAULT FALSE,
+                highest_price DOUBLE PRECISION,
+                lowest_price DOUBLE PRECISION,
+                status VARCHAR(30) NOT NULL DEFAULT 'ENTRY_PENDING',
+                exit_reason VARCHAR(40),
+                exit_detail TEXT,
+                last_checked_at TIMESTAMPTZ,
+                closed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        # Safe migration for an earlier staging copy of this table.
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS stop_stage INTEGER DEFAULT 0;")
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_r1_live_open
+            ON r1_live_trades(status, symbol, signal_time DESC);
+            """
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _r1_order_data(result):
+    data = (result or {}).get("data", {})
+    if isinstance(data, dict) and isinstance(data.get("order"), dict):
+        return data["order"]
+    return data if isinstance(data, dict) else {}
+
+
+def _r1_order_id(result):
+    order = _r1_order_data(result)
+    value = order.get("orderID", order.get("orderId"))
+    return str(value) if value not in (None, "") else None
+
+
+def _r1_order_status(result):
+    return str(_r1_order_data(result).get("status", "")).upper()
+
+
+def _r1_order_executed_qty(result):
+    order = _r1_order_data(result)
+    for key in ("executedQty", "cumQty", "filledQty"):
+        value = order.get(key)
+        if value not in (None, ""):
+            try:
+                return abs(float(value))
+            except Exception:
+                pass
+    return 0.0
+
+
+def _r1_order_avg_price(result):
+    order = _r1_order_data(result)
+    for key in ("avgPrice", "averagePrice", "price"):
+        value = order.get(key)
+        if value not in (None, ""):
+            try:
+                value = float(value)
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+    return 0.0
+
+
+def _r1_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _r1_parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+
+def r1_assert_live_configuration(force=False):
+    """Hard guardrails for the requested R1 live profile."""
+    global _R1_HEDGE_CHECK_AT
+    if not BINGX_API_KEY or not BINGX_SECRET_KEY:
+        raise RuntimeError("R1 live requires BINGX_API_KEY and BINGX_SECRET_KEY")
+    if BINGX_POSITION_MODE != "HEDGE":
+        raise RuntimeError("R1 live requires BINGX_POSITION_MODE=HEDGE")
+    if abs(R1_MARGIN_USDT - 10.0) > 1e-9:
+        raise RuntimeError("R1 live margin must be exactly 10 USDT")
+    if R1_LEVERAGE != 8:
+        raise RuntimeError("R1 live leverage must be exactly 8x")
+    if R1_MAX_OPEN < 1 or R1_MAX_OPEN > 20:
+        raise RuntimeError("R1 live max open must be between 1 and 20")
+    if abs((R1_TP1_SHARE + R1_TP2_SHARE + R1_TP3_SHARE) - 100.0) > 1e-9:
+        raise RuntimeError("R1 TP shares must total 100%")
+
+    now = time.time()
+    if force or now - _R1_HEDGE_CHECK_AT > 60:
+        result = _r1_private_request("GET", "/openApi/swap/v1/positionSide/dual", {})
+        if result.get("code") != 0:
+            raise RuntimeError(f"R1 position-mode query failed: {result}")
+        data = result.get("data", {})
+        dual = data.get("dualSidePosition") if isinstance(data, dict) else None
+        if not _r1_parse_bool(dual):
+            raise RuntimeError("BingX account is not in Hedge Mode")
+        _R1_HEDGE_CHECK_AT = now
+    return True
+
+
+def r1_entry_client_id(result):
+    # Stable within one scanner slot, preventing duplicate entries after a retry.
+    bucket = int(time.time() // 300)
+    raw = "|".join([
+        SCANNER_ENGINE_VERSION,
+        str(result.get("symbol", "")),
+        str(result.get("side", "")),
+        str(bucket),
+    ])
+    return "r1" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:30]
+
+
+def r1_exit_client_id(trade_id, suffix):
+    raw = f"{SCANNER_ENGINE_VERSION}|LIVE|{trade_id}|{suffix}"
+    return "r1" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:30]
+
+
+def _r1_set_leverage(symbol, position_side):
+    result = _r1_private_request(
+        "POST",
+        "/openApi/swap/v2/trade/leverage",
+        {"symbol": symbol, "side": position_side, "leverage": R1_LEVERAGE},
+    )
+    if result.get("code") != 0:
+        raise RuntimeError(f"R1 set leverage failed: {result}")
+    return result
+
+
+def _r1_position_rows(symbol=None):
+    params = {"symbol": symbol} if symbol else {}
+    result = _r1_private_request("GET", "/openApi/swap/v2/user/positions", params)
+    if result.get("code") != 0:
+        raise RuntimeError(f"R1 position query failed: {result}")
+    data = result.get("data", [])
+    if isinstance(data, dict):
+        data = data.get("positions", data.get("data", [data]))
+    return data if isinstance(data, list) else []
+
+
+def r1_get_position(symbol, side):
+    side = str(side).upper()
+    for item in _r1_position_rows(symbol):
+        if str(item.get("symbol", "")).upper() != str(symbol).upper():
+            continue
+        pside = str(item.get("positionSide", item.get("side", ""))).upper()
+        if pside != side:
+            continue
+        qty = abs(_r1_float(item.get("positionAmt", item.get("positionAmount", item.get("availableAmt", 0)))))
+        if qty <= 0:
+            continue
+        return {
+            "quantity": qty,
+            "avg_price": _r1_float(item.get("avgPrice", item.get("entryPrice", item.get("averagePrice", 0)))),
+            "raw": item,
+        }
+    return None
+
+
+def _r1_active_statuses_sql():
+    return "('ENTRY_PENDING','OPEN','PROTECTED_ERROR','UNPROTECTED_ERROR','CLOSING')"
+
+
+def r1_live_open_count():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"SELECT COUNT(*) FROM r1_live_trades WHERE status IN {_r1_active_statuses_sql()};"
+        )
+        return int(cur.fetchone()[0] or 0)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def r1_live_can_open(symbol):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"""
+            SELECT id FROM r1_live_trades
+            WHERE symbol=%s
+              AND (
+                    status IN {_r1_active_statuses_sql()}
+                    OR signal_time > NOW() - (%s * INTERVAL '1 hour')
+                  )
+            ORDER BY signal_time DESC, id DESC
+            LIMIT 1;
+            """,
+            (symbol, SCANNER_COOLDOWN_HOURS),
+        )
+        return cur.fetchone() is None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def r1_live_symbol_side_open(symbol, side):
+    symbol = str(symbol).upper()
+    if not symbol.endswith("-USDT"):
+        symbol += "-USDT"
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"""
+            SELECT 1 FROM r1_live_trades
+            WHERE symbol=%s AND side=%s AND status IN {_r1_active_statuses_sql()}
+            LIMIT 1;
+            """,
+            (symbol, str(side).upper()),
+        )
+        return cur.fetchone() is not None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_line_live_open_count():
+    """LINE pool count excluding positions owned by R1 live.
+
+    Manual/external positions are conservatively counted against LINE's pool.
+    """
+    if not LIVE_TRADING:
+        return 0
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"SELECT symbol, side FROM r1_live_trades WHERE status IN {_r1_active_statuses_sql()};"
+        )
+        r1_pairs = {(str(r[0]).upper(), str(r[1]).upper()) for r in cur.fetchall()}
+    finally:
+        cur.close()
+        conn.close()
+
+    active_non_r1 = set()
+    for item in _r1_position_rows():
+        try:
+            qty = abs(_r1_float(item.get("positionAmt", item.get("positionAmount", item.get("availableAmt", 0)))))
+            if qty <= 0:
+                continue
+            symbol = str(item.get("symbol", "")).upper()
+            side = str(item.get("positionSide", item.get("side", ""))).upper()
+            pair = (symbol, side)
+            if pair not in r1_pairs:
+                active_non_r1.add(pair)
+        except Exception:
+            continue
+
+    # Pending LINE entry orders also occupy a slot before they become positions.
+    pending_roots = set()
+    try:
+        result = _r1_private_request("GET", "/openApi/swap/v2/trade/openOrders", {})
+        data = result.get("data", []) if result.get("code") == 0 else []
+        if isinstance(data, dict):
+            data = data.get("orders", data.get("data", [data]))
+        if isinstance(data, list):
+            for order in data:
+                cid = str(order.get("clientOrderId", order.get("clientOrderID", ""))).lower()
+                if not (cid.startswith("line") and cid.endswith("entry")):
+                    continue
+                symbol = str(order.get("symbol", "")).upper()
+                side = str(order.get("positionSide", "")).upper()
+                if (symbol, side) in active_non_r1:
+                    continue
+                pending_roots.add(cid[:-5])
+    except Exception as e:
+        print("LINE PENDING COUNT WARNING:", str(e), flush=True)
+
+    return len(active_non_r1) + len(pending_roots)
+
+
+def _r1_validate_split(contract, quantity, tp1, tp2, tp3):
+    qp = int(contract.get("quantityPrecision", 0))
+    min_qty = _r1_float(contract.get("tradeMinQuantity", 0))
+    min_usdt = _r1_float(contract.get("tradeMinUSDT", 0))
+    q1 = floor_number(quantity * R1_TP1_SHARE / 100.0, qp)
+    q2 = floor_number(quantity * R1_TP2_SHARE / 100.0, qp)
+    q3 = floor_number(quantity - q1 - q2, qp)
+    parts = [("TP1", q1, tp1), ("TP2", q2, tp2), ("TP3", q3, tp3)]
+    for name, qty, px in parts:
+        if qty <= 0:
+            raise RuntimeError(f"R1 {name} quantity rounded to zero")
+        if min_qty > 0 and qty < min_qty:
+            raise RuntimeError(f"R1 {name} quantity {qty} below minimum {min_qty}")
+        if min_usdt > 0 and qty * float(px) < min_usdt:
+            raise RuntimeError(f"R1 {name} notional below minimum {min_usdt} USDT")
+    return q1, q2, q3
+
+
+def _r1_levels(entry, side):
+    if side == "LONG":
+        return (
+            entry * (1 + SCANNER_TP1 / 100.0),
+            entry * (1 + SCANNER_TP2 / 100.0),
+            entry * (1 + SCANNER_TP3 / 100.0),
+            entry * (1 - SCANNER_SL / 100.0),
+        )
+    return (
+        entry * (1 - SCANNER_TP1 / 100.0),
+        entry * (1 - SCANNER_TP2 / 100.0),
+        entry * (1 - SCANNER_TP3 / 100.0),
+        entry * (1 + SCANNER_SL / 100.0),
+    )
+
+
+def _r1_close_side(position_side):
+    return "SELL" if position_side == "LONG" else "BUY"
+
+
+def _r1_place_conditional(
+    symbol, position_side, quantity, stop_price, order_type, qp, pp,
+    close_position=False
+):
+    params = {
+        "symbol": symbol,
+        "side": _r1_close_side(position_side),
+        "positionSide": position_side,
+        "type": order_type,
+        "quantity": format_number(quantity, qp),
+        "stopPrice": format_number(stop_price, pp),
+        "workingType": "MARK_PRICE",
+    }
+    if close_position:
+        params["closePosition"] = "true"
+    result = _r1_private_request("POST", "/openApi/swap/v2/trade/order", params)
+    if result.get("code") != 0:
+        raise RuntimeError(f"R1 {order_type} failed: {result}")
+    oid = _r1_order_id(result)
+    if not oid:
+        raise RuntimeError(f"R1 {order_type} returned no orderId: {result}")
+    return oid
+
+
+def _r1_cancel_best_effort(symbol, order_id):
+    if not order_id:
+        return
+    try:
+        result = _r1_private_request(
+            "DELETE", "/openApi/swap/v2/trade/order",
+            {"symbol": symbol, "orderId": order_id},
+        )
+        if result.get("code") != 0:
+            print("R1 CANCEL WARNING:", symbol, order_id, result, flush=True)
+    except Exception as e:
+        print("R1 CANCEL WARNING:", symbol, order_id, str(e), flush=True)
+
+
+def _r1_query_order_safe(symbol, order_id=None, client_order_id=None):
+    if not order_id and not client_order_id:
+        return None
+    try:
+        params = {"symbol": symbol}
+        if order_id:
+            params["orderId"] = order_id
+        else:
+            params["clientOrderId"] = client_order_id
+        result = _r1_private_request("GET", "/openApi/swap/v2/trade/order", params)
+        return result if result.get("code") == 0 else None
+    except Exception:
+        return None
+
+
+def _r1_open_orders_strict(symbol):
+    result = _r1_private_request(
+        "GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol}
+    )
+    if result.get("code") != 0:
+        raise RuntimeError(f"R1 open-orders query failed: {result}")
+    data = result.get("data", [])
+    if isinstance(data, dict):
+        data = data.get("orders", data.get("data", [data]))
+    return data if isinstance(data, list) else []
+
+
+def _r1_open_orders(symbol):
+    try:
+        return _r1_open_orders_strict(symbol)
+    except Exception:
+        return []
+
+
+def _r1_find_matching_open_order(symbol, position_side, order_type, stop_price, quantity, qp, pp):
+    close_side = _r1_close_side(position_side)
+    price_tol = max(10 ** (-max(pp, 0)), abs(float(stop_price)) * 1e-10)
+    qty_tol = max(10 ** (-max(qp, 0)), abs(float(quantity)) * 1e-10)
+    for order in _r1_open_orders(symbol):
+        try:
+            if str(order.get("type", "")).upper() != order_type.upper():
+                continue
+            if str(order.get("side", "")).upper() != close_side:
+                continue
+            if str(order.get("positionSide", "")).upper() != position_side.upper():
+                continue
+            op = _r1_float(order.get("stopPrice", 0))
+            oq = _r1_float(order.get("origQty", order.get("quantity", 0)))
+            if abs(op - float(stop_price)) > price_tol:
+                continue
+            if abs(oq - float(quantity)) > qty_tol:
+                continue
+            oid = order.get("orderID", order.get("orderId"))
+            if oid not in (None, ""):
+                return str(oid)
+        except Exception:
+            continue
+    return None
+
+
+def _r1_persist_fields(trade_id, **fields):
+    if not fields:
+        return
+    allowed = {
+        "entry_order_id", "entry_price", "quantity", "remaining_qty",
+        "quantity_precision", "price_precision", "tp1", "tp2", "tp3", "sl",
+        "tp1_qty", "tp2_qty", "tp3_qty", "tp1_order_id", "tp2_order_id",
+        "tp3_order_id", "sl_order_id", "stop_stage", "tp1_hit", "tp2_hit",
+        "tp3_hit", "sl_hit", "highest_price", "lowest_price", "status",
+        "exit_reason", "exit_detail",
+    }
+    bad = set(fields) - allowed
+    if bad:
+        raise RuntimeError(f"Unexpected R1 DB fields: {sorted(bad)}")
+    keys = list(fields)
+    sql = ", ".join(f"{k}=%s" for k in keys) + ", last_checked_at=NOW()"
+    values = [fields[k] for k in keys] + [trade_id]
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"UPDATE r1_live_trades SET {sql} WHERE id=%s;", values)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _r1_ensure_conditional(
+    trade_id, column, existing_order_id, symbol, side, quantity, stop_price,
+    order_type, qp, pp, close_position=False
+):
+    if existing_order_id:
+        existing = _r1_query_order_safe(symbol, order_id=existing_order_id)
+        if existing:
+            status = _r1_order_status(existing)
+            if status in ("NEW", "PARTIALLY_FILLED", "FILLED"):
+                return str(existing_order_id)
+            # A confirmed terminal order can be replaced below.
+        else:
+            # Do not duplicate a conditional order just because the single-order
+            # query had a transient error. Confirm via the open-order list first.
+            recovered = _r1_find_matching_open_order(
+                symbol, side, order_type, stop_price, quantity, qp, pp
+            )
+            if recovered:
+                _r1_persist_fields(trade_id, **{column: recovered})
+                return recovered
+            # If an old ID exists but neither query can confirm its state, keep it
+            # and let the monitor retry instead of blindly creating a duplicate.
+            return str(existing_order_id)
+
+    recovered = _r1_find_matching_open_order(
+        symbol, side, order_type, stop_price, quantity, qp, pp
+    )
+    if recovered:
+        _r1_persist_fields(trade_id, **{column: recovered})
+        return recovered
+
+    oid = _r1_place_conditional(
+        symbol, side, quantity, stop_price, order_type, qp, pp,
+        close_position=close_position,
+    )
+    _r1_persist_fields(trade_id, **{column: oid})
+    return oid
+
+
+def _r1_wait_market_fill(symbol, order_id, client_order_id, side, fallback_price):
+    deadline = time.time() + 15.0
+    last = None
+    while time.time() < deadline:
+        result = _r1_query_order_safe(symbol, order_id=order_id, client_order_id=client_order_id)
+        if result:
+            last = result
+            status = _r1_order_status(result)
+            executed = _r1_order_executed_qty(result)
+            avg_price = _r1_order_avg_price(result)
+            if executed > 0 and status in ("FILLED", "PARTIALLY_FILLED"):
+                if status == "FILLED":
+                    return executed, (avg_price or fallback_price), result
+            if status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                raise RuntimeError(f"R1 market entry ended with {status}: {result}")
+        time.sleep(0.5)
+
+    pos = r1_get_position(symbol, side)
+    if pos and pos["quantity"] > 0:
+        return pos["quantity"], (pos["avg_price"] or fallback_price), last
+    raise RuntimeError(f"R1 market entry fill not confirmed: {last}")
+
+
+def _r1_emergency_close_position(symbol, side, qp):
+    """Fail closed if an entry exists without an exchange stop."""
+    pos = r1_get_position(symbol, side)
+    if not pos or pos["quantity"] <= 0:
+        return True
+    params = {
+        "symbol": symbol,
+        "side": _r1_close_side(side),
+        "positionSide": side,
+        "type": "MARKET",
+        "quantity": format_number(pos["quantity"], int(qp or 0)),
+    }
+    result = _r1_private_request("POST", "/openApi/swap/v2/trade/order", params)
+    return result.get("code") == 0
+
+
+def _r1_install_protection(trade_id, symbol, side, filled_qty, avg_price, contract):
+    qp = int(contract.get("quantityPrecision", 0))
+    pp = int(contract.get("pricePrecision", 8))
+    tp1, tp2, tp3, sl = _r1_levels(avg_price, side)
+    q1, q2, q3 = _r1_validate_split(contract, filled_qty, tp1, tp2, tp3)
+
+    _r1_persist_fields(
+        trade_id,
+        entry_price=avg_price,
+        quantity=filled_qty,
+        remaining_qty=filled_qty,
+        quantity_precision=qp,
+        price_precision=pp,
+        tp1=tp1, tp2=tp2, tp3=tp3, sl=sl,
+        tp1_qty=q1, tp2_qty=q2, tp3_qty=q3,
+        highest_price=avg_price, lowest_price=avg_price,
+        status="PROTECTED_ERROR",
+    )
+
+    # Stop first. Any later TP setup error leaves the live position protected.
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT sl_order_id,tp1_order_id,tp2_order_id,tp3_order_id FROM r1_live_trades WHERE id=%s;",
+            (trade_id,),
+        )
+        row = cur.fetchone() or (None, None, None, None)
+    finally:
+        cur.close()
+        conn.close()
+    sl_oid, tp1_oid, tp2_oid, tp3_oid = row
+
+    sl_oid = _r1_ensure_conditional(
+        trade_id, "sl_order_id", sl_oid, symbol, side, filled_qty, sl,
+        "STOP_MARKET", qp, pp, close_position=True,
+    )
+    tp1_oid = _r1_ensure_conditional(
+        trade_id, "tp1_order_id", tp1_oid, symbol, side, q1, tp1,
+        "TAKE_PROFIT_MARKET", qp, pp,
+    )
+    tp2_oid = _r1_ensure_conditional(
+        trade_id, "tp2_order_id", tp2_oid, symbol, side, q2, tp2,
+        "TAKE_PROFIT_MARKET", qp, pp,
+    )
+    tp3_oid = _r1_ensure_conditional(
+        trade_id, "tp3_order_id", tp3_oid, symbol, side, q3, tp3,
+        "TAKE_PROFIT_MARKET", qp, pp,
+    )
+    _r1_persist_fields(trade_id, status="OPEN", exit_detail=None)
+    return sl_oid, tp1_oid, tp2_oid, tp3_oid
+
+
+_R1_EXECUTION_LOCK_KEY = 74200142
+
+
+def r1_acquire_execution_lock():
+    """Cross-process lock for R1 order creation/management on shared Postgres."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT pg_try_advisory_lock(%s);", (_R1_EXECUTION_LOCK_KEY,))
+        row = cur.fetchone()
+        acquired = bool(row and row[0])
+    finally:
+        cur.close()
+    if not acquired:
+        conn.close()
+        return None
+    return conn
+
+
+def r1_release_execution_lock(lock_conn):
+    if lock_conn is None:
+        return
+    cur = lock_conn.cursor()
+    try:
+        cur.execute("SELECT pg_advisory_unlock(%s);", (_R1_EXECUTION_LOCK_KEY,))
+        lock_conn.commit()
+    except Exception:
+        lock_conn.rollback()
+    finally:
+        cur.close()
+        lock_conn.close()
+
+
+def r1_create_live_trade(result):
+    lock_conn = r1_acquire_execution_lock()
+    if lock_conn is None:
+        print("R1 ENTRY SKIPPED: execution lock busy", flush=True)
+        return None
+    try:
+        return _r1_create_live_trade_unlocked(result)
+    finally:
+        r1_release_execution_lock(lock_conn)
+
+
+def _r1_create_live_trade_unlocked(result):
+    if not R1_LIVE_TRADING:
+        raise RuntimeError("R1_LIVE_TRADING is false")
+
+    init_r1_live_database()
+    r1_assert_live_configuration()
+
+    symbol = str(result["symbol"]).upper()
+    side = str(result.get("side", "LONG")).upper()
+    if side not in ("LONG", "SHORT"):
+        raise RuntimeError(f"Invalid R1 side: {side}")
+    if r1_live_open_count() >= R1_MAX_OPEN:
+        raise RuntimeError(f"R1 live pool full: {R1_MAX_OPEN}")
+    if not r1_live_can_open(symbol):
+        return None
+
+    # BingX hedge mode aggregates same-symbol/same-side positions. Never merge R1
+    # into a LINE/manual position because the two exit managers would conflict.
+    if r1_get_position(symbol, side):
+        raise RuntimeError(f"Existing {symbol} {side} position blocks R1 entry")
+
+    opening_side = "BUY" if side == "LONG" else "SELL"
+    for open_order in _r1_open_orders_strict(symbol):
+        if str(open_order.get("positionSide", "")).upper() != side:
+            continue
+        if str(open_order.get("side", "")).upper() != opening_side:
+            continue
+        if _r1_float(open_order.get("origQty", open_order.get("quantity", 0))) > 0:
+            raise RuntimeError(
+                f"Existing pending {symbol} {side} entry order blocks R1 entry"
+            )
+
+    client_order_id = r1_entry_client_id(result)
+    contract = get_contract_info(symbol)
+    qp = int(contract.get("quantityPrecision", 0))
+    pp = int(contract.get("pricePrecision", 8))
+    min_qty = _r1_float(contract.get("tradeMinQuantity", 0))
+    min_usdt = _r1_float(contract.get("tradeMinUSDT", 0))
+    reference_price = float(result["price"])
+    notional = R1_MARGIN_USDT * R1_LEVERAGE
+    quantity = floor_number(notional / reference_price, qp)
+    if quantity <= 0 or (min_qty > 0 and quantity < min_qty):
+        raise RuntimeError(f"R1 quantity {quantity} below minimum {min_qty}")
+    if min_usdt > 0 and quantity * reference_price < min_usdt:
+        raise RuntimeError(f"R1 order value below minimum {min_usdt} USDT")
+
+    pre_tp1, pre_tp2, pre_tp3, _ = _r1_levels(reference_price, side)
+    _r1_validate_split(contract, quantity, pre_tp1, pre_tp2, pre_tp3)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    trade_id = None
+    try:
+        cur.execute(
+            """
+            INSERT INTO r1_live_trades (
+                symbol, side, strategy, engine_version, entry_client_id,
+                quantity, remaining_qty, quantity_precision, price_precision,
+                score, trend_score, breakout_score, status, last_checked_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ENTRY_PENDING',NOW())
+            ON CONFLICT (entry_client_id) DO NOTHING
+            RETURNING id;
+            """,
+            (
+                symbol, side, result.get("strategy"), SCANNER_ENGINE_VERSION,
+                client_order_id, quantity, quantity, qp, pp,
+                result.get("score"), result.get("trend_score"), result.get("breakout_score"),
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        trade_id = int(row[0])
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    entry_confirmed = False
+    try:
+        _r1_set_leverage(symbol, side)
+        params = {
+            "symbol": symbol,
+            "side": "BUY" if side == "LONG" else "SELL",
+            "positionSide": side,
+            "type": "MARKET",
+            "quantity": format_number(quantity, qp),
+            "clientOrderId": client_order_id,
+        }
+        entry_result = _r1_private_request("POST", "/openApi/swap/v2/trade/order", params)
+        if entry_result.get("code") != 0:
+            raise RuntimeError(f"R1 entry failed: {entry_result}")
+        entry_order_id = _r1_order_id(entry_result)
+        if not entry_order_id:
+            raise RuntimeError(f"R1 entry returned no orderId: {entry_result}")
+
+        # Persist the entry ID before waiting for the fill so a restarted process can recover it.
+        _r1_persist_fields(trade_id, entry_order_id=entry_order_id)
+
+        filled_qty, avg_price, _ = _r1_wait_market_fill(
+            symbol, entry_order_id, client_order_id, side, reference_price
+        )
+        entry_confirmed = True
+        _r1_install_protection(trade_id, symbol, side, filled_qty, avg_price, contract)
+
+        print(
+            "R1 LIVE OPEN:", trade_id, symbol, side,
+            f"entry={avg_price}", f"qty={filled_qty}",
+            f"margin={R1_MARGIN_USDT}U", f"lev={R1_LEVERAGE}x",
+            flush=True,
+        )
+        return trade_id
+
+    except Exception as e:
+        # If there is a position and no stop, flatten it immediately. If the stop
+        # was already installed, leave it protected and let the monitor repair TP orders.
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT sl_order_id FROM r1_live_trades WHERE id=%s;", (trade_id,))
+            row = cur.fetchone()
+            sl_oid = row[0] if row else None
+        finally:
+            cur.close()
+            conn.close()
+
+        emergency_closed = False
+        if entry_confirmed and not sl_oid:
+            try:
+                emergency_closed = _r1_emergency_close_position(symbol, side, qp)
+            except Exception as close_error:
+                print("R1 EMERGENCY CLOSE ERROR:", symbol, str(close_error), flush=True)
+
+        if emergency_closed:
+            _r1_persist_fields(
+                trade_id, status="CLOSED", remaining_qty=0,
+                exit_reason="PROTECTION_SETUP_FAILED", exit_detail=str(e),
+            )
+            conn = get_db_connection(); cur = conn.cursor()
+            try:
+                cur.execute("UPDATE r1_live_trades SET closed_at=NOW() WHERE id=%s;", (trade_id,)); conn.commit()
+            finally:
+                cur.close(); conn.close()
+        elif sl_oid:
+            _r1_persist_fields(trade_id, status="PROTECTED_ERROR", exit_detail=str(e))
+        else:
+            # ENTRY_PENDING can be recovered by clientOrderId if the process/API response was ambiguous.
+            _r1_persist_fields(
+                trade_id,
+                status="UNPROTECTED_ERROR" if entry_confirmed else "ENTRY_PENDING",
+                exit_detail=str(e),
+            )
+        raise
+
+
+def _r1_replace_stop(trade_id, symbol, side, old_stop_id, quantity, stop_price, qp, pp, stage):
+    if quantity <= 0:
+        return None
+    # New stop first, old stop second: there is never an intentional unprotected gap.
+    new_id = _r1_find_matching_open_order(
+        symbol, side, "STOP_MARKET", stop_price, quantity, qp, pp
+    )
+    if not new_id:
+        new_id = _r1_place_conditional(
+            symbol, side, quantity, stop_price, "STOP_MARKET", qp, pp,
+            close_position=True
+        )
+    _r1_persist_fields(
+        trade_id, sl_order_id=new_id, remaining_qty=quantity, stop_stage=stage
+    )
+    if old_stop_id and str(old_stop_id) != str(new_id):
+        _r1_cancel_best_effort(symbol, old_stop_id)
+    return new_id
+
+
+def r1_cancel_all_exit_orders(symbol, order_ids):
+    for oid in order_ids:
+        _r1_cancel_best_effort(symbol, oid)
+
+
+def r1_mark_closed(trade_id, reason, detail=""):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE r1_live_trades
+            SET status='CLOSED', exit_reason=%s, exit_detail=%s,
+                remaining_qty=0, last_checked_at=NOW(), closed_at=NOW()
+            WHERE id=%s AND status <> 'CLOSED';
+            """,
+            (reason, detail, trade_id),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def r1_close_live_trade_market(trade_id, reason="MANUAL_RULE_EXIT", detail=""):
+    # Atomically claim the close so trend-exit and the background monitor cannot
+    # send two market-close orders for the same R1 position.
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE r1_live_trades
+            SET status='CLOSING', last_checked_at=NOW()
+            WHERE id=%s AND status IN ('OPEN','PROTECTED_ERROR','UNPROTECTED_ERROR')
+            RETURNING symbol, side, quantity_precision,
+                      tp1_order_id,tp2_order_id,tp3_order_id,sl_order_id;
+            """,
+            (trade_id,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    if not row:
+        return False
+
+    symbol, side, qp, tp1_oid, tp2_oid, tp3_oid, sl_oid = row
+    try:
+        pos = r1_get_position(symbol, side)
+        if not pos or pos["quantity"] <= 0:
+            r1_cancel_all_exit_orders(symbol, [tp1_oid, tp2_oid, tp3_oid, sl_oid])
+            r1_mark_closed(trade_id, reason, detail or "No live position remained")
+            return True
+
+        qty = floor_number(pos["quantity"], int(qp or 0))
+        if qty <= 0:
+            raise RuntimeError(f"R1 close quantity rounded to zero for {symbol} {side}")
+        params = {
+            "symbol": symbol,
+            "side": _r1_close_side(side),
+            "positionSide": side,
+            "type": "MARKET",
+            "quantity": format_number(qty, int(qp or 0)),
+        }
+        result = _r1_private_request("POST", "/openApi/swap/v2/trade/order", params)
+        if result.get("code") != 0:
+            raise RuntimeError(f"R1 close failed: {result}")
+
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            remaining = r1_get_position(symbol, side)
+            if not remaining or remaining["quantity"] <= 0:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(f"R1 close not confirmed for {symbol} {side}")
+
+        r1_cancel_all_exit_orders(symbol, [tp1_oid, tp2_oid, tp3_oid, sl_oid])
+        r1_mark_closed(trade_id, reason, detail)
+        print("R1 LIVE CLOSE:", trade_id, symbol, side, reason, flush=True)
+        return True
+    except Exception as e:
+        # Keep the trade manageable if the close attempt itself failed.
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE r1_live_trades
+                SET status='OPEN', exit_detail=%s, last_checked_at=NOW()
+                WHERE id=%s AND status='CLOSING';
+                """,
+                (f"Close attempt failed: {e}", trade_id),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        raise
+
+
+def _r1_recover_pending_entries():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT id,symbol,side,signal_time,entry_client_id,entry_order_id,
+                   quantity,quantity_precision,price_precision
+            FROM r1_live_trades
+            WHERE status='ENTRY_PENDING'
+            ORDER BY id ASC;
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+
+    for trade_id, symbol, side, signal_time, client_id, order_id, expected_qty, qp, pp in rows:
+        try:
+            result = _r1_query_order_safe(symbol, order_id=order_id, client_order_id=client_id)
+            if result:
+                status = _r1_order_status(result)
+                executed = _r1_order_executed_qty(result)
+                avg = _r1_order_avg_price(result)
+                if executed > 0 or status == "FILLED":
+                    pos = r1_get_position(symbol, side)
+                    qty = pos["quantity"] if pos else executed
+                    avg_price = (pos["avg_price"] if pos and pos["avg_price"] > 0 else avg)
+                    if qty > 0 and avg_price > 0:
+                        contract = get_contract_info(symbol)
+                        _r1_install_protection(trade_id, symbol, side, qty, avg_price, contract)
+                        continue
+                if status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                    _r1_persist_fields(trade_id, status="ERROR", exit_detail=f"Entry {status}")
+                    continue
+
+            # If the order lookup is temporarily unavailable, do not create a new order.
+            # After a short grace period, only mark ERROR when there is also no position.
+            age = (time.time() - signal_time.timestamp()) if signal_time else 0
+            if age > 180:
+                pos = r1_get_position(symbol, side)
+                if not pos:
+                    _r1_persist_fields(trade_id, status="ERROR", exit_detail="Entry order not found during recovery")
+                else:
+                    # A same-side position exists but the entry cannot be identified safely.
+                    _r1_persist_fields(trade_id, status="UNPROTECTED_ERROR", exit_detail="Position exists but entry order recovery is ambiguous")
+        except Exception as e:
+            print("R1 ENTRY RECOVERY ERROR:", trade_id, symbol, str(e), flush=True)
+
+
+def _r1_manage_live_trades_unlocked():
+    if not R1_LIVE_TRADING:
+        return
+
+    init_r1_live_database()
+    r1_assert_live_configuration()
+    _r1_recover_pending_entries()
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT id,symbol,side,signal_time,entry_price,quantity,remaining_qty,
+                   quantity_precision,price_precision,tp1,tp2,tp3,sl,
+                   tp1_order_id,tp2_order_id,tp3_order_id,sl_order_id,
+                   tp1_hit,tp2_hit,tp3_hit,COALESCE(stop_stage,0),status
+            FROM r1_live_trades
+            WHERE status IN ('OPEN','PROTECTED_ERROR','UNPROTECTED_ERROR')
+            ORDER BY id ASC;
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    for row in rows:
+        (
+            trade_id,symbol,side,signal_time,entry_price,orig_qty,remaining_qty,
+            qp,pp,tp1,tp2,tp3,sl,tp1_oid,tp2_oid,tp3_oid,sl_oid,
+            tp1_hit,tp2_hit,tp3_hit,stop_stage,status,
+        ) = row
+
+        try:
+            side = str(side).upper()
+            qp = int(qp or 0)
+            pp = int(pp or 8)
+            pos = r1_get_position(symbol, side)
+
+            if not pos or pos["quantity"] <= 0:
+                sl_q = _r1_query_order_safe(symbol, order_id=sl_oid)
+                tp3_q = _r1_query_order_safe(symbol, order_id=tp3_oid)
+                reason = "POSITION_CLOSED"
+                if sl_q and _r1_order_status(sl_q) == "FILLED":
+                    reason = (
+                        "SL_EXIT" if int(stop_stage or 0) == 0
+                        else "BREAKEVEN_EXIT" if int(stop_stage or 0) == 1
+                        else "TP2_PROTECT_EXIT"
+                    )
+                elif tp3_q and _r1_order_status(tp3_q) == "FILLED":
+                    reason = "TP3_EXIT"
+                r1_cancel_all_exit_orders(symbol, [tp1_oid,tp2_oid,tp3_oid,sl_oid])
+                r1_mark_closed(trade_id, reason)
+                continue
+
+            current_qty = float(pos["quantity"])
+            avg_price = float(pos["avg_price"] or entry_price or 0)
+
+            # Repair any incomplete protection set after an API error/restart.
+            if status in ("PROTECTED_ERROR", "UNPROTECTED_ERROR"):
+                try:
+                    contract = get_contract_info(symbol)
+                    _r1_install_protection(
+                        trade_id, symbol, side, current_qty,
+                        avg_price or float(entry_price), contract,
+                    )
+                    # Reload order IDs and levels after repair.
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    try:
+                        cur.execute(
+                            """
+                            SELECT entry_price,tp1,tp2,tp3,sl,
+                                   tp1_order_id,tp2_order_id,tp3_order_id,sl_order_id,
+                                   tp1_hit,tp2_hit,tp3_hit,COALESCE(stop_stage,0)
+                            FROM r1_live_trades WHERE id=%s;
+                            """,
+                            (trade_id,),
+                        )
+                        rr = cur.fetchone()
+                    finally:
+                        cur.close(); conn.close()
+                    if not rr:
+                        continue
+                    (
+                        entry_price,tp1,tp2,tp3,sl,
+                        tp1_oid,tp2_oid,tp3_oid,sl_oid,
+                        tp1_hit,tp2_hit,tp3_hit,stop_stage,
+                    ) = rr
+                except Exception as protection_error:
+                    # Only tolerate a retry state when an actual exchange stop is active.
+                    stop_resp = _r1_query_order_safe(symbol, order_id=sl_oid)
+                    stop_active = bool(
+                        stop_resp and _r1_order_status(stop_resp) in ("NEW", "PARTIALLY_FILLED")
+                    )
+                    if not stop_active:
+                        closed = _r1_emergency_close_position(symbol, side, qp)
+                        if closed:
+                            r1_cancel_all_exit_orders(symbol, [tp1_oid,tp2_oid,tp3_oid,sl_oid])
+                            r1_mark_closed(
+                                trade_id,
+                                "PROTECTION_RECOVERY_FAILED",
+                                str(protection_error),
+                            )
+                        else:
+                            _r1_persist_fields(
+                                trade_id,
+                                status="UNPROTECTED_ERROR",
+                                exit_detail=f"NO CONFIRMED STOP: {protection_error}",
+                            )
+                    else:
+                        _r1_persist_fields(
+                            trade_id,
+                            status="PROTECTED_ERROR",
+                            exit_detail=str(protection_error),
+                        )
+                    continue
+
+            sl_q = _r1_query_order_safe(symbol, order_id=sl_oid)
+            sl_status = _r1_order_status(sl_q) if sl_q else ""
+
+            if sl_status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                sl_oid = None
+            elif not sl_q:
+                # Query open orders through the strict path. If BingX itself is
+                # unavailable this raises and we do not create a duplicate stop.
+                active_stop_price = (
+                    float(tp1) if int(stop_stage or 0) >= 2
+                    else float(entry_price) if int(stop_stage or 0) == 1
+                    else float(sl)
+                )
+                recovered_stop = None
+                close_side = _r1_close_side(side)
+                for order in _r1_open_orders_strict(symbol):
+                    try:
+                        if str(order.get("type", "")).upper() != "STOP_MARKET":
+                            continue
+                        if str(order.get("side", "")).upper() != close_side:
+                            continue
+                        if str(order.get("positionSide", "")).upper() != side:
+                            continue
+                        op = _r1_float(order.get("stopPrice", 0))
+                        tol = max(10 ** (-max(pp, 0)), abs(active_stop_price) * 1e-10)
+                        if abs(op - active_stop_price) <= tol:
+                            oid = order.get("orderID", order.get("orderId"))
+                            if oid not in (None, ""):
+                                recovered_stop = str(oid)
+                                break
+                    except Exception:
+                        continue
+                if recovered_stop:
+                    sl_oid = recovered_stop
+                    _r1_persist_fields(trade_id, sl_order_id=sl_oid)
+                else:
+                    sl_oid = None
+
+            if not sl_oid and sl_status != "FILLED":
+                active_stop_price = (
+                    float(tp1) if int(stop_stage or 0) >= 2
+                    else float(entry_price) if int(stop_stage or 0) == 1
+                    else float(sl)
+                )
+                sl_oid = _r1_place_conditional(
+                    symbol, side, current_qty, active_stop_price,
+                    "STOP_MARKET", qp, pp, close_position=True,
+                )
+                _r1_persist_fields(
+                    trade_id, sl_order_id=sl_oid, remaining_qty=current_qty
+                )
+                sl_q = _r1_query_order_safe(symbol, order_id=sl_oid)
+                sl_status = _r1_order_status(sl_q) if sl_q else ""
+
+            if sl_status == "FILLED":
+                reason = (
+                    "SL_EXIT" if int(stop_stage or 0) == 0
+                    else "BREAKEVEN_EXIT" if int(stop_stage or 0) == 1
+                    else "TP2_PROTECT_EXIT"
+                )
+                r1_close_live_trade_market(
+                    trade_id, reason, f"BingX protective stop filled at stage {stop_stage}"
+                )
+                continue
+
+            new_tp1 = bool(tp1_hit)
+            new_tp2 = bool(tp2_hit)
+            new_tp3 = bool(tp3_hit)
+
+            q1 = _r1_query_order_safe(symbol, order_id=tp1_oid) if not new_tp1 else None
+            q2 = _r1_query_order_safe(symbol, order_id=tp2_oid) if not new_tp2 else None
+            q3 = _r1_query_order_safe(symbol, order_id=tp3_oid) if not new_tp3 else None
+
+            if q1 and _r1_order_status(q1) == "FILLED":
+                new_tp1 = True
+            if q2 and _r1_order_status(q2) == "FILLED":
+                new_tp1 = True
+                new_tp2 = True
+            if q3 and _r1_order_status(q3) == "FILLED":
+                new_tp1 = True
+                new_tp2 = True
+                new_tp3 = True
+
+            if new_tp3:
+                # TP3 is terminal. Close any exchange remainder caused by a gap/race.
+                r1_close_live_trade_market(
+                    trade_id, "TP3_EXIT", "TP3 filled; terminal R1 exit"
+                )
+                continue
+
+            desired_stage = 2 if new_tp2 else (1 if new_tp1 else 0)
+            if desired_stage > int(stop_stage or 0):
+                target_stop = float(tp1) if desired_stage == 2 else float(entry_price)
+                try:
+                    sl_oid = _r1_replace_stop(
+                        trade_id, symbol, side, sl_oid, current_qty,
+                        target_stop, qp, pp, desired_stage,
+                    )
+                    stop_stage = desired_stage
+                except Exception as stop_error:
+                    reason = "TP2_PROTECT_EXIT" if desired_stage == 2 else "BREAKEVEN_EXIT"
+                    r1_close_live_trade_market(
+                        trade_id, reason,
+                        f"Could not move protective stop safely; flattened: {stop_error}",
+                    )
+                    continue
+
+            # Same R1 timeout rule: only before TP1.
+            if not new_tp1 and signal_time is not None:
+                age_hours = (time.time() - signal_time.timestamp()) / 3600.0
+                if age_hours >= V42_POSITION_TIMEOUT_HOURS:
+                    r1_close_live_trade_market(
+                        trade_id, "TIMEOUT_EXIT",
+                        f"R1 live timeout after {age_hours:.2f}h without TP1",
+                    )
+                    continue
+
+            _r1_persist_fields(
+                trade_id,
+                tp1_hit=new_tp1,
+                tp2_hit=new_tp2,
+                tp3_hit=new_tp3,
+                remaining_qty=current_qty,
+                sl_order_id=sl_oid,
+                stop_stage=int(stop_stage or 0),
+                status="OPEN",
+            )
+
+        except Exception as e:
+            print("R1 LIVE MANAGE ERROR:", trade_id, symbol, str(e), flush=True)
+
+
+def r1_manage_live_trades():
+    if not R1_LIVE_TRADING:
+        return
+    lock_conn = r1_acquire_execution_lock()
+    if lock_conn is None:
+        return
+    try:
+        return _r1_manage_live_trades_unlocked()
+    finally:
+        r1_release_execution_lock(lock_conn)
+
+
+def r1_live_monitor_loop():
+    print("R1 LIVE MONITOR STARTED", flush=True)
+    while True:
+        try:
+            r1_manage_live_trades()
+        except Exception as e:
+            print("R1 LIVE MONITOR ERROR:", str(e), flush=True)
+        time.sleep(max(5, R1_MONITOR_SEC))
+
+
+def start_r1_live_monitor():
+    thread = threading.Thread(target=r1_live_monitor_loop, daemon=True)
+    thread.start()
+
+
 def create_simulated_trade(result):
     entry = float(result["price"])
     side = result.get("side", "LONG").upper()
@@ -2947,10 +4262,24 @@ def webhook():
                 )
                 continue
 
+            # BingX Hedge Mode aggregates same-symbol/same-side positions.
+            # Do not let LINE merge into an R1-managed live position.
+            if R1_LIVE_TRADING and r1_live_symbol_side_open(signal["symbol"], signal["side"]):
+                update_line_event_status(
+                    event_id,
+                    "R1_COLLISION",
+                    "Same symbol/side is already managed by R1 live; LINE order skipped.",
+                )
+                print(
+                    "LINE/R1 SAME-SIDE COLLISION SKIPPED:",
+                    signal["symbol"], signal["side"], flush=True,
+                )
+                continue
+
             # Scanner is simulation-only in this test version.
             # LINE/Max Crypto has its own separate live pool, capped independently.
             if LIVE_TRADING:
-                line_open = get_live_open_position_count()
+                line_open = get_line_live_open_count()
                 if line_open >= LINE_MAX_OPEN:
                     update_line_event_status(
                         event_id,
@@ -3019,8 +4348,16 @@ def webhook():
 
 try:
     init_database()
+    if DATABASE_URL:
+        init_r1_live_database()
 except Exception as e:
     print("STARTUP DATABASE ERROR:", str(e), flush=True)
+
+if DATABASE_URL and R1_LIVE_TRADING and R1_LIVE_MONITOR:
+    try:
+        start_r1_live_monitor()
+    except Exception as e:
+        print("R1 LIVE MONITOR START ERROR:", str(e), flush=True)
 
 if DATABASE_URL and ENABLE_WEB_SIM_MONITOR:
     try:

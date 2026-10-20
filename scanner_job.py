@@ -15,6 +15,16 @@ from app import (
     scanner_risk_allows_new_trade,
     create_simulated_trade,
     update_simulated_trades,
+    init_r1_live_database,
+    r1_live_open_count,
+    r1_live_can_open,
+    r1_create_live_trade,
+    r1_manage_live_trades,
+    r1_close_live_trade_market,
+    r1_acquire_execution_lock,
+    r1_release_execution_lock,
+    R1_LIVE_TRADING,
+    R1_MAX_OPEN,
     get_all_prices,
     get_klines,
     calculate_ema,
@@ -45,6 +55,9 @@ API_DELAY = 1.10
 # TP2 runner trend-exit requires this many weakness signals.
 TREND_EXIT_WEAKNESS_COUNT = 2
 
+# Keep live radar snapshots independent from the still-running paper R1 cron.
+RADAR_SNAPSHOT_TABLE = "radar_snapshots_r1_live" if R1_LIVE_TRADING else "radar_snapshots"
+
 
 # =========================================================
 # DATABASE
@@ -53,24 +66,24 @@ TREND_EXIT_WEAKNESS_COUNT = 2
 def init_extra_database():
     conn = get_db_connection()
     cur = conn.cursor()
+    try:
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {RADAR_SNAPSHOT_TABLE} (
+                symbol VARCHAR(50) PRIMARY KEY,
+                last_price DOUBLE PRECISION NOT NULL,
+                quote_volume_24h DOUBLE PRECISION,
+                price_change_24h DOUBLE PRECISION,
+                captured_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS radar_snapshots (
-            symbol VARCHAR(50) PRIMARY KEY,
-            last_price DOUBLE PRECISION NOT NULL,
-            quote_volume_24h DOUBLE PRECISION,
-            price_change_24h DOUBLE PRECISION,
-            captured_at TIMESTAMPTZ DEFAULT NOW()
-        );
-        """
-    )
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    print("V4.2 RADAR DATABASE READY", flush=True)
+    print("V4.2 RADAR DATABASE READY |", RADAR_SNAPSHOT_TABLE, flush=True)
 
 
 # =========================================================
@@ -129,25 +142,19 @@ def get_all_tickers():
 def load_previous_snapshots():
     conn = get_db_connection()
     cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT
-            symbol,
-            last_price,
-            quote_volume_24h,
-            price_change_24h,
-            captured_at
-        FROM radar_snapshots;
-        """
-    )
-
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    try:
+        cur.execute(
+            f"""
+            SELECT symbol,last_price,quote_volume_24h,price_change_24h,captured_at
+            FROM {RADAR_SNAPSHOT_TABLE};
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
 
     result = {}
-
     for symbol, price, volume, change_24h, captured_at in rows:
         result[symbol] = {
             "price": float(price),
@@ -155,43 +162,31 @@ def load_previous_snapshots():
             "change_24h": float(change_24h or 0),
             "captured_at": captured_at,
         }
-
     return result
 
 
 def save_snapshots(tickers):
     conn = get_db_connection()
     cur = conn.cursor()
-
-    for item in tickers:
-        cur.execute(
-            """
-            INSERT INTO radar_snapshots (
-                symbol,
-                last_price,
-                quote_volume_24h,
-                price_change_24h,
-                captured_at
+    try:
+        for item in tickers:
+            cur.execute(
+                f"""
+                INSERT INTO {RADAR_SNAPSHOT_TABLE} (
+                    symbol,last_price,quote_volume_24h,price_change_24h,captured_at
+                ) VALUES (%s,%s,%s,%s,NOW())
+                ON CONFLICT (symbol) DO UPDATE SET
+                    last_price=EXCLUDED.last_price,
+                    quote_volume_24h=EXCLUDED.quote_volume_24h,
+                    price_change_24h=EXCLUDED.price_change_24h,
+                    captured_at=NOW();
+                """,
+                (item["symbol"],item["price"],item["quote_volume"],item["change_24h"]),
             )
-            VALUES (%s,%s,%s,%s,NOW())
-            ON CONFLICT (symbol)
-            DO UPDATE SET
-                last_price=EXCLUDED.last_price,
-                quote_volume_24h=EXCLUDED.quote_volume_24h,
-                price_change_24h=EXCLUDED.price_change_24h,
-                captured_at=NOW();
-            """,
-            (
-                item["symbol"],
-                item["price"],
-                item["quote_volume"],
-                item["change_24h"],
-            ),
-        )
-
-    conn.commit()
-    cur.close()
-    conn.close()
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
 
 # =========================================================
@@ -405,7 +400,63 @@ def should_exit_after_tp2(symbol, side):
     return len(weakness) >= TREND_EXIT_WEAKNESS_COUNT, weakness
 
 
+
+def manage_r1_live_tp2_trend_exits():
+    """Apply the same post-TP2 weakness exit to the live R1 runner."""
+    lock_conn = r1_acquire_execution_lock()
+    if lock_conn is None:
+        print("R1 LIVE TP2 TREND MONITOR: execution lock busy", flush=True)
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT id, symbol, side
+                FROM r1_live_trades
+                WHERE status IN ('OPEN','PROTECTED_ERROR')
+                  AND engine_version=%s
+                  AND tp2_hit=TRUE
+                  AND tp3_hit=FALSE
+                ORDER BY id ASC;
+                """,
+                (SCANNER_ENGINE_VERSION,),
+            )
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+            conn.close()
+
+        if not rows:
+            print("R1 LIVE TP2 TREND MONITOR: NO RUNNERS", flush=True)
+            return
+
+        for trade_id, symbol, side in rows:
+            try:
+                exit_now, weakness = should_exit_after_tp2(symbol, side)
+                if not exit_now:
+                    print(
+                        "R1 LIVE KEEP RUNNING:", symbol, side, "|",
+                        ", ".join(weakness) if weakness else "trend healthy",
+                        flush=True,
+                    )
+                    continue
+                r1_close_live_trade_market(
+                    trade_id,
+                    "TREND_EXIT",
+                    ", ".join(weakness),
+                )
+            except Exception as e:
+                print("R1 LIVE TREND EXIT ERROR:", symbol, str(e), flush=True)
+    finally:
+        r1_release_execution_lock(lock_conn)
+
+
 def manage_tp2_trend_exits():
+    if R1_LIVE_TRADING:
+        return manage_r1_live_tp2_trend_exits()
+
     # First run TP/SL/breakeven/TIMEOUT management.
     update_simulated_trades()
 
@@ -563,39 +614,46 @@ def manage_tp2_trend_exits():
 # =========================================================
 
 def run_fast_radar():
+    mode = "LIVE" if R1_LIVE_TRADING else "SIM"
     print("========================================", flush=True)
-    print("BINGX V4.2 5-MINUTE RADAR START", flush=True)
+    print(f"BINGX V4.2 5-MINUTE RADAR START | {mode}", flush=True)
     print("========================================", flush=True)
 
     init_database()
     init_extra_database()
+    if R1_LIVE_TRADING:
+        init_r1_live_database()
 
-    # 1. Update all old/current open simulated trades.
+    # 1. Reconcile/monitor current positions using the matching execution layer.
     try:
-        update_simulated_trades()
+        if R1_LIVE_TRADING:
+            r1_manage_live_trades()
+        else:
+            update_simulated_trades()
     except Exception as e:
         print("TRADE UPDATE ERROR:", str(e), flush=True)
 
-    # 2. Manage TP2 runners.
+    # 2. Manage TP2 runners with the exact same weakness rule, but keep
+    # live and paper databases completely isolated.
     try:
-        manage_tp2_trend_exits()
+        if R1_LIVE_TRADING:
+            manage_r1_live_tp2_trend_exits()
+        else:
+            manage_tp2_trend_exits()
     except Exception as e:
         print("TREND EXIT MANAGER ERROR:", str(e), flush=True)
 
-    # 3. V4.2 risk gate.
-    allow_new, risk_reason = scanner_risk_allows_new_trade()
+    # 3. Simulation keeps its historical risk gate. Live mode deliberately does
+    # not inherit the simulation daily-loss/loss-streak gate.
+    if R1_LIVE_TRADING:
+        allow_new, risk_reason = True, "LIVE_R1_NO_SIM_DAILY_STOP"
+    else:
+        allow_new, risk_reason = scanner_risk_allows_new_trade()
 
-    print(
-        "RISK GATE:",
-        allow_new,
-        "|",
-        risk_reason,
-        flush=True,
-    )
+    print("RISK GATE:", allow_new, "|", risk_reason, flush=True)
 
     previous = load_previous_snapshots()
     current = get_all_tickers()
-
     print("MARKETS RECEIVED:", len(current), flush=True)
 
     if not previous:
@@ -604,52 +662,33 @@ def run_fast_radar():
         return
 
     candidates = build_radar_candidates(current, previous)
-
-    # Save early so next cron has a stable comparison baseline.
     save_snapshots(current)
-
     print("FAST RADAR CANDIDATES:", len(candidates), flush=True)
 
     for item in candidates:
         print(
-            item["symbol"],
-            "|",
-            item["side"],
-            "| 5m",
-            f"{item['radar_move']:+.2f}%",
-            "| Radar",
-            item["radar_score"],
+            item["symbol"], "|", item["side"], "| 5m",
+            f"{item['radar_move']:+.2f}%", "| Radar", item["radar_score"],
             flush=True,
         )
 
     if not allow_new:
-        print(
-            "NEW ENTRY BLOCKED BY RISK CONTROL:",
-            risk_reason,
-            flush=True,
-        )
+        print("NEW ENTRY BLOCKED BY RISK CONTROL:", risk_reason, flush=True)
         print("BINGX V4.2 RADAR COMPLETE", flush=True)
         return
 
     qualified = []
-
     for radar in candidates:
         try:
             result = deep_analyze(radar)
-
             if result:
                 qualified.append(result)
-
         except Exception as e:
             print(
-                "DEEP ANALYSIS ERROR:",
-                radar["symbol"],
-                radar["side"],
-                str(e),
+                "DEEP ANALYSIS ERROR:", radar["symbol"], radar["side"], str(e),
                 flush=True,
             )
 
-    # Prefer score, then BREAKOUT, then stronger absolute radar move.
     qualified.sort(
         key=lambda x: (
             x["score"],
@@ -660,44 +699,59 @@ def run_fast_radar():
     )
 
     created = 0
-
     for result in qualified:
         if created >= SCANNER_MAX_NEW_PER_SCAN:
             break
 
-        if scanner_open_count() >= SCANNER_MAX_OPEN:
-            print("MAX OPEN TRADES REACHED", flush=True)
+        open_count = r1_live_open_count() if R1_LIVE_TRADING else scanner_open_count()
+        max_open = R1_MAX_OPEN if R1_LIVE_TRADING else SCANNER_MAX_OPEN
+        if open_count >= max_open:
+            print("MAX OPEN TRADES REACHED", open_count, "/", max_open, flush=True)
             break
 
-        allow_new, risk_reason = scanner_risk_allows_new_trade()
+        if not R1_LIVE_TRADING:
+            allow_new, risk_reason = scanner_risk_allows_new_trade()
+            if not allow_new:
+                print("RISK CONTROL STOP:", risk_reason, flush=True)
+                break
 
-        if not allow_new:
-            print("RISK CONTROL STOP:", risk_reason, flush=True)
-            break
-
-        if not scanner_can_open(result["symbol"]):
-            print(
-                "COOLDOWN:",
-                result["symbol"],
-                result["side"],
-                flush=True,
-            )
+        can_open = (
+            r1_live_can_open(result["symbol"])
+            if R1_LIVE_TRADING
+            else scanner_can_open(result["symbol"])
+        )
+        if not can_open:
+            print("COOLDOWN:", result["symbol"], result["side"], flush=True)
             continue
 
-        create_simulated_trade(result)
-        created += 1
+        try:
+            if R1_LIVE_TRADING:
+                trade_id = r1_create_live_trade(result)
+                if trade_id is None:
+                    continue
+                print("R1 LIVE TRADE CREATED:", trade_id, flush=True)
+            else:
+                create_simulated_trade(result)
+            created += 1
+        except Exception as e:
+            print(
+                "ENTRY ERROR:", result["symbol"], result["side"], str(e),
+                flush=True,
+            )
 
     print("QUALIFIED:", len(qualified), flush=True)
-    print("NEW V4.2 SIMULATED TRADES:", created, flush=True)
+    print(f"NEW V4.2 {mode} TRADES:", created, flush=True)
 
-    # Final update after new trades are inserted.
     try:
-        update_simulated_trades()
+        if R1_LIVE_TRADING:
+            r1_manage_live_trades()
+        else:
+            update_simulated_trades()
     except Exception as e:
         print("POST UPDATE ERROR:", str(e), flush=True)
 
     print("========================================", flush=True)
-    print("BINGX V4.2 5-MINUTE RADAR COMPLETE", flush=True)
+    print(f"BINGX V4.2 5-MINUTE RADAR COMPLETE | {mode}", flush=True)
     print("========================================", flush=True)
 
 
