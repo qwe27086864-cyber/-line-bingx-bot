@@ -224,7 +224,172 @@ else:
     _app.update_simulated_trades = r1m_update_simulated_trades
 
     print(
-        "R1M PATCH ACTIVE | paper only | engine=R1M | max_open=3 | "
+        "R1M PATCH ACTIVE | paper only | engine=R1M | max_open=30 | "
         "entry=best ask/bid | fees+slippage retained",
+        flush=True,
+    )
+
+
+# ======================================================================
+# SHADOW TRACKING V2 - R1M
+# Diagnostic-only.  It buffers decisions in RAM and writes only at exit.
+# ======================================================================
+try:
+    import atexit as _shadow_atexit
+    import os as _shadow_os
+    from datetime import datetime as _shadow_datetime
+    from datetime import timedelta as _shadow_timedelta
+    from datetime import timezone as _shadow_timezone
+
+    _R1M_SHADOW_PROCESS_START = _shadow_datetime.now(_shadow_timezone.utc)
+    _R1M_SHADOW_BUFFER = []
+    _R1M_SHADOW_CHOSEN = {}
+    _R1M_SHADOW_SEQ = 0
+
+    _R1M_ORIGINAL_CHOOSE = _app.choose_strategy
+    _R1M_ORIGINAL_CAN_OPEN = _app.scanner_can_open
+
+    def _r1m_shadow_key():
+        global _R1M_SHADOW_SEQ
+        _R1M_SHADOW_SEQ += 1
+        stamp = _R1M_SHADOW_PROCESS_START.isoformat()
+        return f"R1M:{stamp}:{_R1M_SHADOW_SEQ}"
+
+    def _r1m_shadow_metadata(result):
+        return {
+            "strategy": result.get("strategy"),
+            "score": result.get("score"),
+            "trend_score": result.get("trend_score"),
+            "breakout_score": result.get("breakout_score"),
+            "trend_blocked": result.get("trend_blocked"),
+            "breakout_blocked": result.get("breakout_blocked"),
+            "trend_15m": result.get("trend_15m"),
+            "trend_1h": result.get("trend_1h"),
+            "radar_move_pct": result.get("radar_move"),
+            "radar_score": result.get("radar_score"),
+            "rsi": result.get("rsi"),
+            "rsi_5m": result.get("rsi_5m"),
+            "volume_ratio": result.get("volume_ratio"),
+            "volume_ratio_5m": result.get("volume_ratio_5m"),
+            "momentum_5m": result.get("momentum_5m"),
+            "entry_mode": "ANALYSIS_REFERENCE_NO_EXTRA_API",
+        }
+
+    def r1m_choose_strategy_shadow(result):
+        chosen = _R1M_ORIGINAL_CHOOSE(result)
+
+        try:
+            snapshot = dict(result)
+            symbol = str(snapshot.get("symbol") or "").upper()
+
+            if chosen is None:
+                price = float(snapshot.get("price") or 0)
+                if symbol and price > 0:
+                    _R1M_SHADOW_BUFFER.append(
+                        {
+                            "source_key": _r1m_shadow_key(),
+                            "engine_version": "R1M",
+                            "symbol": symbol,
+                            "side": snapshot.get("side", "LONG"),
+                            "decision": "CORE_REJECT",
+                            "reason": "choose_strategy rejected",
+                            "entry_price": price,
+                            "signal_price": price,
+                            "observed_at": _shadow_datetime.now(
+                                _shadow_timezone.utc
+                            ),
+                            "metadata": _r1m_shadow_metadata(snapshot),
+                        }
+                    )
+            else:
+                _R1M_SHADOW_CHOSEN[symbol] = dict(chosen)
+
+        except Exception as _shadow_e:
+            print(
+                "R1M SHADOW BUFFER ERROR:",
+                str(_shadow_e),
+                flush=True,
+            )
+
+        return chosen
+
+    def r1m_scanner_can_open_shadow(symbol):
+        allowed = _R1M_ORIGINAL_CAN_OPEN(symbol)
+
+        if not allowed:
+            try:
+                key = str(symbol).upper()
+                snapshot = _R1M_SHADOW_CHOSEN.get(key)
+                if snapshot:
+                    price = float(snapshot.get("price") or 0)
+                    if price > 0:
+                        _R1M_SHADOW_BUFFER.append(
+                            {
+                                "source_key": _r1m_shadow_key(),
+                                "engine_version": "R1M",
+                                "symbol": key,
+                                "side": snapshot.get("side", "LONG"),
+                                "decision": "COOLDOWN",
+                                "reason": "symbol cooldown/open",
+                                "entry_price": price,
+                                "signal_price": price,
+                                "observed_at": _shadow_datetime.now(
+                                    _shadow_timezone.utc
+                                ),
+                                "metadata": _r1m_shadow_metadata(snapshot),
+                            }
+                        )
+            except Exception as _shadow_e:
+                print(
+                    "R1M SHADOW COOLDOWN BUFFER ERROR:",
+                    str(_shadow_e),
+                    flush=True,
+                )
+
+        return allowed
+
+    _app.choose_strategy = r1m_choose_strategy_shadow
+    _app.scanner_can_open = r1m_scanner_can_open_shadow
+
+    def _r1m_shadow_flush():
+        script = _shadow_os.path.basename(
+            str(__import__("sys").argv[0] or "")
+        ).lower()
+
+        if script != "scanner_job.py":
+            return
+
+        try:
+            import shadow_tracker as _shadow
+
+            if not _shadow.init_shadow_database():
+                return
+
+            inserted = _shadow.record_shadow_batch(
+                _R1M_SHADOW_BUFFER
+            )
+            updated = _shadow.update_shadow_results("R1M")
+
+            print(
+                "R1M SHADOW POSTRUN:",
+                f"buffered={len(_R1M_SHADOW_BUFFER)}",
+                f"inserted={inserted}",
+                f"updated={updated}",
+                flush=True,
+            )
+
+        except Exception as _shadow_e:
+            print(
+                "R1M SHADOW POSTRUN ERROR:",
+                str(_shadow_e),
+                flush=True,
+            )
+
+    _shadow_atexit.register(_r1m_shadow_flush)
+
+except Exception as _shadow_setup_e:
+    print(
+        "R1M SHADOW SETUP ERROR:",
+        str(_shadow_setup_e),
         flush=True,
     )
