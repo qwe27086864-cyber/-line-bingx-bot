@@ -1,153 +1,130 @@
-"""Read-only R1/V6 paper-trading dashboard. Does not place orders or mutate data."""
+"""Read-only R1M vs R2 research dashboard. No order execution or database writes."""
 import os
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime, timezone
 from flask import Flask, Response, render_template_string, request
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# V6 paper sizing: 10 USDT margin x 8 leverage = 80 USDT notional.
-# V6 net_pct already includes configured round-trip fees and slippage.
-# Funding is not stored, so the derived U amount is an estimate.
-V6_NOTIONAL_USDT = 80.0
 app = Flask(__name__)
-PAGE = '''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60"><title>R1 / V6 交易研究儀表板</title><style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{background:#0c101a;color:#edf3ff;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans TC",sans-serif;margin:0}header,.wrap{max-width:1100px;margin:auto;padding:18px 14px}h1{font-size:24px;margin:0 0 8px}p,.muted{color:#9fb0ca;font-size:13px}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card,.panel{background:#151d2b;border:1px solid #2c3950;border-radius:14px;padding:15px}.label{font-size:12px;color:#9fb0ca}.num{font-size:24px;font-weight:750;overflow-wrap:anywhere;margin-top:5px}.green{color:#68e5ad}.red{color:#ff8b91}.grid{display:grid;grid-template-columns:1fr;gap:12px;margin-top:14px}h2{font-size:17px;margin:0 0 14px}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:12px}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid #2c3950;white-space:nowrap}th{color:#9fb0ca}a{color:#9ac4ff}select{background:#1d293a;border:1px solid #52627b;color:white;padding:9px;border-radius:9px}.tag{display:inline-block;border:1px solid #52627b;border-radius:25px;padding:5px 10px}.wrap{padding-top:0}details{max-width:340px}summary{cursor:pointer;color:#a6c7ff}pre{white-space:pre-wrap;word-break:break-word;font-size:11px}@media(min-width:800px){.cards{grid-template-columns:repeat(4,1fr)}.grid{grid-template-columns:repeat(2,1fr)}}
-</style></head><body><header><h1>交易研究儀表板</h1><p>SIMULATION ONLY · 唯讀 · 60 秒自動更新 · {{now}}</p><form method="get"><label>模擬版本　<select name="version" onchange="this.form.submit()"><option value="R1" {% if version=='R1' %}selected{% endif %}>R1</option><option value="V6" {% if version=='V6' %}selected{% endif %}>V6</option></select></label></form><p><span class="tag">非實盤</span> <span class="tag">{{version}}</span> <span class="tag">{{scope}}</span></p></header><div class="wrap"><div class="cards">{% for label,value,color in cards %}<div class="card"><div class="label">{{label}}</div><div class="num {{color}}">{{value}}</div></div>{% endfor %}</div><div class="grid">
-<section class="panel"><h2>目前持倉</h2><div class="scroll"><table><tr><th>幣種</th><th>方向</th><th>進場</th><th>分數</th><th>持倉時間</th><th>開倉 UTC</th></tr>{% for t in active %}<tr><td>{{t.symbol}}</td><td>{{t.side}}</td><td>{{fmt(t.entry_price,6)}}</td><td>{{t.score if t.score is not none else '—'}}</td><td>{{age(t.entry_time)}}</td><td>{{dt(t.entry_time)}}</td></tr>{% else %}<tr><td colspan="6">目前沒有持倉</td></tr>{% endfor %}</table></div></section>
-<section class="panel"><h2>TP 階段統計（新批次）</h2>
-<p>統計範圍：本批次全部 {{version}} 交易（包含持倉中）。旗標表示交易程式觀察到觸發，不等於逐筆成交紀錄。</p>
-<div class="cards">
-<div><div class="label">TP1 觸發</div><div class="num">{{tp_stats.tp1}}</div></div>
-<div><div class="label">TP2 觸發</div><div class="num">{{tp_stats.tp2}}</div></div>
-<div><div class="label">TP3 觸發</div><div class="num">{{tp_stats.tp3}}</div></div>
-<div><div class="label">有紀錄交易</div><div class="num">{{tp_stats.total}}</div></div>
-</div>
-<p class="muted">舊批次不納入。階段時間、各段實際平倉數量和分段獲利尚無完整事件紀錄，不能由旗標推算。</p>
-<p class="muted">{{'R1 實際 TP 旗標' if version=='R1' else 'V6 影子 TP 旗標（只觀察、不分批平倉）'}}；不代表逐筆成交。</p>
-</section>
-<section class="panel"><h2>最近 30 筆已平倉</h2><div class="scroll"><table><tr><th>幣種</th><th>方向</th><th>淨利 U</th><th>淨利 %</th><th>出場原因</th><th>診斷</th></tr>{% for t in recent %}<tr><td>{{t.symbol}}</td><td>{{t.side}}</td><td class="{{'green' if t.pnl_u is not none and t.pnl_u>=0 else 'red'}}">{{signed(t.pnl_u)}}</td><td>{{signed(t.net_pct)}}</td><td>{{t.exit_reason or '—'}}</td><td><details><summary>查看</summary><pre>進場評分：{{t.score if t.score is not none else '待收集'}}
-策略：{{t.strategy or '—'}}
-進場：{{dt(t.entry_time)}}
-平倉：{{dt(t.exit_time)}}
-最新觀察：{{dt(t.diagnostic.observed_at) if t.diagnostic else "待收集"}}
-觀察價：{{fmt(t.diagnostic.market_price,6) if t.diagnostic else "待收集"}}
-BTC 24h：{{signed(t.diagnostic.btc_change_24h) if t.diagnostic else "待收集"}}%
-ETH 24h：{{signed(t.diagnostic.eth_change_24h) if t.diagnostic else "待收集"}}%
-幣種 24h：{{signed(t.diagnostic.symbol_change_24h) if t.diagnostic else "待收集"}}%
-觀察快照：{{t.snapshot_count}} 筆
-影子追蹤：{% if t.shadows %}{% for sh in t.shadows %}{{sh.checkpoint_hours}}h: {{signed(sh.hold_vs_exit_pct)}}%（實際觀察 {{dt(sh.observed_at)}}）; {% endfor %}{% else %}待收集{% endif %}
-TP1：{{'已觸發' if t.tp1_hit else ('未觸發' if t.tp1_hit is not none else '待收集')}}（目標 {{fmt(t.tp1,6)}}）
-TP2：{{'已觸發' if t.tp2_hit else ('未觸發' if t.tp2_hit is not none else '待收集')}}（目標 {{fmt(t.tp2,6)}}）
-TP3：{{'已觸發' if t.tp3_hit else ('未觸發' if t.tp3_hit is not none else '待收集')}}（目標 {{fmt(t.tp3,6)}}）
-最高價：{{fmt(t.highest_price,6)}}
-最低價：{{fmt(t.lowest_price,6)}}
-進場理由：{{t.reasons if t.reasons else '待收集'}}
-市場環境分類：待收集（目前只有 BTC/ETH 24h 漲跌，不足以分類）</pre></details></td></tr>{% else %}<tr><td colspan="6">尚無平倉交易</td></tr>{% endfor %}</table></div></section>
-{% for heading,rows in groups %}<section class="panel"><h2>{{heading}}</h2><div class="scroll"><table><tr><th>分類</th><th>筆數</th><th>勝率</th><th>PF</th><th>淨利 U</th></tr>{% for g in rows %}<tr><td>{{g.name}}</td><td>{{g.n}}</td><td>{{'%.1f%%'|format(g.win_rate) if g.has_usdt else '待收集'}}</td><td>{{g.pf if g.has_usdt else '待收集'}}</td><td class="{{'green' if g.net>=0 else 'red'}}">{{signed(g.net) if g.has_usdt else '待收集'}}</td></tr>{% else %}<tr><td colspan="5">無資料</td></tr>{% endfor %}</table></div></section>{% endfor %}
-<section class="panel"><h2>診斷快照（最近 30 筆）</h2><div class="scroll"><table><tr><th>觀察 UTC</th><th>幣種</th><th>方向</th><th>狀態</th><th>浮動毛利 %</th><th>BTC 24h %</th><th>ETH 24h %</th><th>幣種 24h %</th><th>持倉分鐘</th></tr>{% for d in observations %}<tr><td>{{dt(d.observed_at)}}</td><td>{{d.symbol}}</td><td>{{d.side}}</td><td>{{d.status}}</td><td>{{signed(d.unrealized_gross_pct)}}</td><td>{{signed(d.btc_change_24h)}}</td><td>{{signed(d.eth_change_24h)}}</td><td>{{signed(d.symbol_change_24h)}}</td><td>{{fmt(d.holding_minutes,0)}}</td></tr>{% else %}<tr><td colspan="9">尚無診斷資料</td></tr>{% endfor %}</table></div></section><section class="panel"><h2>影子持倉（最近 30 筆）</h2><div class="scroll"><table><tr><th>幣種</th><th>觀察 UTC</th><th>平倉後</th><th>繼續持有差異 %</th></tr>{% for sh in shadow_rows %}<tr><td>{{sh.symbol}}</td><td>{{dt(sh.observed_at)}}</td><td>{{sh.checkpoint_hours}}h</td><td>{{signed(sh.hold_vs_exit_pct)}}</td></tr>{% else %}<tr><td colspan="4">尚無影子觀察</td></tr>{% endfor %}</table></div></section><section class="panel"><h2>診斷說明</h2><p>目前已接入持倉快照、BTC／ETH 與幣種 24h 漲跌、平倉後影子觀察。影子觀察價格是檢查當下價格，不保證精確等於平倉後 1/2/4 小時價格。</p><p class="muted">行情分類、錯失機會及小幣橫盤判斷仍待開發；V6 淨利 U 由 net_pct × 80 U / 100 估算，已含核心預設手續費與滑價；尚未計入資金費。</p></section>
-</div><p class="muted">R1 舊紀錄不刪除。{{note}} 模擬淨利只計已平倉交易；回撤不含未實現損益。V6 USDT 損益為依 10 U 保證金 × 8 倍槓桿換算的估算值，未計資金費；不是交易所實際結算金額。</p></div></body></html>'''
+VERSIONS = ('R1M', 'R2')
 
-def fmt(value, digits=2):
-    return '—' if value is None else f'{float(value):,.{digits}f}'
-def signed(value):
-    return '待收集' if value is None else f'{float(value):+.3f}'
+PAGE = r'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60"><title>R1M × R2 模擬研究儀表板</title><style>
+:root{color-scheme:dark;--bg:#0a101c;--panel:#141e2d;--line:#2a3a50;--muted:#9eafc7;--text:#e9f2ff;--a:#77b9ff;--good:#68e2b0;--bad:#ff9297}*{box-sizing:border-box}body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Noto Sans TC",sans-serif;margin:0}main,header{max-width:1250px;margin:auto;padding:18px 14px}header{padding-bottom:0}h1{font-size:24px;margin:0 0 8px}h2{font-size:18px;margin:0 0 13px}h3{font-size:15px;margin:0 0 10px}p,.muted{color:var(--muted);font-size:13px;line-height:1.65}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.pill{border:1px solid #3b526f;border-radius:20px;padding:5px 10px;color:#bed1eb;font-size:12px}.columns{display:grid;grid-template-columns:1fr;gap:15px}.panel,.metric{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:15px;min-width:0}.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:12px 0}.metric .name{font-size:12px;color:var(--muted)}.metric .value{font-size:21px;font-weight:750;margin-top:5px;overflow-wrap:anywhere}.good{color:var(--good)}.bad{color:var(--bad)}.section{margin-top:15px}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{color:var(--muted);font-weight:500}td.wrapcell{white-space:normal;min-width:150px}details summary{cursor:pointer;color:var(--a)}pre{font-size:11px;white-space:pre-wrap;word-break:break-word}select{background:#1c293c;border:1px solid #4a607e;border-radius:8px;color:white;padding:9px}a{color:var(--a)}.empty{color:var(--muted);font-size:13px}.note{border-left:3px solid #6a94cb;padding-left:10px}.headline{display:flex;justify-content:space-between;align-items:center;gap:10px}.kicker{color:var(--a);font-size:12px;font-weight:700;letter-spacing:.08em}@media(min-width:860px){.columns{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
+</style></head><body><header><h1>R1M × R2 交易研究儀表板</h1><div class="row"><span class="pill">PAPER ONLY</span><span class="pill">唯讀</span><span class="pill">每 60 秒更新</span><span class="pill">{{now}}</span></div><p>R1M：舊 R1 訊號 + 更貼近成交的進場；R2：獨立方向／微結構／成交評分核心。兩者只比較已平倉損益，持倉浮盈虧不包含在內。</p></header><main>
+<div class="panel"><div class="headline"><h2>雙核心總覽</h2><form method="get"><label class="muted">統計範圍 <select name="period" onchange="this.form.submit()"><option value="all" {% if period=='all' %}selected{% endif %}>全部</option><option value="24h" {% if period=='24h' %}selected{% endif %}>最近 24 小時</option><option value="7d" {% if period=='7d' %}selected{% endif %}>最近 7 天</option></select></label></form></div><div class="scroll"><table><tr><th>版本</th><th>總交易</th><th>已平倉</th><th>持倉</th><th>勝率</th><th>PF</th><th>已實現淨利</th><th>平均每單</th><th>最大已平倉回撤</th></tr>{% for v in versions %}{% set s=stats[v] %}<tr><td><strong>{{v}}</strong></td><td>{{s.total}}</td><td>{{s.closed_count}}</td><td>{{s.open_count}}</td><td>{{s.win_rate}}</td><td>{{s.pf}}</td><td class="{{'good' if s.net>=0 else 'bad'}}">{{money(s.net) if s.closed_count else '—'}}</td><td>{{money(s.avg) if s.closed_count else '—'}}</td><td>{{money(s.drawdown) if s.closed_count else '—'}}</td></tr>{% endfor %}</table></div></div>
+<div class="columns section">{% for v in versions %}{% set s=stats[v] %}<section class="panel"><div class="headline"><div><div class="kicker">{{v}} CORE</div><h2>{{'真實成交條件基準' if v=='R1M' else '新核心 · 執行感知'}}</h2></div><span class="pill">{{s.total}} 筆</span></div><div class="metrics"><div class="metric"><div class="name">勝率</div><div class="value">{{s.win_rate}}</div></div><div class="metric"><div class="name">PF</div><div class="value">{{s.pf}}</div></div><div class="metric"><div class="name">已實現淨利</div><div class="value {{'good' if s.net>=0 else 'bad'}}">{{money(s.net) if s.closed_count else '—'}}</div></div><div class="metric"><div class="name">已平倉 / 持倉</div><div class="value">{{s.closed_count}} / {{s.open_count}}</div></div><div class="metric"><div class="name">贏 / 輸 / 平</div><div class="value">{{s.wins}} / {{s.losses}} / {{s.flats}}</div></div><div class="metric"><div class="name">平均每筆淨利</div><div class="value">{{money(s.avg) if s.closed_count else '—'}}</div></div><div class="metric"><div class="name">TP1 / TP2 / TP3 觸發</div><div class="value">{{s.tp1}} / {{s.tp2}} / {{s.tp3}}</div></div><div class="metric"><div class="name">平均 Spread</div><div class="value">{{percent(s.avg_spread)}}</div></div><div class="metric"><div class="name">平均不利追價</div><div class="value">{{percent(s.avg_chase)}}</div></div></div>
+<p class="muted">Spread / 追價僅統計有對應診斷資料的進場，樣本 {{s.diagnostic_count}} 筆。R1M 為 signal→entry 方向性偏差；R2 為 chase_pct。正值代表不利。</p>
+<h3>目前持倉</h3><div class="scroll"><table><tr><th>幣種</th><th>方向</th><th>進場價</th><th>分數</th><th>持倉時間</th></tr>{% for t in s.active %}<tr><td>{{t.symbol}}</td><td>{{t.side}}</td><td>{{price(t.entry_price)}}</td><td>{{t.score if t.score is not none else '—'}}</td><td>{{age(t.signal_time)}}</td></tr>{% else %}<tr><td colspan="5" class="empty">目前沒有持倉</td></tr>{% endfor %}</table></div>
+<h3 class="section">最近 20 筆平倉</h3><div class="scroll"><table><tr><th>幣種</th><th>方向</th><th>淨利 U</th><th>淨利 %</th><th>出場</th><th>詳細</th></tr>{% for t in s.recent %}<tr><td>{{t.symbol}}</td><td>{{t.side}}</td><td class="{{'good' if t.sim_pnl_usdt is not none and t.sim_pnl_usdt>=0 else 'bad'}}">{{money(t.sim_pnl_usdt)}}</td><td>{{percent(t.net_result_pct)}}</td><td>{{t.exit_reason or '—'}}</td><td><details><summary>查看</summary><pre>進場時間 UTC：{{dt(t.signal_time)}}
+平倉時間 UTC：{{dt(t.closed_at)}}
+策略：{{t.strategy or '—'}}
+進場評分：{{t.score if t.score is not none else '—'}}
+進場價格：{{price(t.entry_price)}}
+出場價格：{{price(t.exit_price)}}
+TP1 / TP2 / TP3：{{t.tp1_hit}} / {{t.tp2_hit}} / {{t.tp3_hit}}
+最高 / 最低：{{price(t.highest_price)}} / {{price(t.lowest_price)}}
+進場理由：{{t.reasons or '—'}}
+{% if t.diag %}Spread：{{percent(t.diag.spread_pct)}}
+追價：{{percent(t.diag.chase_pct)}}
+訊號價：{{price(t.diag.signal_price)}}
+Bid / Ask：{{price(t.diag.bid_price)}} / {{price(t.diag.ask_price)}}
+{% endif %}</pre></details></td></tr>{% else %}<tr><td colspan="6" class="empty">尚無已平倉交易</td></tr>{% endfor %}</table></div>
+<h3 class="section">依方向 / 策略 / 出場原因</h3><div class="scroll"><table><tr><th>類別</th><th>筆數</th><th>勝率</th><th>PF</th><th>淨利 U</th></tr>{% for g in s.groups %}<tr><td>{{g.name}}</td><td>{{g.count}}</td><td>{{g.win_rate}}</td><td>{{g.pf}}</td><td class="{{'good' if g.net>=0 else 'bad'}}">{{money(g.net)}}</td></tr>{% else %}<tr><td colspan="5" class="empty">尚無分類數據</td></tr>{% endfor %}</table></div></section>{% endfor %}</div>
+<div class="columns section"><section class="panel"><h2>R1M 成交診斷（最近 30 筆）</h2><div class="scroll"><table><tr><th>時間 UTC</th><th>幣種</th><th>方向</th><th>訊號價</th><th>可成交價</th><th>Spread</th><th>不利追價</th><th>模式</th></tr>{% for d in r1m_diagnostics %}<tr><td>{{dt(d.created_at)}}</td><td>{{d.symbol}}</td><td>{{d.side}}</td><td>{{price(d.signal_price)}}</td><td>{{price(d.market_entry_price)}}</td><td>{{percent(d.spread_pct)}}</td><td>{{percent(d.signal_to_entry_pct)}}</td><td>{{d.entry_mode or '—'}}</td></tr>{% else %}<tr><td colspan="8" class="empty">尚無診斷資料</td></tr>{% endfor %}</table></div></section><section class="panel"><h2>R2 進場 / 拒絕統計</h2><div class="metrics"><div class="metric"><div class="name">已分析決策</div><div class="value">{{decision_total}}</div></div><div class="metric"><div class="name">實際進場</div><div class="value">{{decision_enter}}</div></div><div class="metric"><div class="name">拒絕 / 未進場</div><div class="value">{{decision_total-decision_enter}}</div></div></div><p class="muted">這是 R2 深度分析後記錄的決策數，不是所有市場掃描數；NO_SLOT / COOLDOWN / RISK_BLOCKED 也計入未進場。</p><div class="scroll"><table><tr><th>決策</th><th>次數</th></tr>{% for name,n in decision_counts %}<tr><td>{{name}}</td><td>{{n}}</td></tr>{% else %}<tr><td colspan="2" class="empty">尚無 R2 決策</td></tr>{% endfor %}</table></div></section></div>
+<section class="panel section"><h2>R2 最新 40 筆決策與分數</h2><div class="scroll"><table><tr><th>時間 UTC</th><th>幣種</th><th>方向</th><th>Regime</th><th>Direction</th><th>Micro</th><th>Execution</th><th>Forward</th><th>Spread</th><th>追價</th><th>決策</th><th>原因</th></tr>{% for d in decisions %}<tr><td>{{dt(d.observed_at)}}</td><td>{{d.symbol}}</td><td>{{d.side}}</td><td>{{d.regime}}</td><td>{{number(d.direction_score)}}</td><td>{{number(d.micro_score)}}</td><td>{{number(d.execution_score)}}</td><td>{{number(d.forward_score)}}</td><td>{{percent(d.spread_pct)}}</td><td>{{percent(d.chase_pct)}}</td><td>{{d.decision}}</td><td class="wrapcell">{{d.reason or '—'}}</td></tr>{% else %}<tr><td colspan="12" class="empty">等待 R2 下一輪深度分析</td></tr>{% endfor %}</table></div></section>
+<p class="note">說明：R2 Forward Score 是規則分數，不是經過校準的上漲機率。模擬損益依資料庫已記錄的 sim_pnl_usdt，含程式預設交易成本假設，不代表交易所實際結算；資金費未完整計入。PF = 正獲利總和 ÷ 虧損絕對值總和。最大回撤只依已平倉結果計算。所有資料唯讀，不會下單。</p>
+</main></body></html>'''
+
+def money(value):
+    return '—' if value is None else f'{float(value):+.3f} U'
+
+def percent(value):
+    return '—' if value is None else f'{float(value):+.2f}%'
+
+def number(value):
+    return '—' if value is None else f'{float(value):.1f}'
+
+def price(value):
+    if value is None: return '—'
+    v = float(value)
+    return f'{v:.8f}'.rstrip('0').rstrip('.') if abs(v) < 1 else f'{v:.6f}'.rstrip('0').rstrip('.')
+
 def dt(value):
     return value.strftime('%m/%d %H:%M') if value else '—'
-def age(value):
-    if not value:return '—'
-    minutes=max(0,int((datetime.now(timezone.utc)-value).total_seconds()//60))
-    return f'{minutes//60}h {minutes%60}m'
-def group_stats(trades, key):
-    bins=defaultdict(list)
-    for t in trades:bins[str(key(t) or 'UNKNOWN')].append(t)
-    rows=[]
-    for name,items in bins.items():
-        pnl=[float(t['pnl_u']) for t in items if t['pnl_u'] is not None]
-        gains=sum(max(0,x) for x in pnl);losses=-sum(min(0,x) for x in pnl)
-        rows.append(dict(name=name,n=len(items),has_usdt=len(pnl)==len(items),win_rate=100*sum(x>0 for x in pnl)/len(pnl) if pnl else 0,pf=f'{gains/losses:.2f}' if losses else ('∞' if gains else '—'),net=sum(pnl)))
-    return sorted(rows,key=lambda x:(-x['n'],x['name']))[:30]
 
-def normalize(row,version):
-    d=dict(row)
-    if version=='R1':
-        return dict(id=d['id'],symbol=d['symbol'],side=d['side'],strategy=d['strategy'],score=d['score'],entry_price=d['entry_price'],entry_time=d['signal_time'],exit_time=d['closed_at'],status='OPEN' if d['status']=='OPEN' else 'CLOSED',exit_reason=d['exit_reason'],pnl_u=float(d['sim_pnl_usdt']) if d['sim_pnl_usdt'] is not None else None,net_pct=d['net_result_pct'],highest_price=d.get('highest_price'),lowest_price=d.get('lowest_price'),reasons=d.get('reasons'),tp1_hit=d.get('tp1_hit'),tp2_hit=d.get('tp2_hit'),tp3_hit=d.get('tp3_hit'),tp1=d.get('tp1'),tp2=d.get('tp2'),tp3=d.get('tp3'),diagnostic=None,snapshot_count=0,shadows=[])
-    return dict(id=d['id'],symbol=d['symbol'],side=d['side'],strategy=d['strategy'],score=d['score'],entry_price=d['entry_price'],entry_time=d['entry_time'],exit_time=d['exit_time'],status=d['status'],exit_reason=d['exit_reason'],pnl_u=(float(d['net_pct']) * V6_NOTIONAL_USDT / 100.0 if d['status']=='CLOSED' and d['net_pct'] is not None else None),net_pct=d['net_pct'],highest_price=d['highest_price'],lowest_price=d['lowest_price'],reasons=d['reasons'],tp1_hit=d.get('shadow_tp1_hit'),tp2_hit=d.get('shadow_tp2_hit'),tp3_hit=d.get('shadow_tp3_hit'),tp1=2.0,tp2=4.0,tp3=8.0,diagnostic=None,snapshot_count=0,shadows=[])
+def age(value):
+    if not value: return '—'
+    minutes = max(0, int((datetime.now(timezone.utc) - value).total_seconds() // 60))
+    return f'{minutes // 60}h {minutes % 60}m'
+
+def stats_for(trades):
+    active = [t for t in trades if t['status'] == 'OPEN']
+    closed = sorted([t for t in trades if t['status'] != 'OPEN' and t['closed_at'] is not None], key=lambda t:(t['closed_at'],t['id']))
+    pnl = [float(t['sim_pnl_usdt']) for t in closed if t['sim_pnl_usdt'] is not None]
+    gains = sum(max(0,x) for x in pnl)
+    losses_abs = -sum(min(0,x) for x in pnl)
+    net = sum(pnl)
+    bal=1000.0;peak=bal;dd=0.0
+    for t in closed:
+        if t['sim_pnl_usdt'] is None: continue
+        bal += float(t['sim_pnl_usdt'])
+        peak=max(peak,bal)
+        dd=max(dd,peak-bal)
+    diagnostics=[t['diag'] for t in trades if t.get('diag')]
+    spreads=[float(d['spread_pct']) for d in diagnostics if d['spread_pct'] is not None]
+    chases=[float(d['chase_pct']) for d in diagnostics if d['chase_pct'] is not None]
+    groups=[]
+    for label, key in [('方向','side'),('策略','strategy'),('出場','exit_reason')]:
+        buckets=defaultdict(list)
+        for t in closed:
+            if t['sim_pnl_usdt'] is not None: buckets[f'{label} · {t.get(key) or "UNKNOWN"}'].append(float(t['sim_pnl_usdt']))
+        for name,values in buckets.items():
+            gp=sum(max(0,x) for x in values);gl=-sum(min(0,x) for x in values)
+            groups.append(dict(name=name,count=len(values),win_rate=f'{sum(x>0 for x in values)/len(values)*100:.1f}%',pf=f'{gp/gl:.2f}' if gl else ('∞' if gp else '—'),net=sum(values)))
+    groups.sort(key=lambda g:(-g['count'],g['name']))
+    return dict(total=len(trades),open_count=len(active),closed_count=len(closed),wins=sum(x>0 for x in pnl),losses=sum(x<0 for x in pnl),flats=sum(x==0 for x in pnl),win_rate=f'{sum(x>0 for x in pnl)/len(pnl)*100:.1f}%' if pnl else '—',pf=f'{gains/losses_abs:.2f}' if losses_abs else ('∞' if gains else '—'),net=net,avg=net/len(pnl) if pnl else 0,drawdown=dd,tp1=sum(t['tp1_hit'] is True for t in trades),tp2=sum(t['tp2_hit'] is True for t in trades),tp3=sum(t['tp3_hit'] is True for t in trades),avg_spread=sum(spreads)/len(spreads) if spreads else None,avg_chase=sum(chases)/len(chases) if chases else None,diagnostic_count=len(diagnostics),active=sorted(active,key=lambda t:t['signal_time'],reverse=True),recent=list(reversed(closed))[:20],groups=groups[:35])
+
+@app.get('/health')
+def health():
+    return {'status':'ok','mode':'read_only','versions':list(VERSIONS)}
 
 @app.get('/')
 def home():
-    if os.environ.get('LIVE_TRADING','false').lower()!='false':return Response('Simulation-only dashboard',status=503)
-    url=os.environ.get('DATABASE_URL','')
-    if not url:return Response('DATABASE_URL is missing',status=503)
-    version=request.args.get('version','R1')
-    if version not in ('R1','V6'):version='R1'
-    # Optional UTC start time, shared by both versions; never delete earlier records.
-    start=os.environ.get('COMPARE_START_UTC','').strip()
-    cutoff=None
-    if start:
-        try:
-            cutoff=datetime.fromisoformat(start.replace('Z','+00:00'))
-            if cutoff.tzinfo is None:raise ValueError('timezone required')
-        except ValueError:return Response('Invalid COMPARE_START_UTC: use ISO8601 UTC',status=503)
+    if os.getenv('LIVE_TRADING','false').lower() != 'false':
+        return Response('Read-only dashboard requires LIVE_TRADING=false',status=503)
+    url=os.getenv('DATABASE_URL','')
+    if not url: return Response('DATABASE_URL is missing',status=503)
+    period=request.args.get('period','all')
+    if period not in ('all','24h','7d'): period='all'
+    interval={'all':None,'24h':'24 hours','7d':'7 days'}[period]
     try:
         with psycopg2.connect(url,sslmode='require',connect_timeout=8) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute('SET TRANSACTION READ ONLY')
-                if version=='R1':
-                    cur.execute('''SELECT id,symbol,side,strategy,score,entry_price,signal_time,closed_at,status,exit_reason,sim_pnl_usdt,net_result_pct,reasons,highest_price,lowest_price,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit FROM scanner_trades WHERE engine_version=%s AND (%s::timestamptz IS NULL OR signal_time >= %s::timestamptz) ORDER BY id DESC LIMIT 20000''',('V4.2R1',cutoff,cutoff))
-                else:
-                    cur.execute('''SELECT id,symbol,side,strategy,score,entry_price,entry_time,exit_time,status,exit_reason,net_pct,highest_price,lowest_price,reasons,shadow_tp1_hit,shadow_tp2_hit,shadow_tp3_hit FROM v6_paper_trades WHERE (%s::timestamptz IS NULL OR entry_time >= %s::timestamptz) ORDER BY id DESC LIMIT 20000''',(cutoff,cutoff))
-                trades=[normalize(r,version) for r in cur.fetchall()]
-                observations=[];shadow_rows=[]
-                # Separate read-only diagnostic tables; missing tables are treated as not-yet-collected.
-                cur.execute('SAVEPOINT diagnostic_read')
-                try:
-                    cur.execute('''SELECT version,trade_id,observed_at,symbol,side,status,market_price,
-                        unrealized_gross_pct,btc_change_24h,eth_change_24h,symbol_change_24h,
-                        holding_minutes FROM dual_trade_diagnostics
-                        WHERE version=%s AND (%s::timestamptz IS NULL OR entry_time >= %s::timestamptz)
-                        ORDER BY observed_at DESC LIMIT 10000''',(version,cutoff,cutoff))
-                    rows=cur.fetchall()
-                    latest={};counts=defaultdict(int)
-                    for d in rows:
-                        tid=d['trade_id'];counts[tid]+=1
-                        if tid not in latest:latest[tid]=dict(d)
-                    observations=rows[:30]
-                    cur.execute('''SELECT sh.trade_id,sh.checkpoint_hours,sh.observed_at,
-                        sh.hold_vs_exit_pct,t.symbol FROM dual_shadow_observations sh
-                        JOIN dual_trade_diagnostics t ON t.version=sh.version AND t.trade_id=sh.trade_id
-                        WHERE sh.version=%s AND (%s::timestamptz IS NULL OR t.entry_time >= %s::timestamptz)
-                        GROUP BY sh.trade_id,sh.checkpoint_hours,sh.observed_at,sh.hold_vs_exit_pct,t.symbol
-                        ORDER BY sh.observed_at DESC LIMIT 200''',(version,cutoff,cutoff))
-                    all_shadows=cur.fetchall();shadow_rows=all_shadows[:30]
-                    shadows=defaultdict(list)
-                    for sh in all_shadows:shadows[sh['trade_id']].append(dict(sh))
-                    for t in trades:
-                        t['diagnostic']=latest.get(t['id'])
-                        t['snapshot_count']=counts[t['id']]
-                        t['shadows']=shadows[t['id']]
-                except psycopg2.Error:
-                    cur.execute('ROLLBACK TO SAVEPOINT diagnostic_read')
-                    app.logger.warning('Diagnostic tables unavailable; dashboard will show pending diagnostics')
-                finally:
-                    cur.execute('RELEASE SAVEPOINT diagnostic_read')
+                cur.execute('''SELECT id,symbol,side,signal_time,entry_price,score,strategy,status,exit_reason,closed_at,exit_price,sim_pnl_usdt,net_result_pct,reasons,highest_price,lowest_price,tp1_hit,tp2_hit,tp3_hit,engine_version FROM scanner_trades WHERE engine_version IN ('R1M','R2') AND (%s::text IS NULL OR signal_time >= NOW() - (%s::text)::interval) ORDER BY signal_time DESC LIMIT 25000''',(interval,interval))
+                rows=[dict(x) for x in cur.fetchall()]
+                cur.execute('''SELECT trade_id,symbol,side,signal_price,market_entry_price,bid_price,ask_price,spread_pct,signal_to_entry_pct,entry_mode,created_at FROM r1m_entry_diagnostics WHERE (%s::text IS NULL OR created_at >= NOW() - (%s::text)::interval) ORDER BY created_at DESC LIMIT 25000''',(interval,interval))
+                r1m_diagnostics=[dict(x) for x in cur.fetchall()]
+                cur.execute('''SELECT id,observed_at,symbol,side,regime,direction_score,micro_score,execution_score,forward_score,signal_price,bid_price,ask_price,market_entry_price,spread_pct,chase_pct,decision,reason,scanner_trade_id FROM r2_decisions WHERE (%s::text IS NULL OR observed_at >= NOW() - (%s::text)::interval) ORDER BY observed_at DESC LIMIT 25000''',(interval,interval))
+                all_decisions=[dict(x) for x in cur.fetchall()]
     except psycopg2.Error:
-        app.logger.exception('Dashboard read query failed')
-        return Response('資料庫查詢失敗，請確認 R1/V6 資料表存在',status=503)
-    tp_stats=dict(total=len(trades),tp1=sum(t['tp1_hit'] is True for t in trades),tp2=sum(t['tp2_hit'] is True for t in trades),tp3=sum(t['tp3_hit'] is True for t in trades))
-    active=[t for t in trades if t['status']=='OPEN']
-    closed=[t for t in trades if t['status']=='CLOSED' and t['exit_time'] is not None]
-    closed.sort(key=lambda t:(t['exit_time'],t['id']),reverse=True)
-    pnl=[t['pnl_u'] for t in closed if t['pnl_u'] is not None]
-    complete=bool(pnl) and len(pnl)==len(closed)
-    gains=sum(max(0,p) for p in pnl);losses=-sum(min(0,p) for p in pnl);net=sum(pnl)
-    balance=1000;peak=1000;dd=0
-    for t in reversed(closed):
-        if t['pnl_u'] is None:continue
-        balance+=t['pnl_u'];peak=max(peak,balance);dd=max(dd,peak-balance)
-    pf=f'{gains/losses:.2f}' if losses else ('∞' if gains else '—')
-    cards=[('已平倉',str(len(closed)),''),('目前持倉',str(len(active)),''),('勝率',f'{100*sum(x>0 for x in pnl)/len(pnl):.2f}%' if complete else '待收集',''),('PF',pf if complete else '待收集',''),('累計淨利 U',f'{net:+.2f} U' if complete else '待收集','green' if net>=0 else 'red'),('模擬帳面起始 1000 U',f'{1000+net:.2f} U' if complete else '待收集',''),('已實現 ROI',f'{net/10:+.2f}%' if complete else '待收集',''),('最大已平倉回撤',f'{dd:.2f} U' if complete else '待收集','red'),('贏 / 輸',f'{sum(x>0 for x in pnl)} / {sum(x<=0 for x in pnl)}' if complete else '待收集',''),('平均淨利/單',f'{net/len(pnl):+.3f} U' if complete else '待收集','')]
-    groups=[('依方向',group_stats(closed,lambda t:t['side'])),('依策略',group_stats(closed,lambda t:t['strategy'])),('依出場原因',group_stats(closed,lambda t:t['exit_reason'])),('依幣種',group_stats(closed,lambda t:t['symbol'])),('依進場評分',group_stats(closed,lambda t:'90+' if (t['score'] or 0)>=90 else ('85–89' if (t['score'] or 0)>=85 else '<85')))]
-    return render_template_string(PAGE,version=version,scope='同期新批次' if cutoff else '現有全部模擬紀錄',note='共同起跑時間尚未設定；目前顯示各版本既有資料。' if not cutoff else f'共同起跑 UTC：{cutoff.isoformat()}',now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),cards=cards,active=active,recent=closed[:30],groups=groups,observations=observations,shadow_rows=shadow_rows,tp_stats=tp_stats,fmt=fmt,dt=dt,age=age,signed=signed)
+        app.logger.exception('Dashboard read failed')
+        return Response('資料庫查詢失敗：請檢查 DATABASE_URL 與資料表',status=503)
+    by_version={v:[] for v in VERSIONS}
+    r1m_by_id={d['trade_id']:d for d in r1m_diagnostics}
+    r2_by_id={}
+    for d in all_decisions:
+        if d['scanner_trade_id'] is not None:
+            r2_by_id.setdefault(d['scanner_trade_id'], d)
+    for t in rows:
+        v=t['engine_version']
+        d=r1m_by_id.get(t['id']) if v=='R1M' else r2_by_id.get(t['id'])
+        t['diag']={'spread_pct':d.get('spread_pct'),'chase_pct':d.get('signal_to_entry_pct') if v=='R1M' else d.get('chase_pct'),'signal_price':d.get('signal_price'),'bid_price':d.get('bid_price'),'ask_price':d.get('ask_price')} if d else None
+        by_version[v].append(t)
+    stats={v:stats_for(by_version[v]) for v in VERSIONS}
+    counts=Counter(d['decision'] for d in all_decisions)
+    return render_template_string(PAGE,versions=VERSIONS,stats=stats,period=period,now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),r1m_diagnostics=r1m_diagnostics[:30],decisions=all_decisions[:40],decision_total=len(all_decisions),decision_enter=counts.get('ENTER',0),decision_counts=counts.most_common(),money=money,percent=percent,number=number,price=price,dt=dt,age=age)
 
-if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.environ.get('PORT','10000')))
+if __name__ == '__main__':
+    app.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')))
