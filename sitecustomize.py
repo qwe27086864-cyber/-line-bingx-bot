@@ -28,7 +28,7 @@ else:
     # Isolate this run from the historical V4.2R1 paper data.
     # ------------------------------------------------------------------
     _app.SCANNER_ENGINE_VERSION = "R1M"
-    _app.SCANNER_MAX_OPEN = 3
+    _app.SCANNER_MAX_OPEN = 30
     _app.SCANNER_MAX_NEW_PER_SCAN = 3
 
     # Explicitly force paper-only behavior for this simulation service.
