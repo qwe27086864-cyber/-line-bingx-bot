@@ -13,6 +13,7 @@ from app import (
     scanner_open_count,
     scanner_can_open,
     scanner_risk_allows_new_trade,
+    r1_live_risk_allows_new_trade,
     create_simulated_trade,
     update_simulated_trades,
     init_r1_live_database,
@@ -646,10 +647,11 @@ def run_fast_radar():
     except Exception as e:
         print("TREND EXIT MANAGER ERROR:", str(e), flush=True)
 
-    # 3. Simulation keeps its historical risk gate. Live mode deliberately does
-    # not inherit the simulation daily-loss/loss-streak gate.
+    # 3. Live and paper now both enforce daily-loss / consecutive-loss safety.
+    # Live uses authoritative BingX income records (realized PnL + trading fees
+    # + funding) and fails closed while a recent settlement is still pending.
     if R1_LIVE_TRADING:
-        allow_new, risk_reason = True, "LIVE_R1_NO_SIM_DAILY_STOP"
+        allow_new, risk_reason = r1_live_risk_allows_new_trade()
     else:
         allow_new, risk_reason = scanner_risk_allows_new_trade()
 

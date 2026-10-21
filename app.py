@@ -92,6 +92,10 @@ R1_TP2_SHARE = 40.0
 R1_TP3_SHARE = 25.0
 R1_MONITOR_SEC = int(os.environ.get("R1_MONITOR_SEC", "5"))
 R1_MAX_CHASE_PCT = float(os.environ.get("R1_MAX_CHASE_PCT", "0.75"))
+R1_DAILY_MAX_LOSS_USDT = float(os.environ.get("R1_DAILY_MAX_LOSS_USDT", str(SIM_DAILY_MAX_LOSS_USDT)))
+R1_MAX_CONSECUTIVE_LOSSES = int(os.environ.get("R1_MAX_CONSECUTIVE_LOSSES", str(SIM_MAX_CONSECUTIVE_LOSSES)))
+R1_PAUSE_HOURS_AFTER_STREAK = int(os.environ.get("R1_PAUSE_HOURS_AFTER_STREAK", str(SIM_PAUSE_HOURS_AFTER_STREAK)))
+R1_LIVE_COHORT_START_UTC = os.environ.get("R1_LIVE_COHORT_START_UTC", "2026-10-21T07:00:00Z")
 R1_LIVE_MONITOR = os.environ.get(
     "R1_LIVE_MONITOR", "true" if R1_LIVE_TRADING else "false"
 ).strip().lower() == "true"
@@ -340,7 +344,10 @@ def bingx_private_request(method, path, params=None):
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
-    if method == "GET":
+    if method in ("GET", "DELETE"):
+        # BingX authenticated GET/DELETE endpoints read signed parameters from
+        # the query string. Sending DELETE parameters in the body causes the
+        # exchange to report required fields such as symbol/timestamp missing.
         url = BINGX_BASE_URL + path + "?" + signed
         data = None
     else:
@@ -1615,7 +1622,9 @@ def init_r1_live_database():
                 signal_time TIMESTAMPTZ DEFAULT NOW(),
                 entry_client_id VARCHAR(64) UNIQUE NOT NULL,
                 entry_order_id VARCHAR(80),
+                exit_order_id VARCHAR(80),
                 entry_price DOUBLE PRECISION,
+                exit_price DOUBLE PRECISION,
                 signal_price DOUBLE PRECISION,
                 fresh_price DOUBLE PRECISION,
                 chase_pct DOUBLE PRECISION,
@@ -1648,6 +1657,14 @@ def init_r1_live_database():
                 status VARCHAR(30) NOT NULL DEFAULT 'ENTRY_PENDING',
                 exit_reason VARCHAR(40),
                 exit_detail TEXT,
+                realized_pnl_usdt DOUBLE PRECISION,
+                trading_fee_usdt DOUBLE PRECISION,
+                funding_fee_usdt DOUBLE PRECISION,
+                net_pnl_usdt DOUBLE PRECISION,
+                settlement_status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                settlement_synced_at TIMESTAMPTZ,
+                settlement_error TEXT,
+                income_record_count INTEGER DEFAULT 0,
                 last_checked_at TIMESTAMPTZ,
                 closed_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT NOW()
@@ -1660,6 +1677,16 @@ def init_r1_live_database():
         cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS fresh_price DOUBLE PRECISION;")
         cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS chase_pct DOUBLE PRECISION;")
         cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS entry_mode VARCHAR(20);")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS exit_order_id VARCHAR(80);")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS realized_pnl_usdt DOUBLE PRECISION;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS trading_fee_usdt DOUBLE PRECISION;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS funding_fee_usdt DOUBLE PRECISION;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS net_pnl_usdt DOUBLE PRECISION;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS settlement_status VARCHAR(20) NOT NULL DEFAULT 'PENDING';")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS settlement_synced_at TIMESTAMPTZ;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS settlement_error TEXT;")
+        cur.execute("ALTER TABLE r1_live_trades ADD COLUMN IF NOT EXISTS income_record_count INTEGER DEFAULT 0;")
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_r1_live_open
@@ -2072,12 +2099,15 @@ def _r1_persist_fields(trade_id, **fields):
     if not fields:
         return
     allowed = {
-        "entry_order_id", "entry_price", "quantity", "remaining_qty",
-        "quantity_precision", "price_precision", "tp1", "tp2", "tp3", "sl",
+        "entry_order_id", "exit_order_id", "entry_price", "exit_price",
+        "quantity", "remaining_qty", "quantity_precision", "price_precision",
+        "tp1", "tp2", "tp3", "sl",
         "tp1_qty", "tp2_qty", "tp3_qty", "tp1_order_id", "tp2_order_id",
         "tp3_order_id", "sl_order_id", "stop_stage", "tp1_hit", "tp2_hit",
         "tp3_hit", "sl_hit", "highest_price", "lowest_price", "status",
-        "exit_reason", "exit_detail",
+        "exit_reason", "exit_detail", "realized_pnl_usdt", "trading_fee_usdt",
+        "funding_fee_usdt", "net_pnl_usdt", "settlement_status",
+        "settlement_synced_at", "settlement_error", "income_record_count",
     }
     bad = set(fields) - allowed
     if bad:
@@ -2630,6 +2660,266 @@ def r1_cancel_all_exit_orders(symbol, order_ids):
         _r1_cancel_best_effort(symbol, oid)
 
 
+def _r1_income_records(symbol, start_ms, end_ms):
+    """Read actual BingX perpetual fund-flow records for one R1 trade window."""
+    result = _r1_private_request(
+        "GET",
+        "/openApi/swap/v2/user/income",
+        {
+            "symbol": symbol,
+            "startTime": int(start_ms),
+            "endTime": int(end_ms),
+            "limit": 1000,
+        },
+    )
+    if result.get("code") != 0:
+        raise RuntimeError(f"R1 income query failed: {result}")
+    data = result.get("data", [])
+    if isinstance(data, dict):
+        data = data.get("income", data.get("rows", data.get("data", [])))
+    return data if isinstance(data, list) else []
+
+
+def _r1_weighted_exit_price(symbol, order_ids):
+    """Weighted average fill price across known R1 closing orders."""
+    seen = set()
+    total_qty = 0.0
+    total_value = 0.0
+    for oid in order_ids:
+        if not oid or str(oid) in seen:
+            continue
+        seen.add(str(oid))
+        result = _r1_query_order_safe(symbol, order_id=oid)
+        if not result:
+            continue
+        qty = _r1_order_executed_qty(result)
+        px = _r1_order_avg_price(result)
+        if qty > 0 and px > 0:
+            total_qty += qty
+            total_value += qty * px
+    return (total_value / total_qty) if total_qty > 0 else None
+
+
+def r1_sync_live_settlements(limit=100):
+    """Backfill actual realized PnL, fees, funding and exit fill for closed R1 trades.
+
+    The income endpoint is authoritative for cash PnL. A trade remains PENDING
+    when BingX has not published its close-side income yet; risk control then
+    fails closed instead of opening new positions with unknown recent losses.
+    """
+    init_r1_live_database()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT id,symbol,signal_time,created_at,closed_at,
+                   tp1_order_id,tp2_order_id,tp3_order_id,sl_order_id,exit_order_id
+            FROM r1_live_trades
+            WHERE status='CLOSED'
+              AND signal_time >= %s::timestamptz
+              AND COALESCE(settlement_status,'PENDING') <> 'SETTLED'
+            ORDER BY closed_at ASC NULLS LAST, id ASC
+            LIMIT %s;
+            """,
+            (R1_LIVE_COHORT_START_UTC, int(limit)),
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+
+    settled = 0
+    pending = 0
+    errors = 0
+    for (
+        trade_id, symbol, signal_time, created_at, closed_at,
+        tp1_oid, tp2_oid, tp3_oid, sl_oid, exit_oid,
+    ) in rows:
+        if not closed_at:
+            pending += 1
+            continue
+        try:
+            # Include the entry fee and any funding paid during the position.
+            start_dt = signal_time or created_at
+            if start_dt is None:
+                raise RuntimeError("missing trade start time")
+            start_ms = int(start_dt.timestamp() * 1000) - 60000
+            end_ms = int(closed_at.timestamp() * 1000) + 90000
+            records = _r1_income_records(symbol, start_ms, end_ms)
+
+            realized = 0.0
+            trading_fee = 0.0
+            funding_fee = 0.0
+            realized_seen = False
+            trading_fee_seen = False
+            used = 0
+            for item in records:
+                if str(item.get("symbol", symbol)).upper() != str(symbol).upper():
+                    continue
+                ts = int(_r1_float(item.get("time", 0)))
+                if ts and not (start_ms <= ts <= end_ms):
+                    continue
+                kind = str(item.get("incomeType", "")).upper()
+                amount = _r1_float(item.get("income", 0))
+                if kind == "REALIZED_PNL":
+                    realized += amount
+                    realized_seen = True
+                    used += 1
+                elif kind == "TRADING_FEE":
+                    trading_fee += amount
+                    trading_fee_seen = True
+                    used += 1
+                elif kind == "FUNDING_FEE":
+                    funding_fee += amount
+                    used += 1
+
+            # BingX fund flow may lag the order close by a few seconds. Do not
+            # invent zero PnL; keep it pending and retry on the next cron pass.
+            if not realized_seen or not trading_fee_seen:
+                pending += 1
+                _r1_persist_fields(
+                    trade_id,
+                    settlement_status="PENDING",
+                    settlement_error=(
+                        f"income not complete yet: realized={realized_seen} "
+                        f"trading_fee={trading_fee_seen} records={len(records)}"
+                    ),
+                    income_record_count=used,
+                )
+                continue
+
+            exit_price = _r1_weighted_exit_price(
+                symbol, [tp1_oid, tp2_oid, tp3_oid, sl_oid, exit_oid]
+            )
+            net = realized + trading_fee + funding_fee
+            fields = {
+                "realized_pnl_usdt": realized,
+                "trading_fee_usdt": trading_fee,
+                "funding_fee_usdt": funding_fee,
+                "net_pnl_usdt": net,
+                "settlement_status": "SETTLED",
+                "settlement_synced_at": "NOW_SENTINEL",
+                "settlement_error": None,
+                "income_record_count": used,
+            }
+            if exit_price is not None:
+                fields["exit_price"] = exit_price
+
+            # settlement_synced_at=NOW() cannot go through the generic value
+            # updater without becoming a string, so persist the numeric fields
+            # first and stamp synchronization separately.
+            fields.pop("settlement_synced_at")
+            _r1_persist_fields(trade_id, **fields)
+            conn = get_db_connection(); cur = conn.cursor()
+            try:
+                cur.execute(
+                    "UPDATE r1_live_trades SET settlement_synced_at=NOW() WHERE id=%s;",
+                    (trade_id,),
+                )
+                conn.commit()
+            finally:
+                cur.close(); conn.close()
+            settled += 1
+            print(
+                "R1 SETTLED:", trade_id, symbol,
+                f"realized={realized:.6f}U", f"fees={trading_fee:.6f}U",
+                f"funding={funding_fee:.6f}U", f"net={net:.6f}U",
+                f"exit={exit_price if exit_price is not None else '-'}",
+                flush=True,
+            )
+        except Exception as e:
+            errors += 1
+            try:
+                _r1_persist_fields(
+                    trade_id,
+                    settlement_status="RETRY",
+                    settlement_error=str(e)[:1000],
+                )
+            except Exception:
+                pass
+            print("R1 SETTLEMENT ERROR:", trade_id, symbol, str(e), flush=True)
+
+    return {"settled": settled, "pending": pending, "errors": errors}
+
+
+def r1_live_risk_allows_new_trade():
+    """Live equivalent of the paper daily-loss and consecutive-loss gate."""
+    if R1_MAX_OPEN <= 0:
+        return False, "R1_MAX_OPEN_0"
+
+    sync = r1_sync_live_settlements(limit=100)
+    if sync.get("errors"):
+        return False, f"SETTLEMENT_SYNC_ERROR {sync['errors']}"
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Fail closed if any newly closed trade has not received authoritative
+        # BingX settlement yet. This avoids continuing after an unknown loss.
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM r1_live_trades
+            WHERE status='CLOSED'
+              AND signal_time >= %s::timestamptz
+              AND COALESCE(settlement_status,'PENDING') <> 'SETTLED';
+            """,
+            (R1_LIVE_COHORT_START_UTC,),
+        )
+        unsettled = int(cur.fetchone()[0] or 0)
+        if unsettled:
+            return False, f"SETTLEMENT_PENDING {unsettled}"
+
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(net_pnl_usdt),0)
+            FROM r1_live_trades
+            WHERE status='CLOSED'
+              AND settlement_status='SETTLED'
+              AND signal_time >= %s::timestamptz
+              AND closed_at >= DATE_TRUNC('day', NOW());
+            """,
+            (R1_LIVE_COHORT_START_UTC,),
+        )
+        daily_pnl = float(cur.fetchone()[0] or 0)
+        if daily_pnl <= -abs(R1_DAILY_MAX_LOSS_USDT):
+            return False, f"LIVE_DAILY_LOSS_LIMIT {daily_pnl:.2f}U"
+
+        cur.execute(
+            """
+            SELECT net_pnl_usdt, closed_at
+            FROM r1_live_trades
+            WHERE status='CLOSED'
+              AND settlement_status='SETTLED'
+              AND signal_time >= %s::timestamptz
+              AND net_pnl_usdt IS NOT NULL
+            ORDER BY closed_at DESC, id DESC
+            LIMIT %s;
+            """,
+            (R1_LIVE_COHORT_START_UTC, max(R1_MAX_CONSECUTIVE_LOSSES, 1)),
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+
+    streak = 0
+    most_recent_loss_time = None
+    for pnl, closed_at in rows:
+        if float(pnl or 0) < 0:
+            streak += 1
+            if most_recent_loss_time is None:
+                most_recent_loss_time = closed_at
+        else:
+            break
+
+    if streak >= R1_MAX_CONSECUTIVE_LOSSES and most_recent_loss_time is not None:
+        elapsed = time.time() - most_recent_loss_time.timestamp()
+        if elapsed < R1_PAUSE_HOURS_AFTER_STREAK * 3600:
+            return False, f"LIVE_LOSS_STREAK_PAUSE {streak}"
+
+    return True, f"OK daily={daily_pnl:.2f}U streak={streak}"
+
+
 def r1_mark_closed(trade_id, reason, detail=""):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -2638,7 +2928,9 @@ def r1_mark_closed(trade_id, reason, detail=""):
             """
             UPDATE r1_live_trades
             SET status='CLOSED', exit_reason=%s, exit_detail=%s,
-                remaining_qty=0, last_checked_at=NOW(), closed_at=NOW()
+                remaining_qty=0, settlement_status='PENDING',
+                settlement_synced_at=NULL, settlement_error=NULL,
+                last_checked_at=NOW(), closed_at=NOW()
             WHERE id=%s AND status <> 'CLOSED';
             """,
             (reason, detail, trade_id),
@@ -2690,10 +2982,14 @@ def r1_close_live_trade_market(trade_id, reason="MANUAL_RULE_EXIT", detail=""):
             "positionSide": side,
             "type": "MARKET",
             "quantity": format_number(qty, int(qp or 0)),
+            "clientOrderId": r1_exit_client_id(trade_id, "close"),
         }
         result = _r1_private_request("POST", "/openApi/swap/v2/trade/order", params)
         if result.get("code") != 0:
             raise RuntimeError(f"R1 close failed: {result}")
+        exit_order_id = _r1_order_id(result)
+        if exit_order_id:
+            _r1_persist_fields(trade_id, exit_order_id=exit_order_id)
 
         deadline = time.time() + 8.0
         while time.time() < deadline:
