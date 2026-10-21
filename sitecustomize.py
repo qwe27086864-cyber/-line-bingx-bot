@@ -228,3 +228,73 @@ else:
         "entry=best ask/bid | fees+slippage retained",
         flush=True,
     )
+
+
+# ======================================================================
+# SHADOW TRACKING V2 - R2 / R2F
+# No strategy function is wrapped. Existing decision rows are copied only
+# after r2_job.py / r2_fast_job.py has completely finished.
+# ======================================================================
+try:
+    import atexit as _shadow_atexit
+    import os as _shadow_os
+    from datetime import datetime as _shadow_datetime
+    from datetime import timedelta as _shadow_timedelta
+    from datetime import timezone as _shadow_timezone
+
+    _SHADOW_PROCESS_START = _shadow_datetime.now(_shadow_timezone.utc)
+
+    def _r2_shadow_postrun():
+        script = _shadow_os.path.basename(
+            str(__import__("sys").argv[0] or "")
+        ).lower()
+
+        if script == "r2_job.py":
+            engine = "R2"
+        elif script == "r2_fast_job.py":
+            engine = "R2F"
+        else:
+            return
+
+        try:
+            import shadow_tracker as _shadow
+
+            if not _shadow.init_shadow_database():
+                return
+
+            # Look back 90 minutes. source_key UNIQUE prevents duplicates and
+            # also recovers rows if an earlier post-run import was interrupted.
+            since = (
+                _SHADOW_PROCESS_START
+                - _shadow_timedelta(minutes=90)
+            )
+
+            inserted = _shadow.import_existing_decisions(
+                engine,
+                since,
+            )
+            updated = _shadow.update_shadow_results(engine)
+
+            print(
+                f"{engine} SHADOW POSTRUN:",
+                f"inserted={inserted}",
+                f"updated={updated}",
+                flush=True,
+            )
+
+        except Exception as _shadow_e:
+            print(
+                "R2 SHADOW POSTRUN ERROR:",
+                engine,
+                str(_shadow_e),
+                flush=True,
+            )
+
+    _shadow_atexit.register(_r2_shadow_postrun)
+
+except Exception as _shadow_setup_e:
+    print(
+        "R2 SHADOW SETUP ERROR:",
+        str(_shadow_setup_e),
+        flush=True,
+    )
