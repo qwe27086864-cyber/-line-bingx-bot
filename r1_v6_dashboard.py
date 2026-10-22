@@ -50,6 +50,19 @@ Bid / Ask：{{price(t.diag.bid_price)}} / {{price(t.diag.ask_price)}}
 <div class="scroll"><table><tr><th>時間 UTC</th><th>幣種</th><th>路徑</th><th>Direction</th><th>Micro</th><th>Execution</th><th>Fast</th><th>Spread</th><th>追價</th><th>耗時</th><th>決策</th></tr>{% for d in fast_decisions %}<tr><td>{{dt(d.observed_at)}}</td><td>{{d.symbol}}</td><td>{{d.path}}</td><td>{{number(d.direction_score)}}</td><td>{{number(d.micro_score)}}</td><td>{{number(d.execution_score)}}</td><td>{{number(d.fast_score)}}</td><td>{{percent(d.spread_pct)}}</td><td>{{percent(d.chase_pct)}}</td><td>{{latency_ms(d.analysis_latency_ms)}}</td><td>{{d.decision}}</td></tr>{% else %}<tr><td colspan="11" class="empty">等待 R2-Fast 下一輪分析</td></tr>{% endfor %}</table></div>
 </section>
 </div>
+
+<section class="panel section"><div class="headline"><div><div class="kicker">SHADOW RESEARCH</div><h2>影子策略：未進場訊號後驗追蹤</h2></div><span class="pill">不下單 · 不占倉位</span></div>
+<p class="muted">這裡追蹤的是「原策略沒有進場」的訊號，觀察如果當時硬進場，1 / 3 / 5 / 10 分鐘後會怎樣。R1M 追蹤核心拒絕與冷卻；R2 / R2-Fast 追蹤 decision ≠ ENTER 的決策。影子資料不會改動核心、不會建立模擬持倉，也不會下實盤單。</p>
+{% if not shadow_table_available %}<p class="bad">目前資料庫還沒有 shadow_rejections 表，代表影子追蹤尚未成功跑過或這個儀表板連到不同資料庫。</p>{% endif %}
+<div class="scroll"><table><tr><th>版本</th><th>影子筆數</th><th>完成 10m</th><th>待完成</th><th>1m 平均</th><th>3m 平均</th><th>5m 平均</th><th>10m 平均</th><th>10m 正收益率</th><th>平均 MFE</th><th>平均 MAE</th><th>TP1 命中</th><th>SL 命中</th></tr>{% for v in versions %}{% set sh=shadow_stats[v] %}<tr><td><strong>{{v}}</strong></td><td>{{sh.total}}</td><td>{{sh.completed}}</td><td>{{sh.pending}}</td><td class="{{'good' if sh.avg_1m is not none and sh.avg_1m>=0 else 'bad' if sh.avg_1m is not none else ''}}">{{percent(sh.avg_1m)}}</td><td class="{{'good' if sh.avg_3m is not none and sh.avg_3m>=0 else 'bad' if sh.avg_3m is not none else ''}}">{{percent(sh.avg_3m)}}</td><td class="{{'good' if sh.avg_5m is not none and sh.avg_5m>=0 else 'bad' if sh.avg_5m is not none else ''}}">{{percent(sh.avg_5m)}}</td><td class="{{'good' if sh.avg_10m is not none and sh.avg_10m>=0 else 'bad' if sh.avg_10m is not none else ''}}">{{percent(sh.avg_10m)}}</td><td>{{sh.positive_10m_rate}}</td><td class="good">{{percent(sh.avg_mfe)}}</td><td class="bad">{{percent(sh.avg_mae)}}</td><td>{{sh.tp1_hits}}</td><td>{{sh.sl_hits}}</td></tr>{% endfor %}</table></div>
+</section>
+
+<div class="columns section">{% for v in versions %}{% set sh=shadow_stats[v] %}<section class="panel"><div class="headline"><div><div class="kicker">{{v}} SHADOW</div><h2>{{v}} 影子拒絕分析</h2></div><span class="pill">{{sh.total}} 筆</span></div>
+<div class="metrics"><div class="metric"><div class="name">10m 已完成</div><div class="value">{{sh.completed}}</div></div><div class="metric"><div class="name">10m 正收益率</div><div class="value">{{sh.positive_10m_rate}}</div></div><div class="metric"><div class="name">10m 平均結果</div><div class="value {{'good' if sh.avg_10m is not none and sh.avg_10m>=0 else 'bad'}}">{{percent(sh.avg_10m)}}</div></div><div class="metric"><div class="name">TP1 / SL</div><div class="value">{{sh.tp1_hits}} / {{sh.sl_hits}}</div></div><div class="metric"><div class="name">先碰 TP1</div><div class="value">{{sh.first_tp1}}</div></div><div class="metric"><div class="name">先碰 SL</div><div class="value">{{sh.first_sl}}</div></div></div>
+<h3>拒絕原因（前 12）</h3><div class="scroll"><table><tr><th>決策 / 原因</th><th>筆數</th></tr>{% for name,n in sh.reasons %}<tr><td class="wrapcell">{{name}}</td><td>{{n}}</td></tr>{% else %}<tr><td colspan="2" class="empty">尚無影子資料</td></tr>{% endfor %}</table></div></section>{% endfor %}</div>
+
+<section class="panel section"><h2>最新 60 筆影子訊號</h2><div class="scroll"><table><tr><th>時間 UTC</th><th>版本</th><th>幣種</th><th>方向</th><th>決策</th><th>原因</th><th>1m</th><th>3m</th><th>5m</th><th>10m</th><th>MFE</th><th>MAE</th><th>先碰</th><th>狀態</th></tr>{% for x in shadow_recent %}<tr><td>{{dt(x.observed_at)}}</td><td><strong>{{x.engine_version}}</strong></td><td>{{x.symbol}}</td><td>{{x.side}}</td><td>{{x.decision}}</td><td class="wrapcell">{{x.reason or '—'}}</td><td>{{percent(x.return_1m_pct)}}</td><td>{{percent(x.return_3m_pct)}}</td><td>{{percent(x.return_5m_pct)}}</td><td class="{{'good' if x.return_10m_pct is not none and x.return_10m_pct>=0 else 'bad' if x.return_10m_pct is not none else ''}}">{{percent(x.return_10m_pct)}}</td><td>{{percent(x.mfe_10m_pct)}}</td><td>{{percent(x.mae_10m_pct)}}</td><td>{{x.first_barrier_10m or '—'}}</td><td>{{'完成' if x.completed_at else '等待'}}</td></tr>{% else %}<tr><td colspan="14" class="empty">尚無影子訊號。若 Render Log 已出現 SHADOW POSTRUN 但這裡仍為 0，請確認 dashboard 與三個 scanner 使用同一個 DATABASE_URL。</td></tr>{% endfor %}</table></div></section>
+
 <p class="note">說明：R2 Forward Score 與 R2-Fast Fast Score 都是規則分數，不是經過校準的上漲機率。模擬損益依資料庫已記錄的 sim_pnl_usdt，含程式預設交易成本假設，不代表交易所實際結算；資金費未完整計入。PF = 正獲利總和 ÷ 虧損絕對值總和。最大回撤只依已平倉結果計算。所有資料唯讀，不會下單。</p>
 </main></body></html>'''
 
@@ -105,6 +118,32 @@ def stats_for(trades):
     groups.sort(key=lambda g:(-g['count'],g['name']))
     return dict(total=len(trades),open_count=len(active),closed_count=len(closed),wins=sum(x>0 for x in pnl),losses=sum(x<0 for x in pnl),flats=sum(x==0 for x in pnl),win_rate=f'{sum(x>0 for x in pnl)/len(pnl)*100:.1f}%' if pnl else '—',pf=f'{gains/losses_abs:.2f}' if losses_abs else ('∞' if gains else '—'),net=net,avg=net/len(pnl) if pnl else 0,drawdown=dd,tp1=sum(t['tp1_hit'] is True for t in trades),tp2=sum(t['tp2_hit'] is True for t in trades),tp3=sum(t['tp3_hit'] is True for t in trades),avg_spread=sum(spreads)/len(spreads) if spreads else None,avg_chase=sum(chases)/len(chases) if chases else None,diagnostic_count=len(diagnostics),active=sorted(active,key=lambda t:t['signal_time'],reverse=True),recent=list(reversed(closed))[:20],groups=groups[:35])
 
+
+def shadow_stats_for(rows):
+    completed=[r for r in rows if r.get('return_10m_pct') is not None]
+    def avg(field):
+        vals=[float(r[field]) for r in rows if r.get(field) is not None]
+        return sum(vals)/len(vals) if vals else None
+    reasons=Counter()
+    for r in rows:
+        key=f"{r.get('decision') or 'UNKNOWN'} · {r.get('reason') or '—'}"
+        reasons[key]+=1
+    pos=sum(float(r['return_10m_pct'])>0 for r in completed)
+    return dict(
+        total=len(rows),
+        completed=len(completed),
+        pending=len(rows)-len(completed),
+        avg_1m=avg('return_1m_pct'), avg_3m=avg('return_3m_pct'),
+        avg_5m=avg('return_5m_pct'), avg_10m=avg('return_10m_pct'),
+        avg_mfe=avg('mfe_10m_pct'), avg_mae=avg('mae_10m_pct'),
+        positive_10m_rate=f'{pos/len(completed)*100:.1f}%' if completed else '—',
+        tp1_hits=sum(r.get('tp1_hit_10m') is True for r in rows),
+        sl_hits=sum(r.get('sl_hit_10m') is True for r in rows),
+        first_tp1=sum(r.get('first_barrier_10m')=='TP1' for r in rows),
+        first_sl=sum(r.get('first_barrier_10m')=='SL' for r in rows),
+        reasons=reasons.most_common(12),
+    )
+
 @app.get('/health')
 def health():
     return {'status':'ok','mode':'read_only','versions':list(VERSIONS)}
@@ -130,6 +169,13 @@ def home():
                 all_decisions=[dict(x) for x in cur.fetchall()]
                 cur.execute('''SELECT id,observed_at,symbol,side,path,radar_move_pct,direction_score,micro_score,market_score,execution_score,fast_score,signal_price,pre_bid,pre_ask,post_bid,post_ask,market_entry_price,spread_pct,chase_pct,analysis_latency_ms,decision,reason,scanner_trade_id FROM r2_fast_decisions WHERE (%s::text IS NULL OR observed_at >= NOW() - (%s::text)::interval) ORDER BY observed_at DESC LIMIT 25000''',(interval,interval))
                 all_fast_decisions=[dict(x) for x in cur.fetchall()]
+                cur.execute("SELECT to_regclass('public.shadow_rejections') AS tbl")
+                shadow_table_available = cur.fetchone()['tbl'] is not None
+                if shadow_table_available:
+                    cur.execute('''SELECT id,engine_version,symbol,side,decision,reason,entry_price,signal_price,observed_at,return_1m_pct,return_3m_pct,return_5m_pct,return_10m_pct,mfe_10m_pct,mae_10m_pct,tp1_hit_10m,sl_hit_10m,first_barrier_10m,completed_at FROM shadow_rejections WHERE engine_version IN ('R1M','R2','R2F') AND (%s::text IS NULL OR observed_at >= NOW() - (%s::text)::interval) ORDER BY observed_at DESC LIMIT 25000''',(interval,interval))
+                    shadow_rows=[dict(x) for x in cur.fetchall()]
+                else:
+                    shadow_rows=[]
     except psycopg2.Error:
         app.logger.exception('Dashboard read failed')
         return Response('資料庫查詢失敗：請檢查 DATABASE_URL 與資料表',status=503)
@@ -166,7 +212,13 @@ def home():
     fast_enter=fast_counts.get('ENTER',0)
     fast_direct_enter=sum(1 for d in all_fast_decisions if d.get('path')=='FAST' and d.get('decision')=='ENTER')
     fast_full_count=sum(1 for d in all_fast_decisions if d.get('path')=='FULL')
-    return render_template_string(PAGE,versions=VERSIONS,stats=stats,period=period,now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),r1m_diagnostics=r1m_diagnostics[:30],decisions=all_decisions[:40],decision_total=len(all_decisions),decision_enter=counts.get('ENTER',0),decision_counts=counts.most_common(),fast_decisions=all_fast_decisions[:30],fast_total=len(all_fast_decisions),fast_enter=fast_enter,fast_direct_enter=fast_direct_enter,fast_full_count=fast_full_count,fast_avg_latency=fast_avg_latency,fast_decision_counts=fast_counts.most_common(),money=money,percent=percent,number=number,latency_ms=latency_ms,price=price,dt=dt,age=age)
+    shadow_by_version={v:[] for v in VERSIONS}
+    for x in shadow_rows:
+        if x.get('engine_version') in shadow_by_version:
+            shadow_by_version[x['engine_version']].append(x)
+    shadow_stats={v:shadow_stats_for(shadow_by_version[v]) for v in VERSIONS}
+    shadow_recent=shadow_rows[:60]
+    return render_template_string(PAGE,versions=VERSIONS,stats=stats,period=period,now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),r1m_diagnostics=r1m_diagnostics[:30],decisions=all_decisions[:40],decision_total=len(all_decisions),decision_enter=counts.get('ENTER',0),decision_counts=counts.most_common(),fast_decisions=all_fast_decisions[:30],fast_total=len(all_fast_decisions),fast_enter=fast_enter,fast_direct_enter=fast_direct_enter,fast_full_count=fast_full_count,fast_avg_latency=fast_avg_latency,fast_decision_counts=fast_counts.most_common(),shadow_table_available=shadow_table_available,shadow_stats=shadow_stats,shadow_recent=shadow_recent,money=money,percent=percent,number=number,latency_ms=latency_ms,price=price,dt=dt,age=age)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')))
