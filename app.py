@@ -3013,6 +3013,61 @@ def webhook():
     return "OK", 200
 
 
+
+# =========================================================
+# R2 / R2F SHADOW POST-RUN HOOK
+# =========================================================
+# R2 and R2F always import app.py, so register the shadow collector here
+# instead of relying on Python auto-loading sitecustomize.py.
+def _register_r2_shadow_postrun():
+    import atexit
+    import sys
+    from datetime import datetime, timedelta, timezone
+
+    script = os.path.basename(str(sys.argv[0] or "")).lower()
+    if script == "r2_job.py":
+        engine = "R2"
+    elif script == "r2_fast_job.py":
+        engine = "R2F"
+    else:
+        return
+
+    process_started = datetime.now(timezone.utc)
+
+    def _shadow_postrun():
+        try:
+            import shadow_tracker as shadow
+
+            if not shadow.init_shadow_database():
+                print(f"{engine} SHADOW POSTRUN: init_failed", flush=True)
+                return
+
+            # Re-read a short history. shadow source_key is UNIQUE, so this
+            # also recovers a missed prior cycle without duplicating rows.
+            since = process_started - timedelta(minutes=90)
+            inserted = shadow.import_existing_decisions(engine, since)
+            updated = shadow.update_shadow_results(engine)
+
+            print(
+                f"{engine} SHADOW POSTRUN:",
+                f"inserted={inserted}",
+                f"updated={updated}",
+                flush=True,
+            )
+        except Exception as exc:
+            # Shadow analytics must never break the paper strategy itself.
+            print(
+                f"{engine} SHADOW POSTRUN ERROR:",
+                str(exc),
+                flush=True,
+            )
+
+    atexit.register(_shadow_postrun)
+    print(f"{engine} SHADOW HOOK REGISTERED", flush=True)
+
+
+_register_r2_shadow_postrun()
+
 # =========================================================
 # STARTUP
 # =========================================================
