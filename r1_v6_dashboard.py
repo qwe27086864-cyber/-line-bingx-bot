@@ -75,7 +75,9 @@ def calc_dir_shadow(rows):
 
 
 def table_exists(cur,name):
-    cur.execute("SELECT to_regclass(%s)",(f"public.{name}",)); return cur.fetchone()[0] is not None
+    cur.execute("SELECT to_regclass(%s) AS regclass", (f"public.{name}",))
+    row = cur.fetchone()
+    return bool(row and row.get("regclass") is not None)
 
 
 @app.get("/health")
