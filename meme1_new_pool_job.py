@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import psycopg2
 
 ENGINE = "MEME1"
+STRATEGY_VERSION = "MEME1_FIX_V2"
 PAPER_ONLY = True
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -55,7 +56,9 @@ TAKE_PROFIT_PCT = float(os.environ.get("MEME1_TAKE_PROFIT_PCT", "100"))
 TRAIL_ACTIVATE_PCT = float(os.environ.get("MEME1_TRAIL_ACTIVATE_PCT", "25"))
 TRAIL_DISTANCE_PCT = float(os.environ.get("MEME1_TRAIL_DISTANCE_PCT", "12"))
 MAX_HOLD_MIN = float(os.environ.get("MEME1_MAX_HOLD_MIN", "240"))
-LIQUIDITY_COLLAPSE_RATIO = float(os.environ.get("MEME1_LIQUIDITY_COLLAPSE_RATIO", "0.40"))
+LIQUIDITY_COLLAPSE_RATIO = float(os.environ.get("MEME1_LIQUIDITY_COLLAPSE_RATIO", "0.70"))
+RAPID_LIQUIDITY_DROP_RATIO = float(os.environ.get("MEME1_RAPID_LIQUIDITY_DROP_RATIO", "0.80"))
+DIRECT_ENTRY_ENABLED = os.environ.get("MEME1_DIRECT_ENTRY_ENABLED", "false").lower() == "true"
 
 # Market-data sanity guards. These do not change the trading thesis; they only
 # prevent impossible one-tick prices from being realized as paper PnL.
@@ -540,6 +543,8 @@ def log_position_snapshot(pos, p=None, peak=None, reason_now=None, market_ok_ove
                 "trail_activate_pct": TRAIL_ACTIVATE_PCT,
                 "trail_distance_pct": TRAIL_DISTANCE_PCT,
                 "liquidity_collapse_ratio": LIQUIDITY_COLLAPSE_RATIO,
+                "rapid_liquidity_drop_ratio": RAPID_LIQUIDITY_DROP_RATIO,
+                "strategy_version": STRATEGY_VERSION,
                 "execution_model": "constant_product_liquidity_impact_v2",
             })
         ))
@@ -633,20 +638,38 @@ def exit_reason(pos, p):
     price = p["price"]
     if entry <= 0 or price <= 0:
         return None
-    roi = (price / entry - 1.0) * 100.0
+
     peak = max(float(pos.get("peak_price") or entry), price)
     peak_roi = (peak / entry - 1.0) * 100.0
     trail_floor = peak * (1.0 - TRAIL_DISTANCE_PCT / 100.0)
     age_min = (datetime.now(timezone.utc) - pos["opened_at"]).total_seconds() / 60.0
     entry_liq = float(pos.get("entry_liquidity_usd") or 0.0)
+    last_liq = float(pos.get("last_liquidity_usd") or entry_liq or 0.0)
+    current_liq = float(p.get("liq") or 0.0)
 
-    if roi <= -STOP_LOSS_PCT:
-        return "STOP_LOSS"
-    if entry_liq > 0 and p["liq"] < entry_liq * LIQUIDITY_COLLAPSE_RATIO:
+    # V2: liquidity risk first. The old 40% trigger often fired only after
+    # most of the pool had already vanished.
+    if entry_liq > 0 and current_liq < entry_liq * LIQUIDITY_COLLAPSE_RATIO:
         return "LIQUIDITY_COLLAPSE"
+    if (entry_liq > 0 and last_liq > 0 and
+            current_liq < last_liq * RAPID_LIQUIDITY_DROP_RATIO and
+            current_liq < entry_liq * 0.90):
+        return "LIQUIDITY_DRAIN"
+
+    # V2: stop loss uses modeled executable proceeds rather than screen price.
+    exit_price, _ = executable_exit(price, pos["token_qty"], current_liq)
+    gross_value = float(pos["token_qty"]) * exit_price
+    exit_fee = gross_value * FEE_BPS_PER_SIDE / 10000.0
+    executable_net_roi = (
+        gross_value - exit_fee - float(pos["notional_usdt"])
+    ) / float(pos["notional_usdt"]) * 100.0
+    if executable_net_roi <= -STOP_LOSS_PCT:
+        return "STOP_LOSS_EXECUTABLE"
+
+    raw_roi = (price / entry - 1.0) * 100.0
     if peak_roi >= TRAIL_ACTIVATE_PCT and price <= trail_floor:
         return "TRAILING_STOP"
-    if roi >= TAKE_PROFIT_PCT:
+    if raw_roi >= TAKE_PROFIT_PCT:
         return "TAKE_PROFIT"
     if age_min >= MAX_HOLD_MIN:
         return "MAX_HOLD"
@@ -810,9 +833,16 @@ def run_once():
         log_observation(p, score, rug_score, rug_level, decision, reason, meta)
 
         if decision == "OPEN":
-            pid = open_position(p, score, rug_score, meta)
-            open_pools.add(p["pool_address"]); room -= 1
-            print(f"MEME1 OPEN #{pid} {p['pool_name']} score={score:.1f} rug={rug_score} liq=${p['liq']:.0f}", flush=True)
+            # V2: fresh signals are routed through MEME1X's 1-3 minute
+            # exitability confirmation instead of opening immediately.
+            # Existing legacy MEME1 positions are still monitored and closed.
+            if DIRECT_ENTRY_ENABLED:
+                meta["strategy_version"] = STRATEGY_VERSION
+                pid = open_position(p, score, rug_score, meta)
+                open_pools.add(p["pool_address"]); room -= 1
+                print(f"MEME1 DIRECT OPEN #{pid} {p['pool_name']} score={score:.1f} rug={rug_score} liq=${p['liq']:.0f}", flush=True)
+            else:
+                print(f"MEME1 SIGNAL {p['pool_name']} score={score:.1f} rug={rug_score} liq=${p['liq']:.0f} -> EXITABILITY_GATE", flush=True)
 
     print(f"MEME1 done pools={len(pools)} open={len(get_open_positions())} rug_checks={risk_checks}", flush=True)
 

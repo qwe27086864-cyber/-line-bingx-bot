@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import meme1_new_pool_job as base
 
 ENGINE = "MEME1X"
-VARIANT = "EXITABILITY_V1"
+VARIANT = "EXITABILITY_V2"
 PAPER_ONLY = True
 
 POLL_SEC = float(os.environ.get("MEME1X_POLL_SEC", "15"))
@@ -44,6 +44,7 @@ TRAIL_ACTIVATE_PCT = float(os.environ.get("MEME1X_TRAIL_ACTIVATE_PCT", str(base.
 TRAIL_DISTANCE_PCT = float(os.environ.get("MEME1X_TRAIL_DISTANCE_PCT", str(base.TRAIL_DISTANCE_PCT)))
 MAX_HOLD_MIN = float(os.environ.get("MEME1X_MAX_HOLD_MIN", str(base.MAX_HOLD_MIN)))
 LIQUIDITY_COLLAPSE_RATIO = float(os.environ.get("MEME1X_LIQUIDITY_COLLAPSE_RATIO", str(base.LIQUIDITY_COLLAPSE_RATIO)))
+RAPID_LIQUIDITY_DROP_RATIO = float(os.environ.get("MEME1X_RAPID_LIQUIDITY_DROP_RATIO", str(base.RAPID_LIQUIDITY_DROP_RATIO)))
 FEE_BPS_PER_SIDE = base.FEE_BPS_PER_SIDE
 
 
@@ -425,16 +426,32 @@ def load_open_positions():
 def position_exit_reason(pos,p):
     entry=sf(pos["raw_entry_price"]); price=sf(p["price"])
     if entry<=0 or price<=0: return None
-    roi=(price/entry-1.0)*100.0
     peak=max(sf(pos.get("peak_price"),entry),price)
     peak_roi=(peak/entry-1.0)*100.0
     trail_floor=peak*(1.0-TRAIL_DISTANCE_PCT/100.0)
     age_min=(utcnow()-pos["opened_at"]).total_seconds()/60.0
     entry_liq=sf(pos.get("entry_liquidity_usd"))
-    if roi <= -STOP_LOSS_PCT: return "STOP_LOSS"
-    if entry_liq>0 and sf(p["liq"]) < entry_liq*LIQUIDITY_COLLAPSE_RATIO: return "LIQUIDITY_COLLAPSE"
+    last_liq=sf(pos.get("last_liquidity_usd"),entry_liq)
+    current_liq=sf(p.get("liq"))
+
+    if entry_liq>0 and current_liq < entry_liq*LIQUIDITY_COLLAPSE_RATIO:
+        return "LIQUIDITY_COLLAPSE"
+    if (entry_liq>0 and last_liq>0 and
+            current_liq < last_liq*RAPID_LIQUIDITY_DROP_RATIO and
+            current_liq < entry_liq*0.90):
+        return "LIQUIDITY_DRAIN"
+
+    exit_price,_=base.executable_exit(price,pos["token_qty"],current_liq)
+    gross_value=sf(pos["token_qty"])*exit_price
+    exit_fee=gross_value*FEE_BPS_PER_SIDE/10000.0
+    notional=sf(pos["notional_usdt"])
+    executable_net_roi=(gross_value-exit_fee-notional)/notional*100.0 if notional>0 else -100.0
+    if executable_net_roi <= -STOP_LOSS_PCT:
+        return "STOP_LOSS_EXECUTABLE"
+
+    raw_roi=(price/entry-1.0)*100.0
     if peak_roi >= TRAIL_ACTIVATE_PCT and price <= trail_floor: return "TRAILING_STOP"
-    if roi >= TAKE_PROFIT_PCT: return "TAKE_PROFIT"
+    if raw_roi >= TAKE_PROFIT_PCT: return "TAKE_PROFIT"
     if age_min >= MAX_HOLD_MIN: return "MAX_HOLD"
     return None
 
@@ -548,7 +565,7 @@ def start_health_server():
 def run_monitor():
     init_database(); start_health_server()
     print("="*78,flush=True)
-    print("MEME1X EXITABILITY SHADOW V1 | FORWARD ONLY | PAPER ONLY | MEME1 UNCHANGED",flush=True)
+    print("MEME1X EXITABILITY V2 | FORWARD ONLY | PAPER ONLY | CONFIRMED ENTRY + EXECUTABLE EXIT",flush=True)
     print(f"base_confirm={BASE_CONFIRM_SEC:.0f}s risky_lp_confirm={RISKY_LP_CONFIRM_SEC:.0f}s min_liq=${MIN_CONFIRM_LIQUIDITY_USD:.0f} min_current_ratio={MIN_CURRENT_LIQ_RATIO:.2f} min_path_ratio={MIN_PATH_LIQ_RATIO:.2f} max_exit_bps={MAX_EXIT_EXECUTION_BPS:.0f}",flush=True)
     print("="*78,flush=True)
     while True:
