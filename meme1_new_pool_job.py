@@ -57,6 +57,14 @@ TRAIL_DISTANCE_PCT = float(os.environ.get("MEME1_TRAIL_DISTANCE_PCT", "12"))
 MAX_HOLD_MIN = float(os.environ.get("MEME1_MAX_HOLD_MIN", "240"))
 LIQUIDITY_COLLAPSE_RATIO = float(os.environ.get("MEME1_LIQUIDITY_COLLAPSE_RATIO", "0.40"))
 
+# Market-data sanity guards. These do not change the trading thesis; they only
+# prevent impossible one-tick prices from being realized as paper PnL.
+MAX_TICK_PRICE_MULTIPLIER = float(os.environ.get("MEME1_MAX_TICK_PRICE_MULTIPLIER", "2.0"))
+ANOMALY_CONFIRMATIONS_REQUIRED = int(os.environ.get("MEME1_ANOMALY_CONFIRMATIONS_REQUIRED", "2"))
+ANOMALY_CONFIRM_BAND_PCT = float(os.environ.get("MEME1_ANOMALY_CONFIRM_BAND_PCT", "25"))
+MAX_PROFIT_EXIT_EXECUTION_BPS = float(os.environ.get("MEME1_MAX_PROFIT_EXIT_EXECUTION_BPS", "5000"))
+_pending_price_anomalies = {}
+
 # High-frequency open-position monitor. New-pool discovery stays on the 5-minute cron.
 MONITOR_INTERVAL_SEC = float(os.environ.get("MEME1_MONITOR_INTERVAL_SEC", "15"))
 HEALTH_PORT = int(os.environ.get("PORT", "10000"))
@@ -331,10 +339,7 @@ def score_pool(p):
     if p["fdv_liq"] > MAX_FDV_LIQ_RATIO:
         reasons.append("FDV_LIQ_TOO_HIGH")
 
-    # 0..20 liquidity. Full points around 5x minimum.
     liq_score = min(20.0, max(0.0, 20.0 * math.log10(max(p["liq"], 1.0) / MIN_LIQUIDITY_USD + 1.0) / math.log10(6.0)))
-
-    # 0..20 turnover. New tokens need actual flow, not only a funded pool.
     turnover = p["vol_h1"] / p["liq"] if p["liq"] > 0 else 0.0
     turnover_score = min(20.0, turnover * 12.0)
 
@@ -342,10 +347,8 @@ def score_pool(p):
     total = buys + sells
     buy_ratio = buys / total if total else 0.0
     pressure_score = max(0.0, min(20.0, (buy_ratio - 0.40) / 0.35 * 20.0))
-
     activity_score = min(15.0, total / 40.0 * 15.0)
 
-    # Reward positive acceleration but cap chase-heavy pumps.
     m5 = p["pc_m5"]
     if m5 <= -10:
         momentum_score = 0.0
@@ -359,8 +362,8 @@ def score_pool(p):
         momentum_score = 3.0
 
     age_score = max(0.0, 10.0 * (1.0 - min(p["age_min"], MAX_POOL_AGE_MIN) / MAX_POOL_AGE_MIN))
-
     score = liq_score + turnover_score + pressure_score + activity_score + momentum_score + age_score
+
     return round(max(0.0, min(100.0, score)), 2), reasons, {
         "liq_score": round(liq_score, 2),
         "turnover_score": round(turnover_score, 2),
@@ -487,13 +490,15 @@ def update_position_mark(pos, price, liq, peak):
         cur.close(); conn.close()
 
 
-def log_position_snapshot(pos, p=None, peak=None, reason_now=None):
+def log_position_snapshot(pos, p=None, peak=None, reason_now=None, market_ok_override=None):
     raw_price = _safe_float((p or {}).get("price"), 0.0)
     liq = _safe_float((p or {}).get("liq"), 0.0)
     entry = _safe_float(pos.get("raw_entry_price"), 0.0)
     qty = _safe_float(pos.get("token_qty"), 0.0)
     notional = _safe_float(pos.get("notional_usdt"), 0.0)
     market_ok = raw_price > 0
+    if market_ok_override is not None:
+        market_ok = bool(market_ok_override)
 
     if peak is None:
         peak = max(_safe_float(pos.get("peak_price"), entry), raw_price if raw_price > 0 else 0.0)
@@ -541,6 +546,60 @@ def log_position_snapshot(pos, p=None, peak=None, reason_now=None):
         conn.commit()
     finally:
         cur.close(); conn.close()
+
+
+def validate_price_tick(pos, p):
+    """Quarantine an extreme one-tick move until it repeats.
+
+    Any >=2x or <=0.5x jump from the last trusted mark requires confirmation.
+    Real pumps can still pass on the next nearby reading; isolated API spikes
+    cannot immediately become realized PnL.
+    """
+    price = _safe_float((p or {}).get("price"), 0.0)
+    reference = _safe_float(pos.get("last_price"), 0.0) or _safe_float(pos.get("raw_entry_price"), 0.0)
+    if price <= 0 or reference <= 0:
+        return False, "MARKET_DATA_MISSING"
+
+    ratio = price / reference
+    limit = max(1.01, MAX_TICK_PRICE_MULTIPLIER)
+    suspicious = ratio >= limit or ratio <= (1.0 / limit)
+    key = int(pos["id"])
+
+    if not suspicious:
+        _pending_price_anomalies.pop(key, None)
+        return True, None
+
+    previous = _pending_price_anomalies.get(key)
+    hits = 1
+    if previous:
+        candidate = _safe_float(previous.get("price"), 0.0)
+        if candidate > 0:
+            delta_pct = abs(price / candidate - 1.0) * 100.0
+            if delta_pct <= max(1.0, ANOMALY_CONFIRM_BAND_PCT):
+                hits = int(previous.get("hits", 1)) + 1
+
+    _pending_price_anomalies[key] = {"price": price, "hits": hits}
+    required = max(2, ANOMALY_CONFIRMATIONS_REQUIRED)
+
+    if hits >= required:
+        _pending_price_anomalies.pop(key, None)
+        return True, f"ANOMALOUS_PRICE_CONFIRMED_{hits}"
+
+    return False, f"ANOMALOUS_PRICE_TICK ratio={ratio:.2f}x confirmation={hits}/{required}"
+
+
+def profit_exit_execution_ok(pos, p, reason):
+    """Block positive exits whose modeled sell impact is effectively unfillable."""
+    if reason not in ("TAKE_PROFIT", "TRAILING_STOP"):
+        return True, None
+
+    _, execution_bps = executable_exit(p["price"], pos["token_qty"], p["liq"])
+    if execution_bps > MAX_PROFIT_EXIT_EXECUTION_BPS:
+        return False, (
+            f"EXIT_IMPACT_TOO_HIGH {execution_bps:.1f}bps "
+            f"> {MAX_PROFIT_EXIT_EXECUTION_BPS:.1f}bps"
+        )
+    return True, None
 
 
 def close_position(pos, p, reason):
@@ -606,10 +665,37 @@ def monitor_open_positions_once():
             log_position_snapshot(pos, None, peak=float(pos.get("peak_price") or pos["raw_entry_price"]),
                                   reason_now="MARKET_DATA_MISSING")
             continue
+        tick_ok, tick_note = validate_price_tick(pos, p)
+        if not tick_ok:
+            # Do not update last_price or peak with an untrusted tick.
+            log_position_snapshot(
+                pos,
+                p,
+                peak=float(pos.get("peak_price") or pos["raw_entry_price"]),
+                reason_now=tick_note,
+                market_ok_override=False,
+            )
+            print(f"MEME1 QUARANTINE #{pos['id']} {pos['pool_name']} {tick_note}", flush=True)
+            continue
+
         peak = max(float(pos.get("peak_price") or p["price"]), p["price"])
         reason = exit_reason(pos, p)
-        # Persist the full 15-second path BEFORE any close/update, so every trade can be replayed.
-        log_position_snapshot(pos, p, peak=peak, reason_now=reason)
+
+        if reason:
+            execution_ok, execution_note = profit_exit_execution_ok(pos, p, reason)
+            if not execution_ok:
+                log_position_snapshot(
+                    pos,
+                    p,
+                    peak=float(pos.get("peak_price") or pos["raw_entry_price"]),
+                    reason_now=execution_note,
+                    market_ok_override=False,
+                )
+                print(f"MEME1 QUARANTINE #{pos['id']} {pos['pool_name']} {execution_note}", flush=True)
+                continue
+
+        # Persist the trusted 15-second path BEFORE any close/update.
+        log_position_snapshot(pos, p, peak=peak, reason_now=reason or tick_note)
         if reason:
             net, ret = close_position(pos, p, reason)
             closed += 1
@@ -653,7 +739,6 @@ def monitor_loop():
             if open_count or closed:
                 print(f"MEME1 monitor open={open_count} closed={closed}", flush=True)
         except Exception as exc:
-            # Never kill the continuous risk monitor for one transient market-data failure.
             print(f"MEME1 monitor error: {type(exc).__name__}: {exc}", flush=True)
         elapsed = time.time() - started
         time.sleep(max(1.0, MONITOR_INTERVAL_SEC - elapsed))
@@ -662,14 +747,11 @@ def monitor_loop():
 def run_once():
     init_database()
 
-    # 1) Safety backup: cron also marks/closes positions once, while the dedicated
-    # monitor service handles them every ~15 seconds.
     try:
         monitor_open_positions_once()
     except Exception as exc:
         print(f"MEME1 cron monitor warning: {type(exc).__name__}: {exc}", flush=True)
 
-    # 2) Discover and score new pools.
     opens = get_open_positions()
     open_pools = {p["pool_address"] for p in opens}
     room = max(0, MAX_OPEN - len(opens))
