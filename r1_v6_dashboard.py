@@ -49,7 +49,8 @@ main{max-width:1040px;margin:auto;padding:16px}h1{font-size:25px;margin:0 0 4px}
 .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-bottom:12px}.summary-card,.core{background:var(--panel);border:1px solid var(--line);border-radius:14px}.summary-card{padding:11px}.summary-card .label,.metric .label{color:var(--muted);font-size:11px}.summary-card .big{font-size:17px;font-weight:750;margin-top:5px;overflow-wrap:anywhere}
 .cores{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.core{padding:14px;min-width:0}.head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}.name{font-size:19px;font-weight:800}.desc{color:var(--muted);font-size:12px;margin-top:3px}.revision{color:var(--blue);font-size:11px;font-weight:700;margin-top:6px}.badge{font-size:12px;font-weight:700;padding:5px 8px;border-radius:999px;border:1px solid var(--line);white-space:nowrap}.badge.good{color:var(--good)}.badge.bad{color:var(--bad)}.badge.warn{color:var(--warn)}
 .section-tag{margin-top:12px;font-size:11px;font-weight:800;color:var(--good);letter-spacing:.04em}.metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:7px}.metric{min-width:0}.metric .value{font-size:17px;font-weight:750;margin-top:3px;overflow-wrap:anywhere}.pnl.good{color:var(--good)}.pnl.bad{color:var(--bad)}
-.compare{margin-top:12px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 10px;display:grid;gap:6px;font-size:11px}.compare-row{display:flex;gap:8px;align-items:center;justify-content:space-between}.compare-label{font-weight:800;white-space:nowrap}.compare-label.before{color:var(--muted)}.compare-label.after{color:var(--good)}.compare-data{color:var(--muted);text-align:right;overflow-wrap:anywhere}.compare-row.after .compare-data{color:var(--text)}
+.actionbox{margin-top:12px;border:1px solid var(--line);border-radius:10px;padding:9px 10px;background:var(--panel2);font-size:12px;line-height:1.45}.actionbox .action-title{font-size:13px;font-weight:850;margin-bottom:3px}.actionbox.good .action-title{color:var(--good)}.actionbox.warn .action-title{color:var(--warn)}.actionbox.bad .action-title{color:var(--bad)}
+.compare{margin-top:9px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 10px;display:grid;gap:6px;font-size:11px}.compare-row{display:flex;gap:8px;align-items:center;justify-content:space-between}.compare-label{font-weight:800;white-space:nowrap}.compare-label.before{color:var(--muted)}.compare-label.after{color:var(--good)}.compare-data{color:var(--muted);text-align:right;overflow-wrap:anywhere}.compare-row.after .compare-data{color:var(--text)}
 .foot{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:11px;border-top:1px solid var(--line);padding-top:10px;margin-top:11px}.note{margin-top:12px;color:var(--muted);font-size:11px;line-height:1.5}
 @media(max-width:700px){main{padding:12px}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.cores{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
 </style>
@@ -61,7 +62,7 @@ main{max-width:1040px;margin:auto;padding:16px}h1{font-size:25px;margin:0 0 4px}
   <section class="summary">
     <div class="summary-card"><div class="label">修正後最好</div><div class="big">{{ best }}</div></div>
     <div class="summary-card"><div class="label">修正後最差</div><div class="big">{{ worst }}</div></div>
-    <div class="summary-card"><div class="label">修正後樣本不足</div><div class="big">{{ watch }}</div></div>
+    <div class="summary-card"><div class="label">目前需要修正</div><div class="big">{{ needs_fix }}</div></div>
     <div class="summary-card"><div class="label">系統狀態</div><div class="big">{{ system }}</div></div>
   </section>
   <section class="cores">
@@ -86,6 +87,10 @@ main{max-width:1040px;margin:auto;padding:16px}h1{font-size:25px;margin:0 0 4px}
         <div class="metric"><div class="label">{{ c.extra_label }}</div><div class="value">{{ c.extra }}</div></div>
       </div>
 
+      <div class="actionbox {{ c.action_class }}">
+        <div class="action-title">{{ c.action }}</div>
+        <div>{{ c.progress }}</div>
+      </div>
       <div class="compare">
         <div class="compare-row"><span class="compare-label before">修正前</span><span class="compare-data">{{ c.before_summary }}</span></div>
         <div class="compare-row after"><span class="compare-label after">修正後</span><span class="compare-data">{{ c.after_summary }}</span></div>
@@ -94,7 +99,7 @@ main{max-width:1040px;margin:auto;padding:16px}h1{font-size:25px;margin:0 0 4px}
     </article>
   {% endfor %}
   </section>
-  <div class="note">切分規則：方向核心以 signal_time、其他持倉核心以 opened_at、AS1 以累積快照差值切分。修正前資料保留供比較，但不再計入目前最好/最差、PF、勝率與狀態判斷。MEME2 影子資料另行累積，不會混入實際/模擬持倉績效。</div>
+  <div class="note">判斷規則：交易核心先看 20 / 50 / 100 / 200 筆里程碑；樣本未到就繼續跑，只有達到判斷門檻且 PF / 淨利明顯不合格才顯示「需要修正」。AS1 用 fills；BF1 沒有套利條件時顯示等待市場；MEME2 目前用完成的影子候選作判斷。修正前資料只保留比較，不混入目前判斷。</div>
 </main>
 </body>
 </html>
@@ -119,6 +124,79 @@ def pf_text(gains, losses):
     if gains > 0:
         return "∞"
     return "—"
+
+
+def pf_value(gains, losses):
+    gains, losses = f(gains), f(losses)
+    if losses > 0:
+        return gains / losses
+    if gains > 0:
+        return float("inf")
+    return None
+
+
+def next_target(sample, milestones=(20, 50, 100, 200)):
+    sample = int(sample or 0)
+    for target in milestones:
+        if sample < target:
+            return target, target - sample
+    return milestones[-1], 0
+
+
+def trade_action(after, sample):
+    after = norm_stats(after)
+    sample = int(sample or 0)
+    pfv = pf_value(after["gains"], after["losses"])
+    target, remain = next_target(sample)
+
+    # Very bad early data can be reviewed before 50, but ordinary noise is allowed to accumulate.
+    if sample < 20:
+        return "繼續跑數據", "warn", f"初步判斷 20 筆，還差 {remain} 筆"
+    if sample < 50:
+        if after["net"] < 0 and pfv is not None and pfv < 0.70:
+            return "需要修正", "bad", f"{sample} 筆已呈明顯負期望（PF {pfv:.2f}）；不用硬等 50 筆"
+        return "繼續跑數據", "warn", f"下一次判斷 50 筆，還差 {remain} 筆"
+    if sample < 100:
+        if after["net"] < 0 and pfv is not None and pfv < 0.90:
+            return "需要修正", "bad", f"已達 50 筆且 PF {pfv:.2f}、PnL 為負"
+        return "繼續跑數據", "warn", f"中期判斷 100 筆，還差 {remain} 筆"
+    if sample < 200:
+        if after["net"] < 0 or (pfv is not None and pfv < 1.00):
+            pft = "—" if pfv is None else f"{pfv:.2f}"
+            return "需要修正", "bad", f"已達 100 筆，PF {pft} / PnL 未通過"
+        return "繼續驗證", "good", f"確認門檻 200 筆，還差 {remain} 筆"
+
+    if after["net"] <= 0 or (pfv is not None and pfv < 1.05):
+        pft = "—" if pfv is None else f"{pfv:.2f}"
+        return "需要修正", "bad", f"200+ 筆仍未建立正期望（PF {pft}）"
+    if pfv is not None and pfv >= 1.20:
+        return "核心可保留", "good", f"{sample} 筆已通過長樣本檢查，繼續監控即可"
+    return "持續觀察", "warn", f"{sample} 筆為正但優勢偏薄，暫不改核心"
+
+
+def mm_action(sample, net):
+    sample = int(sample or 0)
+    if sample < 100:
+        return "繼續跑數據", "warn", f"做市初判 100 fills，還差 {100-sample} fills"
+    if sample < 200:
+        if net < 0:
+            return "需要修正", "bad", f"已達 {sample} fills 且修正後 PnL 為負"
+        return "繼續驗證", "good", f"做市確認 200 fills，還差 {200-sample} fills"
+    return (("核心可保留", "good", f"{sample} fills 且修正後仍為正")
+            if net > 0 else ("需要修正", "bad", f"{sample} fills 但修正後 PnL 未轉正"))
+
+
+def shadow_action(completed, avg10, win_rate10):
+    completed = int(completed or 0)
+    if completed < 50:
+        return "繼續收影子", "warn", f"第一輪 50 個完整影子，還差 {50-completed} 個"
+    if completed < 100:
+        if avg10 is not None and avg10 < 0 and win_rate10 is not None and win_rate10 < 45:
+            return "需要修正", "bad", f"50+ 影子：10m 平均 {avg10:+.2f}%、正報酬率 {win_rate10:.1f}%"
+        return "繼續收影子", "warn", f"第二輪 100 個完整影子，還差 {100-completed} 個"
+    if avg10 is not None and avg10 <= 0:
+        return "需要修正", "bad", f"100+ 影子後 10m 平均仍為 {avg10:+.2f}%"
+    return "影子通過初步驗證", "good", f"{completed} 個完整影子；再觀察實際持倉前不切實盤"
 
 
 def parse_revision(core):
@@ -175,7 +253,8 @@ def stat_summary(s, show_pf=True):
 
 def make_core(name, desc, before, after, revision, updated,
               extra_label="樣本", extra=None, sample_count=None,
-              forced_issue=None, note="", show_wr_pf=True):
+              forced_issue=None, note="", show_wr_pf=True,
+              action_override=None):
     before, after = norm_stats(before), norm_stats(after)
     sample = after["closed"] if sample_count is None else int(sample_count or 0)
 
@@ -194,6 +273,10 @@ def make_core(name, desc, before, after, revision, updated,
         status, status_class = "修正後負期望", "bad"
     else:
         status, status_class = "修正後觀察", "warn"
+
+    action, action_class, progress = action_override or trade_action(after, sample)
+    if forced_issue:
+        action, action_class, progress = "系統先處理", "bad", forced_issue
 
     return {
         "name": name,
@@ -214,6 +297,9 @@ def make_core(name, desc, before, after, revision, updated,
         "revision": fmt_revision(revision),
         "before_summary": stat_summary(before, show_wr_pf),
         "after_summary": stat_summary(after, show_wr_pf),
+        "action": action,
+        "action_class": action_class,
+        "progress": progress,
     }
 
 
@@ -276,7 +362,7 @@ def split_positions(cur, table, cutoff, extra_where="", params=None):
 
 @app.get("/health")
 def health():
-    return {"status":"ok","mode":"revision_split_read_only","cores":["R2F","R2FS","R3","AS1","BF1","MEME1X V2","MEME2"]}
+    return {"status":"ok","mode":"revision_split_auto_decision_read_only","cores":["R2F","R2FS","R3","AS1","BF1","MEME1X V2","MEME2"]}
 
 
 @app.get("/")
@@ -297,13 +383,18 @@ def home():
                 # Directional cores
                 for eng, desc in (("R2F","快速方向交易"),("R2FS","R2F 影子 · 進場過濾"),("R3","突破回踩 · 再加速")):
                     before, after, updated = split_directional(cur, eng, revisions[eng])
+                    if table_exists(cur, "shadow_rejections"):
+                        cur.execute("SELECT MAX(observed_at) AS t FROM shadow_rejections WHERE engine_version=%s AND observed_at >= %s", (eng, revisions[eng]))
+                        sr = cur.fetchone()
+                        if sr and sr["t"] and (not updated or sr["t"] > updated):
+                            updated = sr["t"]
                     cores.append(make_core(eng, desc, before, after, revisions[eng], updated,
                                            extra_label="修正後已平倉", extra=str(norm_stats(after)["closed"])))
 
                 # AS1: use cumulative snapshot immediately before the revision as baseline.
                 if table_exists(cur, "as_mm_state") and table_exists(cur, "as_mm_snapshots"):
                     cutoff = revisions["AS1"]
-                    cur.execute("SELECT updated_at,inventory_base,buy_fills,sell_fills,net_pnl_usdt FROM as_mm_state WHERE symbol='BTC-USDT' LIMIT 1")
+                    cur.execute("SELECT updated_at,inventory_base,buy_fills,sell_fills,last_mid,net_pnl_usdt FROM as_mm_state WHERE symbol='BTC-USDT' LIMIT 1")
                     state = cur.fetchone()
                     if state:
                         state = dict(state)
@@ -316,8 +407,8 @@ def home():
                         base = cur.fetchone()
                         base = dict(base) if base else {"net_pnl_usdt":0,"buy_fills":0,"sell_fills":0}
                         pre_fills = int(base.get("buy_fills") or 0) + int(base.get("sell_fills") or 0)
-                        total_fills = int(state.get("buy_fills") or 0) + int(state.get("sell_fills") or 0)
-                        post_fills = max(0, total_fills - pre_fills)
+                        cur.execute("SELECT COUNT(*) AS n FROM as_mm_fills WHERE symbol='BTC-USDT' AND filled_at >= %s", (cutoff,))
+                        post_fills = int(cur.fetchone()["n"] or 0)
                         pre_net = f(base.get("net_pnl_usdt"))
                         post_net = f(state.get("net_pnl_usdt")) - pre_net
                         cur.execute("""
@@ -329,19 +420,35 @@ def home():
                         post24 = f(state.get("net_pnl_usdt")) - f(old24["net_pnl_usdt"]) if old24 else 0.0
                         before = {"closed_count":pre_fills,"open_count":0,"wins":0,"gains":0,"losses":0,"net":pre_net,"pnl24":0}
                         after = {"closed_count":post_fills,"open_count":1 if abs(f(state.get("inventory_base")))>1e-10 else 0,"wins":0,"gains":0,"losses":0,"net":post_net,"pnl24":post24}
-                        cores.append(make_core("AS1","BTC 做市 / 橫盤核心",before,after,cutoff,state.get("updated_at"),
-                                               extra_label="修正後 Fills",extra=str(post_fills),sample_count=post_fills,show_wr_pf=False))
+                        as_updated = state.get("updated_at")
+                        issue = None
+                        if as_updated and (datetime.now(timezone.utc) - as_updated).total_seconds() > 300:
+                            issue = "主 AS1 快照停更"
+                            system_issues.append(issue)
+                        action = mm_action(post_fills, post_net)
+                        inv_notional = abs(f(state.get("inventory_base")) * f(state.get("last_mid")))
+                        as_note = f"主庫存約 {inv_notional:.1f}U"
+                        cores.append(make_core("AS1","BTC 做市 / 橫盤核心",before,after,cutoff,as_updated,
+                                               extra_label="修正後 Fills",extra=str(post_fills),sample_count=post_fills,
+                                               show_wr_pf=False,forced_issue=issue,note=as_note,action_override=action))
 
                 # BF1
                 if table_exists(cur, "bf_positions"):
                     before, after, updated = split_positions(cur, "bf_positions", revisions["BF1"])
+                    obs_count = 0
                     if table_exists(cur, "bf_observations"):
-                        cur.execute("SELECT MAX(observed_at) AS t FROM bf_observations")
-                        t = cur.fetchone()["t"]
+                        cur.execute("SELECT COUNT(*) AS n,MAX(observed_at) AS t FROM bf_observations WHERE observed_at >= %s", (revisions["BF1"],))
+                        br = cur.fetchone(); obs_count = int(br["n"] or 0); t = br["t"]
                         if t:
                             updated = t
+                    closed = norm_stats(after)["closed"]
+                    if closed == 0 and obs_count > 0:
+                        bf_action = ("等待市場條件", "good", f"已掃描 {obs_count} 次但尚無合格套利；第一輪 20 筆有效交易還差 20 筆，不要為湊單放寬")
+                    else:
+                        bf_action = trade_action(after, closed)
                     cores.append(make_core("BF1","Basis + Funding 套利",before,after,revisions["BF1"],updated,
-                                           extra_label="修正後已平倉",extra=str(norm_stats(after)["closed"])))
+                                           extra_label="修正後已平倉",extra=str(closed),
+                                           note=f"修正後掃描 {obs_count} 次",action_override=bf_action))
 
                 # MEME1X V2 only
                 if table_exists(cur, "meme1x_positions"):
@@ -351,10 +458,11 @@ def home():
                     )
                     cores.append(make_core("MEME1X V2","Solana 新池 · 出場能力確認",before,after,revisions["MEME1X"],updated,
                                            extra_label="修正後已平倉",extra=str(norm_stats(after)["closed"]),
-                                           note="只計 EXITABILITY_V2"))
+                                           note="EXITABILITY_V2 程式名；績效只計最新修正切點後"))
 
-                # MEME2
+                # MEME2: active_max_open=0 during current observation phase, so decision sample is completed shadow candidates.
                 active_wallets, signal_count, avg_delay, last_wallet_update = 0, 0, None, None
+                shadow_completed, shadow_total, shadow_avg10, shadow_wr10, shadow_updated = 0, 0, None, None, None
                 if table_exists(cur, "meme2_wallet_state"):
                     cur.execute("SELECT COUNT(*) FILTER (WHERE updated_at>=NOW()-INTERVAL '5 minutes') AS active,MAX(updated_at) AS updated FROM meme2_wallet_state")
                     w = dict(cur.fetchone())
@@ -369,6 +477,20 @@ def home():
                     sg = dict(cur.fetchone())
                     signal_count = int(sg["c"] or 0)
                     avg_delay = f(sg["avg_delay"], None)
+                if table_exists(cur, "shadow_rejections"):
+                    cur.execute("""
+                        SELECT COUNT(*) FILTER (WHERE engine_version='MEME2_V3_SHADOW' AND observed_at >= %s) AS total,
+                               COUNT(*) FILTER (WHERE engine_version='MEME2_V3_SHADOW' AND observed_at >= %s AND completed_at IS NOT NULL) AS completed,
+                               AVG(return_10m_pct) FILTER (WHERE engine_version='MEME2_V3_SHADOW' AND observed_at >= %s AND completed_at IS NOT NULL) AS avg10,
+                               100.0 * COUNT(*) FILTER (WHERE engine_version='MEME2_V3_SHADOW' AND observed_at >= %s AND completed_at IS NOT NULL AND return_10m_pct>0)
+                                 / NULLIF(COUNT(*) FILTER (WHERE engine_version='MEME2_V3_SHADOW' AND observed_at >= %s AND completed_at IS NOT NULL),0) AS wr10,
+                               MAX(observed_at) FILTER (WHERE engine_version='MEME2_V3_SHADOW' AND observed_at >= %s) AS updated
+                        FROM shadow_rejections
+                    """, (revisions["MEME2"],)*6)
+                    sh = dict(cur.fetchone())
+                    shadow_total = int(sh.get("total") or 0); shadow_completed = int(sh.get("completed") or 0)
+                    shadow_avg10 = f(sh.get("avg10"), None); shadow_wr10 = f(sh.get("wr10"), None); shadow_updated = sh.get("updated")
+
                 if table_exists(cur, "meme2_positions"):
                     before, after, updated = split_positions(cur, "meme2_positions", revisions["MEME2"])
                     issue = None
@@ -378,9 +500,12 @@ def home():
                     elif avg_delay is not None and avg_delay > 30:
                         issue = "偵測延遲偏高"
                         system_issues.append(issue)
-                    note = f"修正後訊號 {signal_count}｜延遲 {avg_delay:.1f}s" if avg_delay is not None else f"修正後訊號 {signal_count}"
-                    cores.append(make_core("MEME2","聰明錢包跟單",before,after,revisions["MEME2"],last_wallet_update or updated,
-                                           extra_label="監控錢包",extra=str(active_wallets),forced_issue=issue,note=note))
+                    note = f"修正後訊號 {signal_count}｜影子 {shadow_completed}/{shadow_total}｜延遲 {avg_delay:.1f}s" if avg_delay is not None else f"修正後訊號 {signal_count}｜影子 {shadow_completed}/{shadow_total}"
+                    meme2_action = shadow_action(shadow_completed, shadow_avg10, shadow_wr10)
+                    meme2_updated = max([x for x in (last_wallet_update, shadow_updated, updated) if x], default=None)
+                    cores.append(make_core("MEME2","聰明錢包跟單 · 影子觀察",before,after,revisions["MEME2"],meme2_updated,
+                                           extra_label="完整影子",extra=f"{shadow_completed}/50",sample_count=shadow_completed,
+                                           forced_issue=issue,note=note,action_override=meme2_action))
 
     except psycopg2.Error:
         app.logger.exception("Dashboard read failed")
@@ -398,8 +523,8 @@ def home():
     else:
         best, worst = "樣本不足", "樣本不足"
 
-    insufficient = [c["name"] for c in cores if c["sample_count"] < 20]
-    watch = "、".join(insufficient) if insufficient else "無"
+    needs = [c["name"] for c in cores if c["action_class"] == "bad"]
+    needs_fix = "、".join(needs) if needs else "目前無"
     system = "正常" if not system_issues else "、".join(system_issues)
 
     return render_template_string(
@@ -407,7 +532,7 @@ def home():
         cores=cores,
         best=best,
         worst=worst,
-        watch=watch,
+        needs_fix=needs_fix,
         system=system,
         now=datetime.now(SYDNEY).strftime("%m/%d %H:%M:%S"),
         money=money,
