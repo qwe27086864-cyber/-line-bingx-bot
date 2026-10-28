@@ -82,48 +82,13 @@ def fetch_page(
     }
     url = f"{API_BASE}{KLINE_PATH}?{urlencode(params)}"
     req = Request(url, headers={"User-Agent": "historical-router-v1/1.0"})
-
-    last_error = None
-    for attempt in range(6):
-        try:
-            with urlopen(req, timeout=30) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-
-            code = payload.get("code")
-            if code in (0, "0", None):
-                rows = payload.get("data") or []
-                rows.sort(key=row_ts)
-                return rows
-
-            last_error = RuntimeError(f"BingX error: {payload}")
-
-            # 100410 = temporary "please retry later" response observed in
-            # production. Back off instead of aborting the whole history run.
-            if str(code) == "100410":
-                delay = min(3.0 * (2 ** attempt), 48.0)
-                print(
-                    f"BingX temporary 100410; retry {attempt + 1}/6 "
-                    f"after {delay:.1f}s",
-                    flush=True,
-                )
-                time.sleep(delay)
-                continue
-
-            raise last_error
-
-        except Exception as exc:
-            last_error = exc
-            if attempt >= 5:
-                break
-            delay = min(3.0 * (2 ** attempt), 48.0)
-            print(
-                f"BingX request failed ({type(exc).__name__}: {exc}); "
-                f"retry {attempt + 1}/6 after {delay:.1f}s",
-                flush=True,
-            )
-            time.sleep(delay)
-
-    raise RuntimeError(f"BingX request failed after retries: {last_error}")
+    with urlopen(req, timeout=30) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    if payload.get("code") not in (0, "0", None):
+        raise RuntimeError(f"BingX error: {payload}")
+    rows = payload.get("data") or []
+    rows.sort(key=row_ts)
+    return rows
 
 
 def normalize_row(symbol: str, interval: str, row) -> dict:
@@ -238,8 +203,10 @@ def download_symbol(
             break
         cursor_end = next_end
 
-        if len(page) < 1440:
-            break
+        # Do not infer "last page" from page length. BingX returns different
+        # maximum page sizes for different intervals (for example 1m may return
+        # more rows than 5m/15m). Keep paginating backward until the earliest
+        # candle reaches the requested start time.
         time.sleep(max(0.0, request_pause_sec))
 
     result.sort(key=lambda r: r["timestamp"])
@@ -252,7 +219,7 @@ def main() -> None:
     p.add_argument("--interval", default="5m", choices=sorted(INTERVAL_MS))
     p.add_argument("--days", type=int, default=90)
     p.add_argument("--out", default="data/history_5m.csv")
-    p.add_argument("--request-pause-sec", type=float, default=2.25)
+    p.add_argument("--request-pause-sec", type=float, default=1.05)
     args = p.parse_args()
 
     if args.days <= 0:
