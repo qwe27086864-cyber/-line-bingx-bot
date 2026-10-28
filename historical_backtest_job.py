@@ -18,6 +18,12 @@ for interval in ("1m","5m","15m","1h"):
 run([sys.executable,"market_regime.py","--candles",DATA/"history_5m.csv",
      "--out",DATA/"market_features.csv"])
 
+# Export the existing DB forward/shadow datasets when this service has DATABASE_URL.
+if os.environ.get("DATABASE_URL"):
+    run([sys.executable,"historical_db_forward_export.py","--out-dir",DATA])
+else:
+    print("DATABASE_URL not set: BF1/AS1/MEME1/MEME2 DB export skipped",flush=True)
+
 run([sys.executable,"historical_suite.py","--data-dir",DATA,
      "--out",DATA/"all_core_outcomes.csv"])
 
