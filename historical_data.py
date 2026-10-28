@@ -167,14 +167,24 @@ def download_symbol(
     end_ms: int,
     request_pause_sec: float,
 ) -> list[dict]:
+    """Download a complete historical range by paginating BACKWARD.
+
+    BingX v3 klines returns the most recent rows inside the requested window.
+    Forward pagination therefore stops after the first 1,440 candles. We move
+    `endTime` backward to one interval before the earliest candle received.
+    """
     step = INTERVAL_MS[interval]
-    cursor = start_ms
+    cursor_end = end_ms
     result: list[dict] = []
     seen = set()
 
-    while cursor <= end_ms:
-        page = fetch_page(symbol, interval, cursor, end_ms)
+    while cursor_end >= start_ms:
+        page = fetch_page(symbol, interval, start_ms, cursor_end)
         if not page:
+            break
+
+        page_ts = [row_ts(raw) for raw in page if row_ts(raw) > 0]
+        if not page_ts:
             break
 
         for raw in page:
@@ -184,11 +194,14 @@ def download_symbol(
             seen.add(ts)
             result.append(normalize_row(symbol, interval, raw))
 
-        last_ts = row_ts(page[-1])
-        next_cursor = last_ts + step
-        if next_cursor <= cursor:
+        earliest_ts = min(page_ts)
+        if earliest_ts <= start_ms:
             break
-        cursor = next_cursor
+
+        next_end = earliest_ts - step
+        if next_end >= cursor_end:
+            break
+        cursor_end = next_end
 
         if len(page) < 1440:
             break
