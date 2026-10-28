@@ -56,13 +56,21 @@ def iso_utc(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
 
 
+def row_ts(row) -> int:
+    if isinstance(row, (list, tuple)):
+        return int(row[0])
+    if isinstance(row, dict):
+        return int(row.get("time", row.get("openTime", row.get("open_time", 0))))
+    raise TypeError(f"unsupported kline row type: {type(row).__name__}")
+
+
 def fetch_page(
     symbol: str,
     interval: str,
     start_ms: int,
     end_ms: int,
     limit: int = 1440,
-) -> list[list]:
+) -> list:
     if interval not in INTERVAL_MS:
         raise ValueError(f"unsupported interval: {interval}")
     params = {
@@ -79,27 +87,53 @@ def fetch_page(
     if payload.get("code") not in (0, "0", None):
         raise RuntimeError(f"BingX error: {payload}")
     rows = payload.get("data") or []
-    rows.sort(key=lambda x: int(x[0]))
+    rows.sort(key=row_ts)
     return rows
 
 
-def normalize_row(symbol: str, interval: str, row: list) -> dict:
-    if len(row) < 7:
-        raise ValueError(f"unexpected kline row: {row}")
-    return {
-        "timestamp": iso_utc(int(row[0])),
-        "symbol": symbol,
-        "interval": interval,
-        "open": float(row[1]),
-        "high": float(row[2]),
-        "low": float(row[3]),
-        "close": float(row[4]),
-        "volume": float(row[5]),
-        "quote_volume": float(row[7]) if len(row) > 7 and row[7] not in (None, "") else 0.0,
-        "trades": int(float(row[8])) if len(row) > 8 and row[8] not in (None, "") else 0,
-        "taker_buy_base": float(row[9]) if len(row) > 9 and row[9] not in (None, "") else 0.0,
-        "taker_buy_quote": float(row[10]) if len(row) > 10 and row[10] not in (None, "") else 0.0,
-    }
+def normalize_row(symbol: str, interval: str, row) -> dict:
+    if isinstance(row, (list, tuple)):
+        if len(row) < 6:
+            raise ValueError(f"unexpected kline row: {row}")
+        return {
+            "timestamp": iso_utc(row_ts(row)),
+            "symbol": symbol,
+            "interval": interval,
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]),
+            "quote_volume": float(row[7]) if len(row) > 7 and row[7] not in (None, "") else 0.0,
+            "trades": int(float(row[8])) if len(row) > 8 and row[8] not in (None, "") else 0,
+            "taker_buy_base": float(row[9]) if len(row) > 9 and row[9] not in (None, "") else 0.0,
+            "taker_buy_quote": float(row[10]) if len(row) > 10 and row[10] not in (None, "") else 0.0,
+        }
+
+    if isinstance(row, dict):
+        def first(*keys, default=0):
+            for key in keys:
+                value = row.get(key)
+                if value not in (None, ""):
+                    return value
+            return default
+
+        return {
+            "timestamp": iso_utc(row_ts(row)),
+            "symbol": symbol,
+            "interval": interval,
+            "open": float(first("open")),
+            "high": float(first("high")),
+            "low": float(first("low")),
+            "close": float(first("close")),
+            "volume": float(first("volume")),
+            "quote_volume": float(first("quoteVolume", "quote_volume", "quoteAssetVolume")),
+            "trades": int(float(first("trades", "tradeCount", "count"))),
+            "taker_buy_base": float(first("takerBuyBaseVolume", "taker_buy_base", "takerBuyBaseAssetVolume")),
+            "taker_buy_quote": float(first("takerBuyQuoteVolume", "taker_buy_quote", "takerBuyQuoteAssetVolume")),
+        }
+
+    raise TypeError(f"unsupported kline row type: {type(row).__name__}")
 
 
 def load_existing_keys(path: Path) -> set[tuple[str, str, str]]:
@@ -144,13 +178,13 @@ def download_symbol(
             break
 
         for raw in page:
-            ts = int(raw[0])
+            ts = row_ts(raw)
             if ts < start_ms or ts > end_ms or ts in seen:
                 continue
             seen.add(ts)
             result.append(normalize_row(symbol, interval, raw))
 
-        last_ts = int(page[-1][0])
+        last_ts = row_ts(page[-1])
         next_cursor = last_ts + step
         if next_cursor <= cursor:
             break
