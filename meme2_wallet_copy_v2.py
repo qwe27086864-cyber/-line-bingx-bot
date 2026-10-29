@@ -41,11 +41,11 @@ ENGINE = "MEME2_V3"
 # Transport / rate-limit settings
 # ---------------------------------------------------------------------------
 
-RPC_MIN_INTERVAL_SEC = float(os.environ.get("MEME2_RPC_MIN_INTERVAL_SEC", "1.00"))
-RPC_429_COOLDOWN_SEC = float(os.environ.get("MEME2_RPC_429_COOLDOWN_SEC", "12"))
+RPC_MIN_INTERVAL_SEC = float(os.environ.get("MEME2_RPC_MIN_INTERVAL_SEC", "1.50"))
+RPC_429_COOLDOWN_SEC = float(os.environ.get("MEME2_RPC_429_COOLDOWN_SEC", "20"))
 GECKO_MIN_INTERVAL_SEC = float(os.environ.get("MEME2_GECKO_MIN_INTERVAL_SEC", "2.50"))
 GECKO_429_COOLDOWN_SEC = float(os.environ.get("MEME2_GECKO_429_COOLDOWN_SEC", "15"))
-RETRY_FLOOR_SEC = float(os.environ.get("MEME2_RETRY_FLOOR_SEC", "3.0"))
+RETRY_FLOOR_SEC = float(os.environ.get("MEME2_RETRY_FLOOR_SEC", "5.0"))
 
 core.POLL_INTERVAL_SEC = float(os.environ.get("MEME2_POLL_INTERVAL_SEC", "30"))
 core.HTTP_RETRIES = int(os.environ.get("MEME2_HTTP_RETRIES", "5"))
@@ -181,7 +181,7 @@ def hardened_rpc(method, params):
             headers={"Content-Type": "application/json", "User-Agent": core.USER_AGENT},
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=float(os.environ.get("MEME2_RPC_TIMEOUT_SEC", "22"))) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             if payload.get("error"):
                 raise RuntimeError(f"RPC {method} error: {payload['error']}")
@@ -199,8 +199,11 @@ def hardened_rpc(method, params):
         except Exception as exc:
             last_exc = exc
             if attempt >= core.HTTP_RETRIES - 1:
+                print(f"MEME2 RPC {method} exhausted retries: {type(exc).__name__}", flush=True)
                 raise
             delay = max(RETRY_FLOOR_SEC, core.HTTP_RETRY_BASE_SEC * (2 ** attempt))
+            _push_cooldown("rpc", delay)
+            print(f"MEME2 RPC {method} {type(exc).__name__}; cooldown {delay:.1f}s retry={attempt + 1}", flush=True)
             time.sleep(delay)
 
     raise RuntimeError(f"RPC {method} failed: {last_exc}")
