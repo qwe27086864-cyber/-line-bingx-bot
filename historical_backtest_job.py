@@ -79,17 +79,19 @@ def download_interval(interval: str, start: datetime, end: datetime) -> None:
     print(f"saved {total_new} new rows -> {out}", flush=True)
 
 
-def recover_5m_from_1m(start: datetime, end: datetime) -> None:
-    """Fill missing 5m bars using five complete 1m bars, with no future leakage.
+def recover_interval_from_1m(interval: str, start: datetime, end: datetime) -> None:
+    if interval not in {"5m", "15m"}:
+        raise ValueError(f"Unsupported recovery interval: {interval}")
 
-    BingX may return zero 5m bars for older windows while 1m bars are
-    available. Preserve any exchange-supplied 5m bars; synthesize only gaps.
-    Fail if coverage is insufficient, rather than silently backtesting bad data.
-    """
+    minutes = int(interval[:-1])
+    bucket_ms = minutes * 60_000
     source = DATA / "history_1m.csv"
-    target = DATA / "history_5m.csv"
+    target = DATA / f"history_{interval}.csv"
+
     if not source.exists():
-        raise RuntimeError("Cannot recover 5m candles: 1m CSV is missing")
+        raise RuntimeError(
+            f"Cannot recover {interval} candles: 1m CSV is missing"
+        )
 
     existing = hd.load_existing_keys(target)
     recovered = []
@@ -100,19 +102,26 @@ def recover_5m_from_1m(start: datetime, end: datetime) -> None:
     def flush() -> None:
         if not group:
             return
+
         symbol, bucket = group_key
-        times = [hd.utc_ms(datetime.fromisoformat(r["timestamp"])) for r in group]
-        if len(times) != 5 or times != [bucket + n * 60_000 for n in range(5)]:
+        times = [
+            hd.utc_ms(datetime.fromisoformat(r["timestamp"]))
+            for r in group
+        ]
+        expected_times = [bucket + n * 60_000 for n in range(minutes)]
+        if len(times) != minutes or times != expected_times:
             return
+
         ts = hd.iso_utc(bucket)
-        key = (ts, symbol, "5m")
+        key = (ts, symbol, interval)
         if key in existing:
             return
+
         first, last = group[0], group[-1]
         recovered.append({
             "timestamp": ts,
             "symbol": symbol,
-            "interval": "5m",
+            "interval": interval,
             "open": float(first["open"]),
             "high": max(float(r["high"]) for r in group),
             "low": min(float(r["low"]) for r in group),
@@ -130,28 +139,45 @@ def recover_5m_from_1m(start: datetime, end: datetime) -> None:
             ts_ms = hd.utc_ms(datetime.fromisoformat(row["timestamp"]))
             if ts_ms < start_ms or ts_ms >= end_ms:
                 continue
-            key = (row["symbol"], (ts_ms // 300_000) * 300_000)
+
+            key = (row["symbol"], (ts_ms // bucket_ms) * bucket_ms)
             if key != group_key:
                 flush()
                 group_key, group = key, []
             group.append(row)
+
         flush()
 
     added = hd.append_rows(target, recovered)
-    print(f"5m recovery: aggregated {added} complete bars from 1m", flush=True)
+    print(
+        f"{interval} recovery: aggregated {added} complete bars from 1m",
+        flush=True,
+    )
 
-    counts = {s: 0 for s in (x.strip().upper() for x in SYMBOLS.split(",")) if s}
+    counts = {
+        s: 0
+        for s in (x.strip().upper() for x in SYMBOLS.split(","))
+        if s
+    }
     with target.open(newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             if row["symbol"] in counts:
                 counts[row["symbol"]] += 1
-    expected = int((end - start).total_seconds() // 300)
+
+    expected = int((end - start).total_seconds() // (minutes * 60))
     minimum = int(expected * 0.95)
-    print(f"5m coverage: expected={expected} minimum={minimum} counts={counts}", flush=True)
+
+    print(
+        f"{interval} coverage: expected={expected} minimum={minimum} "
+        f"counts={counts}",
+        flush=True,
+    )
+
     if any(n < minimum for n in counts.values()):
         raise RuntimeError(
-            f"Insufficient 5m history after 1m recovery: {counts}; "
-            f"need >= {minimum} per symbol. Stop rather than backtest incomplete data."
+            f"Insufficient {interval} history after 1m recovery: {counts}; "
+            f"need >= {minimum} per symbol. Stop rather than backtest "
+            "incomplete R3 data."
         )
 
 
@@ -170,7 +196,8 @@ print(
 for interval in ("1m", "5m", "15m", "1h"):
     download_interval(interval, start, end)
 
-recover_5m_from_1m(start, end)
+recover_interval_from_1m("5m", start, end)
+recover_interval_from_1m("15m", start, end)
 
 run([
     sys.executable,
