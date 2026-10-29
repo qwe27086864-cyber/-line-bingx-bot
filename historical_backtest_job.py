@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import os
 import subprocess
 import sys
@@ -78,6 +79,82 @@ def download_interval(interval: str, start: datetime, end: datetime) -> None:
     print(f"saved {total_new} new rows -> {out}", flush=True)
 
 
+def recover_5m_from_1m(start: datetime, end: datetime) -> None:
+    """Fill missing 5m bars using five complete 1m bars, with no future leakage.
+
+    BingX may return zero 5m bars for older windows while 1m bars are
+    available. Preserve any exchange-supplied 5m bars; synthesize only gaps.
+    Fail if coverage is insufficient, rather than silently backtesting bad data.
+    """
+    source = DATA / "history_1m.csv"
+    target = DATA / "history_5m.csv"
+    if not source.exists():
+        raise RuntimeError("Cannot recover 5m candles: 1m CSV is missing")
+
+    existing = hd.load_existing_keys(target)
+    recovered = []
+    group_key = None
+    group = []
+    start_ms, end_ms = hd.utc_ms(start), hd.utc_ms(end)
+
+    def flush() -> None:
+        if not group:
+            return
+        symbol, bucket = group_key
+        times = [hd.utc_ms(datetime.fromisoformat(r["timestamp"])) for r in group]
+        if len(times) != 5 or times != [bucket + n * 60_000 for n in range(5)]:
+            return
+        ts = hd.iso_utc(bucket)
+        key = (ts, symbol, "5m")
+        if key in existing:
+            return
+        first, last = group[0], group[-1]
+        recovered.append({
+            "timestamp": ts,
+            "symbol": symbol,
+            "interval": "5m",
+            "open": float(first["open"]),
+            "high": max(float(r["high"]) for r in group),
+            "low": min(float(r["low"]) for r in group),
+            "close": float(last["close"]),
+            "volume": sum(float(r["volume"]) for r in group),
+            "quote_volume": sum(float(r["quote_volume"]) for r in group),
+            "trades": sum(int(float(r["trades"])) for r in group),
+            "taker_buy_base": sum(float(r["taker_buy_base"]) for r in group),
+            "taker_buy_quote": sum(float(r["taker_buy_quote"]) for r in group),
+        })
+        existing.add(key)
+
+    with source.open(newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            ts_ms = hd.utc_ms(datetime.fromisoformat(row["timestamp"]))
+            if ts_ms < start_ms or ts_ms >= end_ms:
+                continue
+            key = (row["symbol"], (ts_ms // 300_000) * 300_000)
+            if key != group_key:
+                flush()
+                group_key, group = key, []
+            group.append(row)
+        flush()
+
+    added = hd.append_rows(target, recovered)
+    print(f"5m recovery: aggregated {added} complete bars from 1m", flush=True)
+
+    counts = {s: 0 for s in (x.strip().upper() for x in SYMBOLS.split(",")) if s}
+    with target.open(newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            if row["symbol"] in counts:
+                counts[row["symbol"]] += 1
+    expected = int((end - start).total_seconds() // 300)
+    minimum = int(expected * 0.95)
+    print(f"5m coverage: expected={expected} minimum={minimum} counts={counts}", flush=True)
+    if any(n < minimum for n in counts.values()):
+        raise RuntimeError(
+            f"Insufficient 5m history after 1m recovery: {counts}; "
+            f"need >= {minimum} per symbol. Stop rather than backtest incomplete data."
+        )
+
+
 if DAYS <= 0:
     raise ValueError("HIST_DAYS must be > 0")
 
@@ -92,6 +169,8 @@ print(
 
 for interval in ("1m", "5m", "15m", "1h"):
     download_interval(interval, start, end)
+
+recover_5m_from_1m(start, end)
 
 run([
     sys.executable,
