@@ -26,6 +26,7 @@ import r3_historical_adapter as v1
 
 _SERIES_ENDS = {}
 _C1_META = {}
+_QV_FALLBACK_ROWS = {}
 
 
 def _register_series(series):
@@ -35,6 +36,7 @@ def _register_series(series):
 def build_caches(c1_by, c5_by, c15_by, c1h_by):
     _SERIES_ENDS.clear()
     _C1_META.clear()
+    _QV_FALLBACK_ROWS.clear()
 
     for source in (c1_by, c5_by, c15_by, c1h_by):
         for rows in source.values():
@@ -44,9 +46,26 @@ def build_caches(c1_by, c5_by, c15_by, c1h_by):
         ends = _SERIES_ENDS[id(rows)]
         prefix = [0.0]
         total = 0.0
+        fallback_rows = 0
         for x in rows:
-            total += float(x.get("quote_volume") or 0.0)
+            qv = float(x.get("quote_volume") or 0.0)
+
+            # BingX historical 1m responses can return quote_volume=0 even when
+            # base volume and price are present. R3's live Radar gate is defined
+            # in quote currency, so for historical-only replay reconstruct a
+            # conservative per-candle quote-volume proxy from base volume × close.
+            # This does NOT change the live strategy or write any database.
+            if qv <= 0.0:
+                base_vol = float(x.get("volume") or 0.0)
+                close = float(x.get("close") or 0.0)
+                if base_vol > 0.0 and close > 0.0:
+                    qv = base_vol * close
+                    fallback_rows += 1
+
+            total += qv
             prefix.append(total)
+
+        _QV_FALLBACK_ROWS[symbol] = fallback_rows
         _C1_META[symbol] = {
             "rows": rows,
             "ends": ends,
@@ -294,6 +313,7 @@ def run_gate_diagnostic(c1, c5, c15, c1h, spread):
         "max_abs_move_by_symbol_pct": {
             k: round(v, 6) for k, v in sorted(max_abs_move.items())
         },
+        "quote_volume_fallback_rows": dict(sorted(_QV_FALLBACK_ROWS.items())),
         "per_symbol": {k: dict(v) for k, v in sorted(per_symbol.items())},
     }
 
@@ -345,6 +365,12 @@ def main():
         flush=True,
     )
     print("R3_DIAG_DONE", flush=True)
+
+    print(
+        "R3_QUOTE_VOLUME_FALLBACK "
+        + json.dumps(dict(sorted(_QV_FALLBACK_ROWS.items())), sort_keys=True),
+        flush=True,
+    )
 
     print(
         "R3_FAST_CACHE_READY "
