@@ -502,6 +502,77 @@ def run_chase_sweep(c1, c5, c15, c1h, spread):
     }
 
 
+def run_trigger_grid_sweep(c1, c5, c15, c1h, spread):
+    """Historical-only small grid. No DB, no orders, no live parameter writes."""
+    orig_mom = float(v1.TRIGGER_MIN_1M_MOM)
+    orig_vr = float(v1.TRIGGER_MIN_1M_VOLUME_RATIO)
+    orig_chase = float(v1.ENTER_MAX_TRIGGER_CHASE)
+
+    moms = [0.00, 0.03, 0.05]
+    vrs = [0.80, 0.90, 1.00]
+    chases = [0.20, 0.25, 0.30]
+    rows = []
+
+    try:
+        for mom in moms:
+            for vr in vrs:
+                for chase in chases:
+                    v1.TRIGGER_MIN_1M_MOM = float(mom)
+                    v1.TRIGGER_MIN_1M_VOLUME_RATIO = float(vr)
+                    v1.ENTER_MAX_TRIGGER_CHASE = float(chase)
+
+                    details_i, trades_i = v1.run_replay(
+                        c1, c5, c15, c1h, spread
+                    )
+                    metrics = _result_from_trades(trades_i)
+                    vals = [
+                        float(x["net_return_pct"])
+                        for x in trades_i
+                        if x.get("resolved")
+                    ]
+                    wins = sum(1 for x in vals if x > 0)
+                    losses = sum(1 for x in vals if x < 0)
+
+                    rows.append({
+                        "mom": round(mom, 2),
+                        "vr": round(vr, 2),
+                        "chase": round(chase, 2),
+                        "events": len(details_i),
+                        "entries": metrics["entries"],
+                        "resolved_entries": metrics["resolved_entries"],
+                        "wins": wins,
+                        "losses": losses,
+                        "win_rate_pct": metrics["win_rate_pct"],
+                        "profit_factor": metrics["profit_factor"],
+                        "sum_net_return_pct": metrics["sum_net_return_pct"],
+                    })
+    finally:
+        v1.TRIGGER_MIN_1M_MOM = orig_mom
+        v1.TRIGGER_MIN_1M_VOLUME_RATIO = orig_vr
+        v1.ENTER_MAX_TRIGGER_CHASE = orig_chase
+
+    ranked = sorted(
+        rows,
+        key=lambda r: (
+            r["sum_net_return_pct"],
+            r["profit_factor"],
+            r["resolved_entries"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "baseline": {
+            "mom": orig_mom,
+            "vr": orig_vr,
+            "chase": orig_chase,
+        },
+        "tested": len(rows),
+        "top10": ranked[:10],
+        "all": rows,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--candles-1m", required=True)
@@ -590,6 +661,16 @@ def main():
         flush=True,
     )
     print("R3_CHASE_SWEEP_DONE", flush=True)
+
+    trigger_grid = run_trigger_grid_sweep(
+        c1, c5, c15, c1h, args.assumed_spread_pct
+    )
+    print(
+        "R3_TRIGGER_GRID_SUMMARY "
+        + json.dumps(trigger_grid, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
+    print("R3_TRIGGER_GRID_DONE", flush=True)
 
     result = v1.write_outputs(
         details,
