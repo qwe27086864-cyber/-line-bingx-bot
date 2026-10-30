@@ -752,6 +752,91 @@ def run_trade_detail_diagnostic(c1, c5, c15, c1h, spread):
     }
 
 
+def run_portfolio_guard_sweep(c1, c5, c15, c1h, spread):
+    """
+    Historical-only portfolio risk-control sweep.
+    Tests A/B signal parameters with MAX_OPEN and MAX_NEW_PER_SCAN caps.
+    Does not touch DB, orders, or live configuration.
+    """
+    orig_mom = float(v1.TRIGGER_MIN_1M_MOM)
+    orig_vr = float(v1.TRIGGER_MIN_1M_VOLUME_RATIO)
+    orig_chase = float(v1.ENTER_MAX_TRIGGER_CHASE)
+    orig_max_open = int(v1.MAX_OPEN)
+    orig_max_new = int(v1.MAX_NEW_PER_SCAN)
+
+    configs = [
+        {"name": "A_BALANCED", "mom": 0.03, "vr": 0.90, "chase": 0.30},
+        {"name": "B_CONSERVATIVE", "mom": 0.03, "vr": 1.00, "chase": 0.25},
+    ]
+    max_opens = [1, 2, 3, 5]
+    max_news = [1, 2]
+
+    rows = []
+    try:
+        for cfg in configs:
+            for max_open in max_opens:
+                for max_new in max_news:
+                    v1.TRIGGER_MIN_1M_MOM = float(cfg["mom"])
+                    v1.TRIGGER_MIN_1M_VOLUME_RATIO = float(cfg["vr"])
+                    v1.ENTER_MAX_TRIGGER_CHASE = float(cfg["chase"])
+                    v1.MAX_OPEN = int(max_open)
+                    v1.MAX_NEW_PER_SCAN = int(max_new)
+
+                    details_i, trades_i = v1.run_replay(
+                        c1, c5, c15, c1h, spread
+                    )
+                    metrics = _result_from_trades(trades_i)
+                    vals = [
+                        float(t["net_return_pct"])
+                        for t in trades_i
+                        if t.get("resolved")
+                    ]
+                    wins = sum(1 for x in vals if x > 0)
+                    losses = sum(1 for x in vals if x < 0)
+
+                    rows.append({
+                        "candidate": cfg["name"],
+                        "mom": cfg["mom"],
+                        "vr": cfg["vr"],
+                        "chase": cfg["chase"],
+                        "max_open": max_open,
+                        "max_new_per_scan": max_new,
+                        "entries": metrics["entries"],
+                        "resolved_entries": metrics["resolved_entries"],
+                        "wins": wins,
+                        "losses": losses,
+                        "win_rate_pct": metrics["win_rate_pct"],
+                        "profit_factor": metrics["profit_factor"],
+                        "sum_net_return_pct": metrics["sum_net_return_pct"],
+                    })
+    finally:
+        v1.TRIGGER_MIN_1M_MOM = orig_mom
+        v1.TRIGGER_MIN_1M_VOLUME_RATIO = orig_vr
+        v1.ENTER_MAX_TRIGGER_CHASE = orig_chase
+        v1.MAX_OPEN = orig_max_open
+        v1.MAX_NEW_PER_SCAN = orig_max_new
+
+    ranked = sorted(
+        rows,
+        key=lambda r: (
+            r["sum_net_return_pct"],
+            r["profit_factor"],
+            r["resolved_entries"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "baseline_portfolio": {
+            "max_open": orig_max_open,
+            "max_new_per_scan": orig_max_new,
+        },
+        "tested": len(rows),
+        "top10": ranked[:10],
+        "all": rows,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--candles-1m", required=True)
@@ -831,25 +916,15 @@ def main():
     )
     print("R3_STAGE2_DONE", flush=True)
 
-    shortlist = run_shortlist_sweep(
+    guard_sweep = run_portfolio_guard_sweep(
         c1, c5, c15, c1h, args.assumed_spread_pct
     )
     print(
-        "R3_SHORTLIST_SUMMARY "
-        + json.dumps(shortlist, ensure_ascii=False, sort_keys=True),
+        "R3_PORTFOLIO_GUARD_SUMMARY "
+        + json.dumps(guard_sweep, ensure_ascii=False, sort_keys=True),
         flush=True,
     )
-    print("R3_SHORTLIST_DONE", flush=True)
-
-    trade_diag = run_trade_detail_diagnostic(
-        c1, c5, c15, c1h, args.assumed_spread_pct
-    )
-    print(
-        "R3_TRADE_DETAIL_SUMMARY "
-        + json.dumps(trade_diag, ensure_ascii=False, sort_keys=True),
-        flush=True,
-    )
-    print("R3_TRADE_DETAIL_DONE", flush=True)
+    print("R3_PORTFOLIO_GUARD_DONE", flush=True)
 
     result = v1.write_outputs(
         details,
