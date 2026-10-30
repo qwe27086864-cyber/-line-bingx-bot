@@ -288,6 +288,55 @@ def main():
     print("R3_FAST_RUN", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
 
+    # Complete the isolated historical router reporting pipeline without
+    # rerunning the slow original R3 adapter. No database or live data access.
+    regime_path = DATA / "market_features.csv"
+    subprocess.run([
+        sys.executable, "market_regime.py",
+        "--candles", str(DATA / "history_5m.csv"),
+        "--out", str(regime_path),
+    ], check=True)
+    print("R3_FAST_MARKET_REGIME_DONE", flush=True)
+
+    r2_path = DATA / "r2fs_core_outcomes.csv"
+    subprocess.run([
+        sys.executable, "r2fs_historical_adapter.py",
+        "--candles-1m", str(DATA / "history_1m.csv"),
+        "--candles-5m", str(DATA / "history_5m.csv"),
+        "--outcomes-out", str(r2_path),
+    ], check=True)
+    print("R3_FAST_R2FS_BASELINE_DONE", flush=True)
+
+    fields = ["timestamp", "symbol", "core", "net_return_pct"]
+    merged = []
+    for source in (r2_path, DATA / "r3_core_outcomes.csv"):
+        with source.open(newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                merged.append({key: row.get(key, "") for key in fields})
+
+    merged_path = DATA / "all_core_outcomes.csv"
+    with merged_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(merged)
+    print(
+        f"R3_FAST_MERGE merged_rows={len(merged)} "
+        "historical_only=true",
+        flush=True,
+    )
+
+    report_path = DATA / "router_v1_report.json"
+    subprocess.run([
+        sys.executable, "router_trainer.py",
+        "--features", str(regime_path),
+        "--outcomes", str(merged_path),
+        "--out", str(report_path),
+    ], check=True)
+    if not report_path.exists() or report_path.stat().st_size == 0:
+        raise RuntimeError("R3 fast router report missing")
+    print("R3_FAST_ROUTER_REPORT_DONE", flush=True)
+    print("R3_FAST_PIPELINE_DONE", flush=True)
+
 
 if __name__ == "__main__":
     main()
