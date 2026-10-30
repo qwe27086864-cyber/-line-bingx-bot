@@ -573,6 +573,78 @@ def run_trigger_grid_sweep(c1, c5, c15, c1h, spread):
     }
 
 
+def run_shortlist_sweep(c1, c5, c15, c1h, spread):
+    """Historical-only shortlist validation. No DB/orders/live parameter writes."""
+    orig_mom = float(v1.TRIGGER_MIN_1M_MOM)
+    orig_vr = float(v1.TRIGGER_MIN_1M_VOLUME_RATIO)
+    orig_chase = float(v1.ENTER_MAX_TRIGGER_CHASE)
+
+    configs = [
+        {
+            "name": "A_BALANCED",
+            "mom": 0.03,
+            "vr": 0.90,
+            "chase": 0.30,
+        },
+        {
+            "name": "B_CONSERVATIVE",
+            "mom": 0.03,
+            "vr": 1.00,
+            "chase": 0.25,
+        },
+        {
+            "name": "C_MINIMAL_CHANGE",
+            "mom": 0.05,
+            "vr": 0.90,
+            "chase": 0.30,
+        },
+    ]
+
+    rows = []
+    try:
+        for cfg in configs:
+            v1.TRIGGER_MIN_1M_MOM = float(cfg["mom"])
+            v1.TRIGGER_MIN_1M_VOLUME_RATIO = float(cfg["vr"])
+            v1.ENTER_MAX_TRIGGER_CHASE = float(cfg["chase"])
+
+            details_i, trades_i = v1.run_replay(
+                c1, c5, c15, c1h, spread
+            )
+            metrics = _result_from_trades(trades_i)
+            vals = [
+                float(x["net_return_pct"])
+                for x in trades_i
+                if x.get("resolved")
+            ]
+            wins = sum(1 for x in vals if x > 0)
+            losses = sum(1 for x in vals if x < 0)
+
+            rows.append({
+                **cfg,
+                "events": len(details_i),
+                "entries": metrics["entries"],
+                "resolved_entries": metrics["resolved_entries"],
+                "wins": wins,
+                "losses": losses,
+                "win_rate_pct": metrics["win_rate_pct"],
+                "profit_factor": metrics["profit_factor"],
+                "sum_net_return_pct": metrics["sum_net_return_pct"],
+            })
+    finally:
+        v1.TRIGGER_MIN_1M_MOM = orig_mom
+        v1.TRIGGER_MIN_1M_VOLUME_RATIO = orig_vr
+        v1.ENTER_MAX_TRIGGER_CHASE = orig_chase
+
+    return {
+        "baseline": {
+            "mom": orig_mom,
+            "vr": orig_vr,
+            "chase": orig_chase,
+        },
+        "candidates": rows,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--candles-1m", required=True)
@@ -652,25 +724,15 @@ def main():
     )
     print("R3_STAGE2_DONE", flush=True)
 
-    chase_sweep = run_chase_sweep(
+    shortlist = run_shortlist_sweep(
         c1, c5, c15, c1h, args.assumed_spread_pct
     )
     print(
-        "R3_CHASE_SWEEP_SUMMARY "
-        + json.dumps(chase_sweep, ensure_ascii=False, sort_keys=True),
+        "R3_SHORTLIST_SUMMARY "
+        + json.dumps(shortlist, ensure_ascii=False, sort_keys=True),
         flush=True,
     )
-    print("R3_CHASE_SWEEP_DONE", flush=True)
-
-    trigger_grid = run_trigger_grid_sweep(
-        c1, c5, c15, c1h, args.assumed_spread_pct
-    )
-    print(
-        "R3_TRIGGER_GRID_SUMMARY "
-        + json.dumps(trigger_grid, ensure_ascii=False, sort_keys=True),
-        flush=True,
-    )
-    print("R3_TRIGGER_GRID_DONE", flush=True)
+    print("R3_SHORTLIST_DONE", flush=True)
 
     result = v1.write_outputs(
         details,
