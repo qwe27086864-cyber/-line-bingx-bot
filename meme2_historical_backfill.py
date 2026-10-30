@@ -68,7 +68,7 @@ def fetch_wallet(url,wallet,start_ts,end_ts,out_dir,limit,pause):
             "commitment":"finalized",
             "sortOrder":"asc",
             "limit":limit,
-            "filters":{"tokenAccounts":"all","blockTime":{"gte":start_ts,"lt":end_ts},"status":"succeeded"}
+            "filters":{"tokenAccounts":"balanceChanged","blockTime":{"gte":start_ts,"lt":end_ts},"status":"succeeded"}
         }
         if token: cfg["paginationToken"]=token
         ans=call(url,{"jsonrpc":"2.0","id":"meme2-hist","method":"getTransactionsForAddress","params":[wallet,cfg]})
