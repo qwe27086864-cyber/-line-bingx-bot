@@ -468,6 +468,40 @@ def _stage2_summary(details, trades):
     }
 
 
+def _result_from_trades(trades):
+    vals = [float(x["net_return_pct"]) for x in trades if x.get("resolved")]
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    pf = sum(wins) / abs(sum(losses)) if losses else (999.0 if wins else 0.0)
+    return {
+        "entries": len(trades),
+        "resolved_entries": len(vals),
+        "win_rate_pct": round(100.0 * len(wins) / len(vals), 2) if vals else 0.0,
+        "profit_factor": round(pf, 3),
+        "sum_net_return_pct": round(sum(vals), 3),
+    }
+
+
+def run_chase_sweep(c1, c5, c15, c1h, spread):
+    """Historical-only counterfactual sweep. No DB, no orders, no live changes."""
+    original = float(v1.ENTER_MAX_TRIGGER_CHASE)
+    thresholds = [0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
+    results = {}
+    try:
+        for threshold in thresholds:
+            v1.ENTER_MAX_TRIGGER_CHASE = float(threshold)
+            details_i, trades_i = v1.run_replay(c1, c5, c15, c1h, spread)
+            metrics = _result_from_trades(trades_i)
+            metrics["events"] = len(details_i)
+            results[f"{threshold:.2f}"] = metrics
+    finally:
+        v1.ENTER_MAX_TRIGGER_CHASE = original
+    return {
+        "baseline_live_default": original,
+        "thresholds": results,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--candles-1m", required=True)
@@ -546,6 +580,16 @@ def main():
         flush=True,
     )
     print("R3_STAGE2_DONE", flush=True)
+
+    chase_sweep = run_chase_sweep(
+        c1, c5, c15, c1h, args.assumed_spread_pct
+    )
+    print(
+        "R3_CHASE_SWEEP_SUMMARY "
+        + json.dumps(chase_sweep, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
+    print("R3_CHASE_SWEEP_DONE", flush=True)
 
     result = v1.write_outputs(
         details,
