@@ -317,6 +317,157 @@ def run_gate_diagnostic(c1, c5, c15, c1h, spread):
         "per_symbol": {k: dict(v) for k, v in sorted(per_symbol.items())},
     }
 
+# ---------------------------------------------------------------------------
+# Stage-2 lifecycle diagnostic wrappers.
+# These wrappers count gates only; every original return value is preserved.
+# ---------------------------------------------------------------------------
+_STAGE2 = Counter()
+_STAGE2_EXPECT_TRIGGER_MARKET = False
+_STAGE2_EXPECT_CHASE = False
+_STAGE2_TRIGGER_SIDE = None
+
+
+def _install_stage2_wrappers():
+    global _STAGE2_EXPECT_TRIGGER_MARKET, _STAGE2_EXPECT_CHASE, _STAGE2_TRIGGER_SIDE
+
+    _STAGE2.clear()
+    _STAGE2_EXPECT_TRIGGER_MARKET = False
+    _STAGE2_EXPECT_CHASE = False
+    _STAGE2_TRIGGER_SIDE = None
+
+    orig_local_trigger = v1.local_trigger
+    orig_recent_trigger_event = v1.recent_trigger_event
+    orig_market_alignment_for = v1.market_alignment_for
+    orig_pct = v1.pct
+    orig_risk_allows = v1.risk_allows
+    orig_symbol_blocked = v1.symbol_blocked
+    orig_simulate_exit = v1.simulate_exit
+
+    def local_trigger_wrapped(c1_by, symbol, side, scan_t):
+        _STAGE2["local_trigger_calls"] += 1
+        r = orig_local_trigger(c1_by, symbol, side, scan_t)
+        if r is None:
+            _STAGE2["local_trigger_none"] += 1
+        else:
+            _STAGE2["local_trigger_success"] += 1
+        return r
+
+    def recent_trigger_event_wrapped(c1_by, symbol, side, trigger_level, scan_t):
+        global _STAGE2_EXPECT_TRIGGER_MARKET, _STAGE2_TRIGGER_SIDE
+        _STAGE2["recent_trigger_calls"] += 1
+        r = orig_recent_trigger_event(c1_by, symbol, side, trigger_level, scan_t)
+        if r is None:
+            _STAGE2["recent_trigger_none"] += 1
+            return r
+
+        _STAGE2["recent_trigger_found"] += 1
+        mom = float(r.get("mom") or 0.0)
+        vr = float(r.get("vr") or 0.0)
+
+        if mom < v1.TRIGGER_MIN_1M_MOM:
+            _STAGE2["trigger_momentum_fail"] += 1
+        else:
+            _STAGE2["trigger_momentum_pass"] += 1
+
+        if vr < v1.TRIGGER_MIN_1M_VOLUME_RATIO:
+            _STAGE2["trigger_volume_fail"] += 1
+        else:
+            _STAGE2["trigger_volume_pass"] += 1
+
+        if mom >= v1.TRIGGER_MIN_1M_MOM and vr >= v1.TRIGGER_MIN_1M_VOLUME_RATIO:
+            _STAGE2_EXPECT_TRIGGER_MARKET = True
+            _STAGE2_TRIGGER_SIDE = side
+        return r
+
+    def market_alignment_for_wrapped(side, ctx):
+        global _STAGE2_EXPECT_TRIGGER_MARKET, _STAGE2_EXPECT_CHASE, _STAGE2_TRIGGER_SIDE
+        r = orig_market_alignment_for(side, ctx)
+        if _STAGE2_EXPECT_TRIGGER_MARKET:
+            _STAGE2["trigger_market_checks"] += 1
+            if int(r) < v1.MIN_MARKET_ALIGNMENT:
+                _STAGE2["trigger_market_fail"] += 1
+                _STAGE2_EXPECT_CHASE = False
+                _STAGE2_TRIGGER_SIDE = None
+            else:
+                _STAGE2["trigger_market_pass"] += 1
+                # If the supportive/retrace gate passes, the next pct() call in
+                # run_replay is the trigger-chase calculation.
+                _STAGE2_EXPECT_CHASE = True
+                _STAGE2_TRIGGER_SIDE = side
+            _STAGE2_EXPECT_TRIGGER_MARKET = False
+        return r
+
+    def pct_wrapped(a, b):
+        global _STAGE2_EXPECT_CHASE, _STAGE2_TRIGGER_SIDE
+        r = orig_pct(a, b)
+        if _STAGE2_EXPECT_CHASE:
+            _STAGE2["trigger_chase_checks"] += 1
+            adverse = max(float(r), 0.0)
+            if adverse > v1.ENTER_MAX_TRIGGER_CHASE:
+                _STAGE2["trigger_chase_fail"] += 1
+            else:
+                _STAGE2["trigger_chase_pass"] += 1
+            _STAGE2_EXPECT_CHASE = False
+            _STAGE2_TRIGGER_SIDE = None
+        return r
+
+    def risk_allows_wrapped(scan_t, trades):
+        _STAGE2["risk_checks"] += 1
+        r = orig_risk_allows(scan_t, trades)
+        if r[0]:
+            _STAGE2["risk_pass"] += 1
+        else:
+            _STAGE2["risk_fail"] += 1
+            _STAGE2[f"risk_fail_{r[1]}"] += 1
+        return r
+
+    def symbol_blocked_wrapped(symbol, scan_t, trades):
+        _STAGE2["symbol_block_checks"] += 1
+        r = orig_symbol_blocked(symbol, scan_t, trades)
+        if r:
+            _STAGE2["symbol_blocked"] += 1
+        else:
+            _STAGE2["symbol_block_pass"] += 1
+        return r
+
+    def simulate_exit_wrapped(side, entry, entry_time, bars):
+        _STAGE2["simulate_exit_calls"] += 1
+        return orig_simulate_exit(side, entry, entry_time, bars)
+
+    v1.local_trigger = local_trigger_wrapped
+    v1.recent_trigger_event = recent_trigger_event_wrapped
+    v1.market_alignment_for = market_alignment_for_wrapped
+    v1.pct = pct_wrapped
+    v1.risk_allows = risk_allows_wrapped
+    v1.symbol_blocked = symbol_blocked_wrapped
+    v1.simulate_exit = simulate_exit_wrapped
+
+
+def _stage2_summary(details, trades):
+    events = Counter(str(x.get("event") or "UNKNOWN") for x in details)
+    reasons = Counter(str(x.get("reason") or "") for x in details)
+
+    # If market passed but no chase calculation followed, the supportive
+    # retrace gate blocked the setup before entry-price/chase evaluation.
+    supportive_fail = max(
+        int(_STAGE2.get("trigger_market_pass", 0))
+        - int(_STAGE2.get("trigger_chase_checks", 0)),
+        0,
+    )
+
+    return {
+        "event_counts": dict(events),
+        "top_event_reasons": reasons.most_common(20),
+        "gate_counts": dict(_STAGE2),
+        "derived": {
+            "supportive_or_retrace_fail": supportive_fail,
+            "pullback_confirmed_estimate": int(events.get("PULLBACK_CONFIRMED", 0)),
+            "entered": int(events.get("ENTER", 0)),
+            "trades": len(trades),
+        },
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--candles-1m", required=True)
@@ -379,6 +530,8 @@ def main():
         flush=True,
     )
 
+    _install_stage2_wrappers()
+
     details, trades = v1.run_replay(
         c1,
         c5,
@@ -386,6 +539,13 @@ def main():
         c1h,
         args.assumed_spread_pct,
     )
+
+    print(
+        "R3_STAGE2_SUMMARY "
+        + json.dumps(_stage2_summary(details, trades), ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
+    print("R3_STAGE2_DONE", flush=True)
 
     result = v1.write_outputs(
         details,
