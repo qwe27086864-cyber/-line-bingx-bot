@@ -645,6 +645,113 @@ def run_shortlist_sweep(c1, c5, c15, c1h, spread):
     }
 
 
+def _trade_detail_rows(candidate_name, trades):
+    rows = []
+    for t in trades:
+        rows.append({
+            "candidate": candidate_name,
+            "symbol": str(t.get("symbol") or ""),
+            "side": str(t.get("side") or ""),
+            "entry_time": t.get("entry_time").isoformat() if t.get("entry_time") else None,
+            "exit_time": t.get("exit_time").isoformat() if t.get("exit_time") else None,
+            "entry_price": round(float(t.get("entry_price") or 0.0), 10),
+            "exit_price": round(float(t.get("exit_price") or 0.0), 10),
+            "exit_reason": str(t.get("exit_reason") or ""),
+            "gross_return_pct": round(float(t.get("gross_return_pct") or 0.0), 6),
+            "net_return_pct": round(float(t.get("net_return_pct") or 0.0), 6),
+            "resolved": bool(t.get("resolved")),
+        })
+    return rows
+
+
+def _trade_breakdown(rows):
+    def bucket(key_fn):
+        out = {}
+        for r in rows:
+            key = key_fn(r)
+            d = out.setdefault(key, {
+                "entries": 0, "wins": 0, "losses": 0,
+                "sum_net_return_pct": 0.0,
+            })
+            d["entries"] += 1
+            net = float(r["net_return_pct"])
+            d["sum_net_return_pct"] += net
+            if net > 0:
+                d["wins"] += 1
+            elif net < 0:
+                d["losses"] += 1
+        for d in out.values():
+            d["sum_net_return_pct"] = round(d["sum_net_return_pct"], 6)
+            d["win_rate_pct"] = round(
+                100.0 * d["wins"] / d["entries"], 2
+            ) if d["entries"] else 0.0
+        return dict(sorted(out.items()))
+
+    return {
+        "by_symbol": bucket(lambda r: r["symbol"]),
+        "by_side": bucket(lambda r: r["side"]),
+        "by_exit_reason": bucket(lambda r: r["exit_reason"]),
+        "by_symbol_side": bucket(lambda r: f'{r["symbol"]}|{r["side"]}'),
+    }
+
+
+def run_trade_detail_diagnostic(c1, c5, c15, c1h, spread):
+    """
+    Historical-only trade-level diagnostic for A/B shortlist.
+    Does not write DB, send orders, or change live parameters.
+    """
+    orig_mom = float(v1.TRIGGER_MIN_1M_MOM)
+    orig_vr = float(v1.TRIGGER_MIN_1M_VOLUME_RATIO)
+    orig_chase = float(v1.ENTER_MAX_TRIGGER_CHASE)
+
+    configs = [
+        {
+            "name": "A_BALANCED",
+            "mom": 0.03,
+            "vr": 0.90,
+            "chase": 0.30,
+        },
+        {
+            "name": "B_CONSERVATIVE",
+            "mom": 0.03,
+            "vr": 1.00,
+            "chase": 0.25,
+        },
+    ]
+
+    results = []
+    try:
+        for cfg in configs:
+            v1.TRIGGER_MIN_1M_MOM = float(cfg["mom"])
+            v1.TRIGGER_MIN_1M_VOLUME_RATIO = float(cfg["vr"])
+            v1.ENTER_MAX_TRIGGER_CHASE = float(cfg["chase"])
+
+            details_i, trades_i = v1.run_replay(
+                c1, c5, c15, c1h, spread
+            )
+
+            rows = _trade_detail_rows(cfg["name"], trades_i)
+            results.append({
+                **cfg,
+                "trade_count": len(rows),
+                "trades": rows,
+                "breakdown": _trade_breakdown(rows),
+            })
+    finally:
+        v1.TRIGGER_MIN_1M_MOM = orig_mom
+        v1.TRIGGER_MIN_1M_VOLUME_RATIO = orig_vr
+        v1.ENTER_MAX_TRIGGER_CHASE = orig_chase
+
+    return {
+        "baseline": {
+            "mom": orig_mom,
+            "vr": orig_vr,
+            "chase": orig_chase,
+        },
+        "candidates": results,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--candles-1m", required=True)
@@ -733,6 +840,16 @@ def main():
         flush=True,
     )
     print("R3_SHORTLIST_DONE", flush=True)
+
+    trade_diag = run_trade_detail_diagnostic(
+        c1, c5, c15, c1h, args.assumed_spread_pct
+    )
+    print(
+        "R3_TRADE_DETAIL_SUMMARY "
+        + json.dumps(trade_diag, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
+    print("R3_TRADE_DETAIL_DONE", flush=True)
 
     result = v1.write_outputs(
         details,
