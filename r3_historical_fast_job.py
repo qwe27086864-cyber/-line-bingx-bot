@@ -37,6 +37,7 @@ DATA = Path(
 DATA.mkdir(parents=True, exist_ok=True)
 
 MARK_PRICE_PATH = "/openApi/swap/v1/market/markPriceKlines"
+SPOT_HIST_PATH = "/openApi/market/his/v1/kline"
 
 
 def parse_end(value: str) -> datetime:
@@ -244,6 +245,195 @@ def download_mark_price_symbol(
     return result
 
 
+
+def _fetch_spot_hist_page(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 500,
+):
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "startTime": int(start_ms),
+        "endTime": int(end_ms),
+        "limit": min(int(limit), 500),
+    }
+    url = (
+        f"{hd.API_BASE}{SPOT_HIST_PATH}?"
+        f"{urlencode(params)}"
+    )
+    req = Request(
+        url,
+        headers={"User-Agent": "r3-historical-spot-fallback/1.0"},
+    )
+
+    last_error = None
+    for attempt in range(6):
+        try:
+            with urlopen(req, timeout=30) as resp:
+                payload = json.loads(
+                    resp.read().decode("utf-8")
+                )
+
+            code = payload.get("code")
+            if code in (0, "0", None):
+                rows = payload.get("data") or []
+                rows.sort(key=_mark_row_ts)
+                return rows
+
+            last_error = RuntimeError(
+                f"BingX spot-history error: {payload}"
+            )
+            if str(code) == "100410":
+                delay = min(
+                    1.0 * (2 ** attempt),
+                    16.0,
+                )
+                print(
+                    "BingX spot-history temporary 100410; "
+                    f"retry {attempt + 1}/6 "
+                    f"after {delay:.1f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+            raise last_error
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 5:
+                break
+            delay = min(
+                1.0 * (2 ** attempt),
+                16.0,
+            )
+            print(
+                "BingX spot-history request failed "
+                f"({type(exc).__name__}: {exc}); "
+                f"retry {attempt + 1}/6 "
+                f"after {delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        "BingX spot-history request failed after retries: "
+        f"{last_error}"
+    )
+
+
+def _normalize_spot_hist_row(
+    symbol: str,
+    interval: str,
+    row,
+):
+    if not isinstance(row, (list, tuple)) or len(row) < 6:
+        raise ValueError(
+            f"unexpected BingX historical spot kline row: {row}"
+        )
+
+    ts = _mark_row_ts(row)
+    quote_volume = (
+        float(row[7])
+        if len(row) > 7 and row[7] not in (None, "")
+        else float(row[5] or 0.0) * float(row[4] or 0.0)
+    )
+
+    return {
+        "timestamp": hd.iso_utc(ts),
+        "symbol": symbol,
+        "interval": interval,
+        "open": float(row[1]),
+        "high": float(row[2]),
+        "low": float(row[3]),
+        "close": float(row[4]),
+        "volume": float(row[5] or 0.0),
+        "quote_volume": quote_volume,
+        "trades": (
+            int(float(row[8]))
+            if len(row) > 8 and row[8] not in (None, "")
+            else 0
+        ),
+        "taker_buy_base": (
+            float(row[9])
+            if len(row) > 9 and row[9] not in (None, "")
+            else 0.0
+        ),
+        "taker_buy_quote": (
+            float(row[10])
+            if len(row) > 10 and row[10] not in (None, "")
+            else 0.0
+        ),
+    }
+
+
+def download_spot_history_symbol(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    request_pause_sec: float,
+):
+    step = hd.INTERVAL_MS[interval]
+    cursor_end = end_ms
+    result = []
+    seen = set()
+
+    # Historical spot endpoint max is 500 rows. Use a shorter pause than
+    # the main swap downloader, with its own retry/backoff, so a 30-day 1m
+    # backfill completes in a reasonable time.
+    pause = min(max(0.10, request_pause_sec / 8.0), 0.35)
+
+    while cursor_end >= start_ms:
+        page = _fetch_spot_hist_page(
+            symbol,
+            interval,
+            start_ms,
+            cursor_end,
+            500,
+        )
+        if not page:
+            break
+
+        page_ts = [
+            _mark_row_ts(raw)
+            for raw in page
+            if _mark_row_ts(raw) > 0
+        ]
+        if not page_ts:
+            break
+
+        for raw in page:
+            ts = _mark_row_ts(raw)
+            if (
+                ts < start_ms
+                or ts > end_ms
+                or ts in seen
+            ):
+                continue
+            seen.add(ts)
+            result.append(
+                _normalize_spot_hist_row(
+                    symbol,
+                    interval,
+                    raw,
+                )
+            )
+
+        earliest_ts = min(page_ts)
+        if earliest_ts <= start_ms:
+            break
+
+        next_end = earliest_ts - step
+        if next_end >= cursor_end:
+            break
+        cursor_end = next_end
+        time.sleep(pause)
+
+    result.sort(key=lambda r: r["timestamp"])
+    return result
+
 def download_interval(
     interval: str,
     start: datetime,
@@ -301,6 +491,32 @@ def download_interval(
                 f"symbol={symbol} interval={interval} "
                 f"v3_rows={original_count} "
                 f"fallback_rows={len(fallback)} "
+                f"selected_rows={len(rows)} "
+                f"minimum={minimum_rows}",
+                flush=True,
+            )
+
+        # BingX's swap and mark-price endpoints can truncate older fine-grained
+        # history. For 1m only, use BingX's dedicated historical spot endpoint,
+        # which is documented for deeper historical K-line access. The strategy
+        # logic remains unchanged; this is historical-only market-data recovery.
+        if interval == "1m" and len(rows) < minimum_rows:
+            before_spot = len(rows)
+            spot_rows = download_spot_history_symbol(
+                symbol,
+                interval,
+                start_ms,
+                end_ms,
+                REQUEST_PAUSE,
+            )
+            if len(spot_rows) > len(rows):
+                rows = spot_rows
+            print(
+                "R3_FAST_FALLBACK "
+                "source=bingx_historical_spot_kline "
+                f"symbol={symbol} interval={interval} "
+                f"before_rows={before_spot} "
+                f"spot_rows={len(spot_rows)} "
                 f"selected_rows={len(rows)} "
                 f"minimum={minimum_rows}",
                 flush=True,
