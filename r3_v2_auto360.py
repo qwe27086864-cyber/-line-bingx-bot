@@ -1,23 +1,16 @@
+
 """
-R3 A_GUARD baseline vs V2 360-day RESUME runner.
+R3 V2 360d robust resume runner.
 
-Purpose
--------
-Resume the corrected 360-day R3 V2 run from segment 3/12 after the original
-service stalled during segment 3 data download.
+Historical-only. No live/shadow DB writes. No orders.
 
-Fixes in this resume runner
----------------------------
-1) Keeps the already-completed segment 1 and segment 2 metrics.
-2) Starts new work from segment 3 by default.
-3) Wraps every historical data source call in a hard watchdog
-   (default 180 seconds). If a source stalls or repeatedly errors, it returns
-   an empty result so the existing fallback chain can continue.
-4) Retries a failed segment up to 2 times.
-5) Aggregates all 12 segment metrics correctly using gross-profit/gross-loss
-   sums, so the final PF is NOT an average of per-segment PF values.
-
-Historical-only. No live/shadow/current DB writes. No orders.
+Key changes:
+- Can resume from any segment 1..12.
+- Hardcodes completed segments 1..3.
+- Downloads ONLY 1m candles from BingX.
+- Builds 5m / 15m / 1h locally from the same 1m candles.
+- Adds coverage checks and stage logs so a stall is obvious.
+- Keeps combined PF as gross-profit / abs(gross-loss), never average PF.
 """
 
 from __future__ import annotations
@@ -29,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,13 +47,14 @@ END_DATES = [
 ROOT = Path(os.environ.get("R3_V2_AUTO360_DIR", "data/r3_v2_auto360"))
 ROOT.mkdir(parents=True, exist_ok=True)
 
-START_SEGMENT = int(os.environ.get("R3_V2_START_SEGMENT", "3"))
-SOURCE_TIMEOUT_SEC = int(os.environ.get("R3_V2_SOURCE_TIMEOUT_SEC", "180"))
+START_SEGMENT = int(os.environ.get("R3_V2_START_SEGMENT", "4"))
+SOURCE_TIMEOUT_SEC = int(os.environ.get("R3_V2_SOURCE_TIMEOUT_SEC", "240"))
 MAX_SEGMENT_ATTEMPTS = int(os.environ.get("R3_V2_SEGMENT_ATTEMPTS", "2"))
 ADAPTER_TIMEOUT_SEC = int(os.environ.get("R3_V2_ADAPTER_TIMEOUT_SEC", "600"))
+MIN_COVERAGE = float(os.environ.get("R3_V2_MIN_COVERAGE", "0.95"))
 
-PRECOMPLETED_SEGMENTS = [
-    {
+PRECOMPLETED = {
+    1: {
         "segment": 1,
         "start": "2025-06-05T09:30:00+00:00",
         "end": "2025-07-05T09:30:00+00:00",
@@ -80,7 +75,7 @@ PRECOMPLETED_SEGMENTS = [
         "delta_sum_net_return_pct": 1.946,
         "trade_retention_pct": 44.44,
     },
-    {
+    2: {
         "segment": 2,
         "start": "2025-07-05T09:30:00+00:00",
         "end": "2025-08-04T09:30:00+00:00",
@@ -101,7 +96,28 @@ PRECOMPLETED_SEGMENTS = [
         "delta_sum_net_return_pct": -2.583,
         "trade_retention_pct": 35.71,
     },
-]
+    3: {
+        "segment": 3,
+        "start": "2025-08-04T09:30:00+00:00",
+        "end": "2025-09-03T09:30:00+00:00",
+        "baseline": {
+            "trades": 12, "wins": 6, "losses": 6,
+            "win_rate_pct": 50.0, "profit_factor": 0.604,
+            "gross_profit_pct_points": 4.095461,
+            "gross_loss_abs_pct_points": 6.778795,
+            "sum_net_return_pct": -2.683,
+        },
+        "v2": {
+            "trades": 5, "wins": 2, "losses": 3,
+            "win_rate_pct": 40.0, "profit_factor": 0.408,
+            "gross_profit_pct_points": 1.445069,
+            "gross_loss_abs_pct_points": 3.539279,
+            "sum_net_return_pct": -2.094,
+        },
+        "delta_sum_net_return_pct": 0.589,
+        "trade_retention_pct": 41.67,
+    },
+}
 
 
 def _dt(s: str) -> datetime:
@@ -118,7 +134,7 @@ def _read_returns(path: Path) -> list[float]:
             try:
                 vals.append(float(row["net_return_pct"]))
             except Exception:
-                continue
+                pass
     return vals
 
 
@@ -132,7 +148,7 @@ def _metrics(vals: list[float]) -> dict:
         "trades": len(vals),
         "wins": len(wins),
         "losses": len(losses),
-        "win_rate_pct": round(100.0 * len(wins) / len(vals), 2) if vals else 0.0,
+        "win_rate_pct": round(100 * len(wins) / len(vals), 2) if vals else 0.0,
         "profit_factor": round(pf, 3),
         "gross_profit_pct_points": round(gp, 6),
         "gross_loss_abs_pct_points": round(gl, 6),
@@ -140,8 +156,8 @@ def _metrics(vals: list[float]) -> dict:
     }
 
 
-def _aggregate_segment_metrics(segments: list[dict], key: str) -> dict:
-    rows = [seg[key] for seg in segments]
+def _aggregate_metrics(segments, key):
+    rows = [x[key] for x in segments]
     trades = sum(int(x["trades"]) for x in rows)
     wins = sum(int(x["wins"]) for x in rows)
     losses = sum(int(x["losses"]) for x in rows)
@@ -153,7 +169,7 @@ def _aggregate_segment_metrics(segments: list[dict], key: str) -> dict:
         "trades": trades,
         "wins": wins,
         "losses": losses,
-        "win_rate_pct": round(100.0 * wins / trades, 2) if trades else 0.0,
+        "win_rate_pct": round(100 * wins / trades, 2) if trades else 0.0,
         "profit_factor": round(pf, 3),
         "gross_profit_pct_points": round(gp, 6),
         "gross_loss_abs_pct_points": round(gl, 6),
@@ -164,15 +180,7 @@ def _aggregate_segment_metrics(segments: list[dict], key: str) -> dict:
 def _bounded(label, fn):
     def wrapped(*args, **kwargs):
         if SOURCE_TIMEOUT_SEC <= 0 or not hasattr(signal, "SIGALRM"):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as exc:
-                print(
-                    "R3_V2_SOURCE_FAIL "
-                    f"label={label} error={type(exc).__name__}:{exc}",
-                    flush=True,
-                )
-                return []
+            return fn(*args, **kwargs)
 
         old_handler = signal.getsignal(signal.SIGALRM)
 
@@ -183,31 +191,154 @@ def _bounded(label, fn):
             signal.signal(signal.SIGALRM, alarm_handler)
             signal.setitimer(signal.ITIMER_REAL, SOURCE_TIMEOUT_SEC)
             return fn(*args, **kwargs)
-        except Exception as exc:
-            print(
-                "R3_V2_SOURCE_FAIL "
-                f"label={label} error={type(exc).__name__}:{exc}",
-                flush=True,
-            )
-            return []
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, old_handler)
-
     return wrapped
 
 
-# Add watchdogs around the existing corrected historical source functions.
-_ORIG_V3_DOWNLOAD = base.hd.download_symbol
-_ORIG_MARK_DOWNLOAD = base.download_mark_price_symbol
-_ORIG_SPOT_DOWNLOAD = base.download_spot_history_symbol
+base.hd.download_symbol = _bounded("bingx_1m", base.hd.download_symbol)
+base.download_mark_price_symbol = _bounded(
+    "bingx_mark_price", base.download_mark_price_symbol
+)
+base.download_spot_history_symbol = _bounded(
+    "bingx_historical_spot", base.download_spot_history_symbol
+)
 
-base.hd.download_symbol = _bounded("bingx_v3", _ORIG_V3_DOWNLOAD)
-base.download_mark_price_symbol = _bounded("bingx_mark_price", _ORIG_MARK_DOWNLOAD)
-base.download_spot_history_symbol = _bounded("bingx_historical_spot", _ORIG_SPOT_DOWNLOAD)
+
+def _symbols():
+    return [x.strip().upper() for x in base.SYMBOLS.split(",") if x.strip()]
 
 
-def _run_and_stream(cmd: list[str]) -> None:
+def _verify_1m(path: Path, start: datetime, end: datetime):
+    counts = {s: 0 for s in _symbols()}
+    seen = {s: set() for s in _symbols()}
+    start_ms = base.hd.utc_ms(start)
+    end_ms = base.hd.utc_ms(end)
+
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            sym = r["symbol"]
+            if sym not in counts:
+                continue
+            ts = base.hd.utc_ms(datetime.fromisoformat(r["timestamp"]))
+            if start_ms <= ts < end_ms:
+                seen[sym].add(ts)
+
+    for sym in counts:
+        counts[sym] = len(seen[sym])
+
+    expected = int((end - start).total_seconds() // 60)
+    minimum = int(expected * MIN_COVERAGE)
+
+    print(
+        f"R3_V2_1M_COVERAGE expected={expected} minimum={minimum} counts={counts}",
+        flush=True,
+    )
+
+    if any(v < minimum for v in counts.values()):
+        raise RuntimeError(
+            f"Insufficient 1m history: {counts}; need >= {minimum} per symbol"
+        )
+
+
+def _aggregate_from_1m(source: Path, target: Path, interval: str, start: datetime, end: datetime):
+    step_ms = base.hd.INTERVAL_MS[interval]
+    start_ms = base.hd.utc_ms(start)
+    end_ms = base.hd.utc_ms(end)
+    groups = {}
+
+    with source.open(newline="", encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            ts_ms = base.hd.utc_ms(datetime.fromisoformat(r["timestamp"]))
+            if not (start_ms <= ts_ms < end_ms):
+                continue
+
+            bucket = (ts_ms // step_ms) * step_ms
+            key = (r["symbol"], bucket)
+
+            g = groups.get(key)
+            if g is None:
+                groups[key] = {
+                    "first_ts": ts_ms,
+                    "last_ts": ts_ms,
+                    "open": float(r["open"]),
+                    "high": float(r["high"]),
+                    "low": float(r["low"]),
+                    "close": float(r["close"]),
+                    "volume": float(r["volume"] or 0),
+                    "quote_volume": float(r["quote_volume"] or 0),
+                    "trades": int(float(r["trades"] or 0)),
+                    "taker_buy_base": float(r["taker_buy_base"] or 0),
+                    "taker_buy_quote": float(r["taker_buy_quote"] or 0),
+                    "count": 1,
+                }
+            else:
+                if ts_ms < g["first_ts"]:
+                    g["first_ts"] = ts_ms
+                    g["open"] = float(r["open"])
+                if ts_ms >= g["last_ts"]:
+                    g["last_ts"] = ts_ms
+                    g["close"] = float(r["close"])
+                g["high"] = max(g["high"], float(r["high"]))
+                g["low"] = min(g["low"], float(r["low"]))
+                g["volume"] += float(r["volume"] or 0)
+                g["quote_volume"] += float(r["quote_volume"] or 0)
+                g["trades"] += int(float(r["trades"] or 0))
+                g["taker_buy_base"] += float(r["taker_buy_base"] or 0)
+                g["taker_buy_quote"] += float(r["taker_buy_quote"] or 0)
+                g["count"] += 1
+
+    rows = []
+    expected_per_bucket = step_ms // 60_000
+
+    for (symbol, bucket), g in sorted(groups.items(), key=lambda x: (x[0][0], x[0][1])):
+        # Keep only complete buckets. Boundary partials are intentionally dropped.
+        if g["count"] != expected_per_bucket:
+            continue
+        rows.append({
+            "timestamp": base.hd.iso_utc(bucket),
+            "symbol": symbol,
+            "interval": interval,
+            "open": g["open"],
+            "high": g["high"],
+            "low": g["low"],
+            "close": g["close"],
+            "volume": g["volume"],
+            "quote_volume": g["quote_volume"],
+            "trades": g["trades"],
+            "taker_buy_base": g["taker_buy_base"],
+            "taker_buy_quote": g["taker_buy_quote"],
+        })
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=base.hd.FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+
+    counts = {s: 0 for s in _symbols()}
+    for r in rows:
+        counts[r["symbol"]] += 1
+
+    expected = int((end - start).total_seconds() // (step_ms / 1000))
+    # Up to two boundary buckets can be partial depending on window alignment.
+    minimum = max(0, int(expected * MIN_COVERAGE) - 2)
+
+    print(
+        f"R3_V2_LOCAL_AGG interval={interval} rows={len(rows)} "
+        f"expected={expected} minimum={minimum} counts={counts}",
+        flush=True,
+    )
+
+    if any(v < minimum for v in counts.values()):
+        raise RuntimeError(
+            f"Insufficient locally aggregated {interval}: {counts}; "
+            f"need >= {minimum} per symbol"
+        )
+
+
+def _run_and_stream(cmd):
     print("R3_V2_RUN", " ".join(cmd), flush=True)
     p = subprocess.Popen(
         cmd,
@@ -217,7 +348,6 @@ def _run_and_stream(cmd: list[str]) -> None:
         bufsize=1,
     )
     assert p.stdout is not None
-
     started = time.monotonic()
 
     while True:
@@ -251,21 +381,44 @@ def _run_segment(idx: int, end_iso: str) -> dict:
 
     seg = ROOT / f"segment_{idx:02d}"
     seg.mkdir(parents=True, exist_ok=True)
-
     base.DATA = seg
     base.DAYS = 30
 
     print(
-        "R3_V2_AUTO360_SEGMENT_START "
-        f"segment={idx}/12 start={start.isoformat()} end={end.isoformat()}",
+        f"R3_V2_AUTO360_SEGMENT_START segment={idx}/12 "
+        f"start={start.isoformat()} end={end.isoformat()}",
         flush=True,
     )
 
-    for interval in ("1m", "5m", "15m", "1h"):
-        base.download_interval(interval, start, end)
+    # Clean only candle files for this segment so retry is deterministic.
+    for name in ("history_1m.csv", "history_5m.csv", "history_15m.csv", "history_1h.csv"):
+        p = seg / name
+        if p.exists():
+            p.unlink()
 
-    base.recover_interval_from_1m("5m", start, end)
-    base.recover_interval_from_1m("15m", start, end)
+    print(f"R3_V2_STAGE segment={idx}/12 stage=download_1m", flush=True)
+    base.download_interval("1m", start, end)
+    print(f"R3_V2_STAGE_DONE segment={idx}/12 stage=download_1m", flush=True)
+
+    one = seg / "history_1m.csv"
+    _verify_1m(one, start, end)
+
+    for interval in ("5m", "15m", "1h"):
+        print(
+            f"R3_V2_STAGE segment={idx}/12 stage=local_aggregate_{interval}",
+            flush=True,
+        )
+        _aggregate_from_1m(
+            one,
+            seg / f"history_{interval}.csv",
+            interval,
+            start,
+            end,
+        )
+        print(
+            f"R3_V2_STAGE_DONE segment={idx}/12 stage=local_aggregate_{interval}",
+            flush=True,
+        )
 
     common = [
         "--candles-1m", str(seg / "history_1m.csv"),
@@ -276,7 +429,6 @@ def _run_segment(idx: int, end_iso: str) -> dict:
 
     baseline_out = seg / "baseline_outcomes.csv"
     baseline_detail = seg / "baseline_detail.csv"
-
     _run_and_stream([
         sys.executable,
         "r3_historical_adapter_fast.py",
@@ -287,7 +439,6 @@ def _run_segment(idx: int, end_iso: str) -> dict:
 
     v2_out = seg / "v2_outcomes.csv"
     v2_detail = seg / "v2_detail.csv"
-
     _run_and_stream([
         sys.executable,
         "r3_historical_adapter_v2.py",
@@ -296,25 +447,18 @@ def _run_segment(idx: int, end_iso: str) -> dict:
         "--outcomes-out", str(v2_out),
     ])
 
-    bvals = _read_returns(baseline_out)
-    vvals = _read_returns(v2_out)
-
     row = {
         "segment": idx,
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "baseline": _metrics(bvals),
-        "v2": _metrics(vvals),
+        "baseline": _metrics(_read_returns(baseline_out)),
+        "v2": _metrics(_read_returns(v2_out)),
     }
     row["delta_sum_net_return_pct"] = round(
-        row["v2"]["sum_net_return_pct"] - row["baseline"]["sum_net_return_pct"],
-        3,
+        row["v2"]["sum_net_return_pct"] - row["baseline"]["sum_net_return_pct"], 3
     )
     row["trade_retention_pct"] = (
-        round(
-            100.0 * row["v2"]["trades"] / row["baseline"]["trades"],
-            2,
-        )
+        round(100 * row["v2"]["trades"] / row["baseline"]["trades"], 2)
         if row["baseline"]["trades"] else 0.0
     )
 
@@ -328,32 +472,47 @@ def _run_segment(idx: int, end_iso: str) -> dict:
         + json.dumps(row, ensure_ascii=False, sort_keys=True),
         flush=True,
     )
-
     return row
 
 
-def main() -> None:
-    if START_SEGMENT not in (1, 3):
-        raise ValueError(
-            "R3_V2_START_SEGMENT supports 1 or 3 for this resume build"
-        )
+def _load_previous(start_segment: int):
+    segments = []
 
-    segments = list(PRECOMPLETED_SEGMENTS) if START_SEGMENT == 3 else []
+    for idx in range(1, start_segment):
+        if idx in PRECOMPLETED:
+            segments.append(PRECOMPLETED[idx])
+            continue
+
+        path = ROOT / f"segment_{idx:02d}" / "segment_summary.json"
+        if not path.exists():
+            raise RuntimeError(
+                f"Cannot resume at {start_segment}: segment {idx} summary missing"
+            )
+        segments.append(json.loads(path.read_text(encoding="utf-8")))
+
+    return segments
+
+
+def main():
+    if not (1 <= START_SEGMENT <= 12):
+        raise ValueError("R3_V2_START_SEGMENT must be 1..12")
+
+    segments = _load_previous(START_SEGMENT)
 
     print(
         "R3_V2_AUTO360_RESUME "
         f"start_segment={START_SEGMENT}/12 "
         f"precompleted={len(segments)} "
         f"source_timeout_sec={SOURCE_TIMEOUT_SEC} "
-        f"segment_attempts={MAX_SEGMENT_ATTEMPTS}",
+        f"segment_attempts={MAX_SEGMENT_ATTEMPTS} "
+        "higher_intervals=local_from_1m",
         flush=True,
     )
 
     for idx, end_iso in enumerate(END_DATES, start=1):
         if idx < START_SEGMENT:
             print(
-                "R3_V2_AUTO360_SEGMENT_SKIP "
-                f"segment={idx}/12 reason=precompleted",
+                f"R3_V2_AUTO360_SEGMENT_SKIP segment={idx}/12 reason=precompleted",
                 flush=True,
             )
             continue
@@ -363,8 +522,8 @@ def main() -> None:
         for attempt in range(1, MAX_SEGMENT_ATTEMPTS + 1):
             try:
                 print(
-                    "R3_V2_AUTO360_ATTEMPT "
-                    f"segment={idx}/12 attempt={attempt}/{MAX_SEGMENT_ATTEMPTS}",
+                    f"R3_V2_AUTO360_ATTEMPT segment={idx}/12 "
+                    f"attempt={attempt}/{MAX_SEGMENT_ATTEMPTS}",
                     flush=True,
                 )
                 row = _run_segment(idx, end_iso)
@@ -374,8 +533,8 @@ def main() -> None:
             except Exception as exc:
                 last_error = exc
                 print(
-                    "R3_V2_AUTO360_SEGMENT_ERROR "
-                    f"segment={idx}/12 attempt={attempt}/{MAX_SEGMENT_ATTEMPTS} "
+                    f"R3_V2_AUTO360_SEGMENT_ERROR segment={idx}/12 "
+                    f"attempt={attempt}/{MAX_SEGMENT_ATTEMPTS} "
                     f"error={type(exc).__name__}:{exc}",
                     flush=True,
                 )
@@ -393,8 +552,8 @@ def main() -> None:
     if len(segments) != 12:
         raise RuntimeError(f"R3 V2 incomplete segments={len(segments)}/12")
 
-    baseline = _aggregate_segment_metrics(segments, "baseline")
-    v2 = _aggregate_segment_metrics(segments, "v2")
+    baseline = _aggregate_metrics(segments, "baseline")
+    v2 = _aggregate_metrics(segments, "v2")
 
     final = {
         "segments": 12,
@@ -402,15 +561,13 @@ def main() -> None:
         "baseline": baseline,
         "v2": v2,
         "delta_sum_net_return_pct": round(
-            v2["sum_net_return_pct"] - baseline["sum_net_return_pct"],
-            3,
+            v2["sum_net_return_pct"] - baseline["sum_net_return_pct"], 3
         ),
         "delta_pf": round(
-            v2["profit_factor"] - baseline["profit_factor"],
-            3,
+            v2["profit_factor"] - baseline["profit_factor"], 3
         ),
         "trade_retention_pct": (
-            round(100.0 * v2["trades"] / baseline["trades"], 2)
+            round(100 * v2["trades"] / baseline["trades"], 2)
             if baseline["trades"] else 0.0
         ),
         "per_segment": segments,
