@@ -1,474 +1,479 @@
 """
-BF1 Historical V4 static-archive proxy runner.
+Meme2 20-wallet historical copyability screen.
 
-Keeps the existing filename so the current Render historical service can run it
-without changing its start command.
+Purpose
+-------
+Safely analyze the already-completed 360-day raw Helius history without
+redeploying the Meme2 backfill service.
 
-Historical-only. No DATABASE_URL, no orders, no live/shadow writes.
+Input source
+------------
+Streams manifest.json and each wallet's .jsonl from the existing public
+Render HTTP server:
+  https://meme2-historical-360.onrender.com/
+  data/historical_360/meme2_test_twenty/raw/
 
-360-day research proxy:
-- Binance Data Vision spot 15m klines
-- Binance Data Vision USD-M perpetual 15m klines
-- Binance Data Vision USD-M funding-rate history
+Method
+------
+- Parse wallet-owned non-stable token balance changes with the SAME basic
+  pre/post token-balance logic as the live Meme2 core.
+- Require matching SOL flow, matching the live signal guard:
+    BUY  -> wallet SOL delta < 0
+    SELL -> wallet SOL delta > 0
+- For high-confidence "simple swap" transactions only, require exactly one
+  non-ignored token mint change in that wallet transaction.
+- Approximate wallet execution price in SOL/token as:
+    abs(wallet SOL delta) / abs(token delta)
+  This is NOT a USD market quote and does not reconstruct historical pool
+  liquidity. It is useful for copyability / wallet-edge screening only.
+- Mirror live behavior at the wallet/mint level:
+    first BUY opens, next SELL closes; extra BUYs while open are ignored.
+- Test several conservative round-trip cost assumptions.
 
-This is NOT BingX execution performance. The existing BingX ~98-day exact
-result remains the venue-fidelity check.
+IMPORTANT
+---------
+This is NOT the final Meme2 live-equivalent PF because historical liquidity and
+historical GeckoTerminal quotes were not stored. It is a screening layer to
+identify wallets whose raw edge is large enough to survive realistic costs.
+
+Historical-only. No DB. No orders. No private keys.
 """
+
 from __future__ import annotations
 
-import bisect
 import csv
+import hashlib
 import io
 import json
-import os
-import subprocess
-import sys
-import time
-import urllib.error
+import math
+import statistics
 import urllib.request
-import zipfile
-from datetime import date, datetime, timedelta, timezone
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
-os.environ.pop("DATABASE_URL", None)
+BASE = "https://meme2-historical-360.onrender.com"
+RAW_ROOT = "data/historical_360/meme2_test_twenty/raw"
+MANIFEST_URL = f"{BASE}/{RAW_ROOT}/manifest.json"
 
-OUT = Path(os.getenv("BF4_OUT_DIR", "data/bf1_v4_proxy"))
+OUT = Path("data/meme2_copyability")
 OUT.mkdir(parents=True, exist_ok=True)
 
-SYMS = [
-    x.strip().upper()
-    for x in os.getenv("BF4_HIST_SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT").split(",")
-    if x.strip()
-]
-INTERVAL = os.getenv("BF4_HIST_INTERVAL", "15m")
-DAYS = int(os.getenv("BF4_HIST_DAYS", "360"))
-END = datetime.fromisoformat(
-    os.getenv("BF4_HIST_END_ISO", "2026-10-28T09:30:00Z").replace("Z", "+00:00")
-).astimezone(timezone.utc)
-START = END - timedelta(days=DAYS)
-STEP_MS = 15 * 60 * 1000
-START_MS = int(START.timestamp() * 1000)
-END_MS = int(END.timestamp() * 1000)
-EXPECTED = int((END_MS - START_MS) // STEP_MS)
-MIN_COVERAGE = float(os.getenv("BF4_MIN_COVERAGE", "0.95"))
-MIN_ROWS = int(EXPECTED * MIN_COVERAGE)
-SPOT_SPREAD_BPS = float(os.getenv("BF4_PROXY_SPOT_SPREAD_BPS", "2.0"))
-PERP_SPREAD_BPS = float(os.getenv("BF4_PROXY_PERP_SPREAD_BPS", "2.0"))
-PAUSE = float(os.getenv("BF4_ARCHIVE_PAUSE_SEC", "0.03"))
-BASE = "https://data.binance.vision/data"
+WSOL = "So11111111111111111111111111111111111111112"
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+IGNORE_MINTS = {WSOL, USDC, USDT}
+LAMPORTS_PER_SOL = 1_000_000_000.0
+
+# Live fixed-cost assumptions alone imply ~5.37% loss on a flat-price round trip:
+# entry slippage 1.5%, exit slippage 2.0%, fee 1.0% each side.
+# Since historical liquidity impact is unknown, screen additional harsher cases.
+COST_SCENARIOS_PCT = [5.37, 6.5, 8.0, 10.0]
+
+MIN_SOL_FLOW = 0.0001
+HTTP_TIMEOUT = 120
 
 
-def venue_symbol(symbol: str) -> str:
-    return symbol.replace("-", "")
-
-
-def norm_ts(value) -> int:
-    x = int(float(value))
-    # Binance spot archives use microseconds from 2025 onward; futures data is
-    # generally milliseconds. Normalize both to milliseconds.
-    if x > 100_000_000_000_000:
-        x //= 1000
-    return x
-
-
-def fetch_zip_csv(url: str, retries: int = 6):
-    last = None
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "bf1-static-archive/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                raw = resp.read()
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                names = [n for n in zf.namelist() if not n.endswith("/")]
-                if not names:
-                    raise RuntimeError(f"empty zip: {url}")
-                with zf.open(names[0]) as f:
-                    text = io.TextIOWrapper(f, encoding="utf-8-sig", newline="")
-                    return list(csv.reader(text))
-        except urllib.error.HTTPError as exc:
-            last = exc
-            if exc.code == 404:
-                return None
-            if exc.code not in (408, 418, 425, 429, 500, 502, 503, 504):
-                raise
-        except Exception as exc:
-            last = exc
-        if attempt + 1 < retries:
-            delay = min(2 ** attempt, 20)
-            print(
-                f"BF4_ARCHIVE_RETRY attempt={attempt+1}/{retries} delay={delay}s "
-                f"url={url} error={last}",
-                flush=True,
-            )
-            time.sleep(delay)
-    raise RuntimeError(f"archive download failed: {url}: {last}")
-
-
-def month_iter(start: datetime, end: datetime):
-    cur = date(start.year, start.month, 1)
-    last = date(end.year, end.month, 1)
-    while cur <= last:
-        yield cur.year, cur.month
-        if cur.month == 12:
-            cur = date(cur.year + 1, 1, 1)
-        else:
-            cur = date(cur.year, cur.month + 1, 1)
-
-
-def month_start_ms(year: int, month: int) -> int:
-    return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp() * 1000)
-
-
-def next_month_ms(year: int, month: int) -> int:
-    if month == 12:
-        dt = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-    else:
-        dt = datetime(year, month + 1, 1, tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
-
-
-def daily_dates(year: int, month: int):
-    cur = date(year, month, 1)
-    if month == 12:
-        nxt = date(year + 1, 1, 1)
-    else:
-        nxt = date(year, month + 1, 1)
-    while cur < nxt:
-        yield cur
-        cur += timedelta(days=1)
-
-
-def kline_urls(kind: str, symbol: str, year: int, month: int):
-    s = venue_symbol(symbol)
-    if kind == "spot":
-        monthly = (
-            f"{BASE}/spot/monthly/klines/{s}/{INTERVAL}/"
-            f"{s}-{INTERVAL}-{year:04d}-{month:02d}.zip"
-        )
-        daily_tpl = (
-            f"{BASE}/spot/daily/klines/{s}/{INTERVAL}/"
-            f"{s}-{INTERVAL}-{{day}}.zip"
-        )
-    else:
-        monthly = (
-            f"{BASE}/futures/um/monthly/klines/{s}/{INTERVAL}/"
-            f"{s}-{INTERVAL}-{year:04d}-{month:02d}.zip"
-        )
-        daily_tpl = (
-            f"{BASE}/futures/um/daily/klines/{s}/{INTERVAL}/"
-            f"{s}-{INTERVAL}-{{day}}.zip"
-        )
-    return monthly, daily_tpl
-
-
-def funding_urls(symbol: str, year: int, month: int):
-    s = venue_symbol(symbol)
-    monthly = (
-        f"{BASE}/futures/um/monthly/fundingRate/{s}/"
-        f"{s}-fundingRate-{year:04d}-{month:02d}.zip"
+def get_json(url: str):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "meme2-copyability-screen/1.0"},
     )
-    daily_tpl = (
-        f"{BASE}/futures/um/daily/fundingRate/{s}/"
-        f"{s}-fundingRate-{{day}}.zip"
-    )
-    return monthly, daily_tpl
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
-def parse_kline_rows(rows, start_ms: int, end_ms: int, out: dict[int, float]):
-    if not rows:
-        return 0
-    added = 0
-    for row in rows:
-        if len(row) < 5:
-            continue
+def token_amount(b):
+    ui = (b or {}).get("uiTokenAmount") or {}
+    s = ui.get("uiAmountString")
+    if s is not None:
         try:
-            t = norm_ts(row[0])
-            close = float(row[4])
+            return float(s)
         except Exception:
-            # header row, if present
+            return 0.0
+    try:
+        raw = float(ui.get("amount") or 0)
+        dec = int(float(ui.get("decimals") or 0))
+        return raw / (10 ** dec)
+    except Exception:
+        return 0.0
+
+
+def wallet_change(wallet: str, tx: dict):
+    """Return one high-confidence non-stable token change or None."""
+    meta = (tx or {}).get("meta") or {}
+    if meta.get("err"):
+        return None
+
+    message = (((tx or {}).get("transaction") or {}).get("message") or {})
+    keys = message.get("accountKeys") or []
+    pubkeys = []
+    for k in keys:
+        pubkeys.append(k.get("pubkey") if isinstance(k, dict) else k)
+
+    sol_delta = 0.0
+    try:
+        idx = pubkeys.index(wallet)
+        pre = (meta.get("preBalances") or [])[idx]
+        post = (meta.get("postBalances") or [])[idx]
+        sol_delta = (float(post) - float(pre)) / LAMPORTS_PER_SOL
+    except Exception:
+        return None
+
+    pre_map = {}
+    for b in meta.get("preTokenBalances") or []:
+        if b.get("owner") == wallet:
+            mint = b.get("mint")
+            if mint:
+                pre_map[mint] = token_amount(b)
+
+    post_map = {}
+    for b in meta.get("postTokenBalances") or []:
+        if b.get("owner") == wallet:
+            mint = b.get("mint")
+            if mint:
+                post_map[mint] = token_amount(b)
+
+    changes = []
+    for mint in set(pre_map) | set(post_map):
+        if not mint or mint in IGNORE_MINTS:
             continue
-        if start_ms <= t < end_ms and close > 0:
-            if t not in out:
-                added += 1
-            out[t] = close
-    return added
-
-
-def parse_funding_rows(rows, start_ms: int, end_ms: int, out: dict[int, float]):
-    if not rows:
-        return 0
-    added = 0
-    header = None
-    if rows:
-        maybe = [str(x).strip() for x in rows[0]]
-        if any(not x.replace(".", "", 1).replace("-", "", 1).isdigit() for x in maybe[:2]):
-            header = {name: i for i, name in enumerate(maybe)}
-            rows = rows[1:]
-
-    for row in rows:
-        try:
-            if header:
-                if "calc_time" in header:
-                    t = norm_ts(row[header["calc_time"]])
-                    rate = float(row[header.get("last_funding_rate", 2)])
-                elif "fundingTime" in header:
-                    t = norm_ts(row[header["fundingTime"]])
-                    rate = float(row[header.get("fundingRate", 1)])
-                else:
-                    t = norm_ts(row[0])
-                    rate = float(row[-1])
-            else:
-                # Known Binance Data Vision funding archive layout commonly uses
-                # calc_time,funding_interval_hours,last_funding_rate.
-                t = norm_ts(row[0])
-                rate = float(row[2] if len(row) >= 3 else row[1])
-        except Exception:
+        pre = pre_map.get(mint, 0.0)
+        post = post_map.get(mint, 0.0)
+        delta = post - pre
+        if abs(delta) <= 1e-15:
             continue
-        if start_ms <= t < end_ms:
-            if t not in out:
-                added += 1
-            out[t] = rate
-    return added
-
-
-def load_month_kline(kind: str, symbol: str, year: int, month: int, out: dict[int, float]):
-    monthly, daily_tpl = kline_urls(kind, symbol, year, month)
-    rows = fetch_zip_csv(monthly)
-    if rows is not None:
-        n = parse_kline_rows(rows, START_MS, END_MS, out)
-        print(
-            f"BF4_ARCHIVE source={kind} mode=monthly symbol={symbol} month={year:04d}-{month:02d} "
-            f"added={n} total={len(out)}",
-            flush=True,
+        changes.append(
+            {
+                "mint": mint,
+                "side": "BUY" if delta > 0 else "SELL",
+                "delta": delta,
+                "pre": pre,
+                "post": post,
+                "sol_delta": sol_delta,
+            }
         )
-        return
 
-    # Current month may not have a monthly archive yet. Fall back to daily files.
-    print(
-        f"BF4_ARCHIVE_MONTHLY_MISSING source={kind} symbol={symbol} month={year:04d}-{month:02d} "
-        "fallback=daily",
-        flush=True,
+    # High-confidence only: one non-stable token changed in the wallet.
+    # Multi-token transactions can make one wallet-level SOL delta ambiguous.
+    if len(changes) != 1:
+        return None
+
+    ch = changes[0]
+    if ch["side"] == "BUY":
+        if ch["sol_delta"] > -MIN_SOL_FLOW:
+            return None
+    else:
+        if ch["sol_delta"] < MIN_SOL_FLOW:
+            return None
+
+    qty = abs(float(ch["delta"]))
+    if qty <= 0:
+        return None
+
+    # Approximate wallet's own transaction price in SOL/token.
+    px_sol = abs(float(ch["sol_delta"])) / qty
+    if not math.isfinite(px_sol) or px_sol <= 0:
+        return None
+
+    ch["price_sol_per_token"] = px_sol
+    return ch
+
+
+def raw_return_pct(entry_px: float, exit_px: float) -> float:
+    if entry_px <= 0:
+        return 0.0
+    return (exit_px / entry_px - 1.0) * 100.0
+
+
+def net_after_flat_cost(raw_ret_pct: float, cost_pct: float) -> float:
+    # Screening approximation: apply conservative total round-trip cost as
+    # percentage points. Final live-equivalent replay must use historical
+    # liquidity-aware executable prices.
+    return raw_ret_pct - cost_pct
+
+
+def pf(vals):
+    gp = sum(x for x in vals if x > 0)
+    gl = abs(sum(x for x in vals if x < 0))
+    if gl > 0:
+        return gp / gl
+    return 999.0 if gp > 0 else 0.0
+
+
+def percentile(vals, p):
+    if not vals:
+        return None
+    s = sorted(vals)
+    if len(s) == 1:
+        return s[0]
+    x = (len(s) - 1) * p
+    lo = int(math.floor(x))
+    hi = int(math.ceil(x))
+    if lo == hi:
+        return s[lo]
+    frac = x - lo
+    return s[lo] * (1 - frac) + s[hi] * frac
+
+
+def scan_wallet(wallet: str, raw_url: str):
+    opens = {}
+    pairs = []
+    counters = defaultdict(int)
+
+    req = urllib.request.Request(
+        raw_url,
+        headers={"User-Agent": "meme2-copyability-screen/1.0"},
     )
-    for d in daily_dates(year, month):
-        ds = d.isoformat()
-        day_start = int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() * 1000)
-        if day_start >= END_MS:
-            break
-        if day_start + 86400000 <= START_MS:
-            continue
-        rows = fetch_zip_csv(daily_tpl.format(day=ds))
-        if rows is None:
-            print(f"BF4_ARCHIVE_DAILY_MISSING source={kind} symbol={symbol} day={ds}", flush=True)
-            continue
-        n = parse_kline_rows(rows, START_MS, END_MS, out)
-        print(
-            f"BF4_ARCHIVE source={kind} mode=daily symbol={symbol} day={ds} added={n} total={len(out)}",
-            flush=True,
-        )
-        time.sleep(max(0.0, PAUSE))
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        # TextIOWrapper lets us stream line-by-line instead of loading giant files.
+        stream = io.TextIOWrapper(r, encoding="utf-8")
+        for line in stream:
+            counters["raw_rows"] += 1
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                tx = obj.get("tx") or {}
+            except Exception:
+                counters["bad_json"] += 1
+                continue
+
+            ch = wallet_change(wallet, tx)
+            if not ch:
+                counters["not_simple_swap"] += 1
+                continue
+
+            block_time = tx.get("blockTime")
+            if not block_time:
+                counters["missing_time"] += 1
+                continue
+
+            t = datetime.fromtimestamp(float(block_time), tz=timezone.utc)
+            mint = ch["mint"]
+            key = (wallet, mint)
+
+            if ch["side"] == "BUY":
+                counters["simple_buys"] += 1
+                if key in opens:
+                    counters["extra_buy_while_open"] += 1
+                    continue
+                opens[key] = {
+                    "opened": t,
+                    "entry_px_sol": ch["price_sol_per_token"],
+                    "mint": mint,
+                }
+                continue
+
+            counters["simple_sells"] += 1
+            p = opens.get(key)
+            if not p:
+                counters["sell_without_open"] += 1
+                continue
+
+            exit_px = ch["price_sol_per_token"]
+            raw_ret = raw_return_pct(p["entry_px_sol"], exit_px)
+            hold_sec = max(0.0, (t - p["opened"]).total_seconds())
+
+            pairs.append(
+                {
+                    "wallet": wallet,
+                    "mint": mint,
+                    "opened_at": p["opened"].isoformat(),
+                    "closed_at": t.isoformat(),
+                    "hold_sec": hold_sec,
+                    "entry_sol_per_token": p["entry_px_sol"],
+                    "exit_sol_per_token": exit_px,
+                    "raw_return_pct": raw_ret,
+                }
+            )
+            del opens[key]
+
+    counters["unclosed"] = len(opens)
+    return pairs, dict(counters)
 
 
-def load_month_funding(symbol: str, year: int, month: int, out: dict[int, float]):
-    monthly, daily_tpl = funding_urls(symbol, year, month)
-    rows = fetch_zip_csv(monthly)
-    if rows is not None:
-        n = parse_funding_rows(rows, START_MS, END_MS, out)
-        print(
-            f"BF4_ARCHIVE source=funding mode=monthly symbol={symbol} month={year:04d}-{month:02d} "
-            f"added={n} total={len(out)}",
-            flush=True,
-        )
-        return
+def wallet_summary(wallet: str, pairs: list[dict], counters: dict):
+    raw = [float(x["raw_return_pct"]) for x in pairs]
+    holds = [float(x["hold_sec"]) for x in pairs]
 
-    print(
-        f"BF4_ARCHIVE_MONTHLY_MISSING source=funding symbol={symbol} month={year:04d}-{month:02d} "
-        "fallback=daily",
-        flush=True,
-    )
-    for d in daily_dates(year, month):
-        ds = d.isoformat()
-        day_start = int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() * 1000)
-        if day_start >= END_MS:
-            break
-        if day_start + 86400000 <= START_MS:
-            continue
-        rows = fetch_zip_csv(daily_tpl.format(day=ds))
-        if rows is None:
-            print(f"BF4_ARCHIVE_DAILY_MISSING source=funding symbol={symbol} day={ds}", flush=True)
-            continue
-        n = parse_funding_rows(rows, START_MS, END_MS, out)
-        print(
-            f"BF4_ARCHIVE source=funding mode=daily symbol={symbol} day={ds} added={n} total={len(out)}",
-            flush=True,
-        )
-        time.sleep(max(0.0, PAUSE))
-
-
-def load_klines(kind: str, symbol: str):
-    out: dict[int, float] = {}
-    for year, month in month_iter(START, END):
-        load_month_kline(kind, symbol, year, month, out)
-        time.sleep(max(0.0, PAUSE))
-    return out
-
-
-def load_funding(symbol: str):
-    out: dict[int, float] = {}
-    for year, month in month_iter(START, END):
-        load_month_funding(symbol, year, month, out)
-        time.sleep(max(0.0, PAUSE))
-    return sorted(out.items())
-
-
-def quote(mid: float, spread_bps: float):
-    half = max(0.0, spread_bps) / 20000.0
-    return mid * (1.0 - half), mid * (1.0 + half)
-
-
-def funding_at(rows, times, t: int):
-    i = bisect.bisect_left(times, t)
-    if i < len(rows):
-        return rows[i][1], rows[i][0]
-    return 0.0, 0
-
-
-def run_adapter(snapshots: Path, outcomes: Path):
-    subprocess.run(
-        [
-            sys.executable,
-            "bf1_historical_adapter.py",
-            "--snapshots",
-            str(snapshots),
-            "--out",
-            str(outcomes),
-        ],
-        check=True,
-    )
-
-
-def summarize(outcomes: Path, quality: dict):
-    with outcomes.open(newline="", encoding="utf-8-sig") as f:
-        vals = [float(r["net_return_pct"]) for r in csv.DictReader(f)]
-    wins = [x for x in vals if x > 0]
-    losses = [x for x in vals if x < 0]
-    gp = sum(wins)
-    gl = abs(sum(losses))
-    pf = gp / gl if gl else (999.0 if gp else 0.0)
-    return {
-        "closed": len(vals),
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate_pct": round(100 * len(wins) / len(vals), 2) if vals else 0.0,
-        "profit_factor": round(pf, 4),
-        "sum_net_return_pct": round(sum(vals), 4),
-        "mode": "360_CROSS_EXCHANGE_PROXY_STATIC_ARCHIVES",
-        "venue": "Binance Data Vision spot + USD-M perpetual + funding",
-        "days": DAYS,
-        "symbols": SYMS,
-        "coverage_rule": f">={MIN_COVERAGE:.0%}",
-        "warning": (
-            "Research proxy only; not BingX execution performance. "
-            "Use the existing BingX exact-overlap result for venue fidelity."
-        ),
-        "quality": quality,
+    row = {
+        "wallet": wallet,
+        "raw_rows": int(counters.get("raw_rows", 0)),
+        "paired_trades": len(pairs),
+        "simple_buys": int(counters.get("simple_buys", 0)),
+        "simple_sells": int(counters.get("simple_sells", 0)),
+        "unclosed": int(counters.get("unclosed", 0)),
+        "raw_win_rate_pct": round(
+            100.0 * sum(1 for x in raw if x > 0) / len(raw), 2
+        ) if raw else 0.0,
+        "raw_pf": round(pf(raw), 4),
+        "raw_sum_return_pct": round(sum(raw), 4),
+        "median_hold_sec": round(statistics.median(holds), 2) if holds else None,
+        "p25_hold_sec": round(percentile(holds, 0.25), 2) if holds else None,
+        "p75_hold_sec": round(percentile(holds, 0.75), 2) if holds else None,
+        "median_raw_return_pct": round(statistics.median(raw), 4) if raw else None,
     }
+
+    for cost in COST_SCENARIOS_PCT:
+        vals = [net_after_flat_cost(x, cost) for x in raw]
+        tag = str(cost).replace(".", "_")
+        row[f"pf_cost_{tag}"] = round(pf(vals), 4)
+        row[f"sum_cost_{tag}"] = round(sum(vals), 4)
+        row[f"win_rate_cost_{tag}"] = round(
+            100.0 * sum(1 for x in vals if x > 0) / len(vals), 2
+        ) if vals else 0.0
+
+    return row
 
 
 def main():
+    manifest = get_json(MANIFEST_URL)
+    summary = manifest.get("summary") or {}
+    if int(summary.get("complete_wallets", 0)) != 20:
+        raise RuntimeError(
+            f"backfill not complete: {summary}"
+        )
+
+    wallets_meta = manifest.get("wallets") or {}
+
     print(
-        f"BF4_STATIC_WINDOW start={START.isoformat()} end={END.isoformat()} days={DAYS} "
-        f"interval={INTERVAL} expected={EXPECTED} minimum={MIN_ROWS} historical_only=true",
+        "MEME2_COPYABILITY_START "
+        f"wallets={len(wallets_meta)} "
+        f"raw_rows={summary.get('rows')} "
+        f"cost_scenarios={COST_SCENARIOS_PCT}",
         flush=True,
     )
 
-    fields = [
-        "timestamp",
-        "symbol",
-        "spot_bid",
-        "spot_ask",
-        "perp_bid",
-        "perp_ask",
-        "funding_rate",
-        "next_funding_time_ms",
-    ]
-    snapshots = []
-    quality = {}
+    wallet_rows = []
+    all_pairs = []
 
-    for symbol in SYMS:
-        print(f"BF4_STATIC_SYMBOL_START symbol={symbol}", flush=True)
-        spot = load_klines("spot", symbol)
-        perp = load_klines("perp", symbol)
-        funding = load_funding(symbol)
-        ftimes = [x[0] for x in funding]
-        times = sorted(set(spot) & set(perp))
+    for i, (wallet, meta) in enumerate(wallets_meta.items(), start=1):
+        raw_file = str(meta.get("raw_file") or "")
+        if not raw_file:
+            tag = hashlib.sha1(wallet.encode()).hexdigest()[:12]
+            raw_file = f"{RAW_ROOT}/{tag}.jsonl"
 
-        quality[symbol] = {
-            "expected_rows": EXPECTED,
-            "minimum_rows": MIN_ROWS,
-            "spot_rows": len(spot),
-            "perp_rows": len(perp),
-            "aligned_rows": len(times),
-            "coverage_pct": round(100 * len(times) / EXPECTED, 2) if EXPECTED else 0.0,
-            "funding_events": len(funding),
-        }
+        # Manifest stores repo-relative path.
+        raw_url = f"{BASE}/{raw_file.lstrip('/')}"
         print(
-            "BF4_STATIC_QUALITY "
-            + json.dumps({"symbol": symbol, **quality[symbol]}, separators=(",", ":")),
+            f"MEME2_COPYABILITY_WALLET_START "
+            f"wallet={i}/{len(wallets_meta)} {wallet[:8]}.. "
+            f"raw_rows={meta.get('rows')}",
             flush=True,
         )
 
-        for t in times:
-            sb, sa = quote(spot[t], SPOT_SPREAD_BPS)
-            pb, pa = quote(perp[t], PERP_SPREAD_BPS)
-            rate, nft = funding_at(funding, ftimes, t)
-            snapshots.append(
+        pairs, counters = scan_wallet(wallet, raw_url)
+        row = wallet_summary(wallet, pairs, counters)
+        wallet_rows.append(row)
+        all_pairs.extend(pairs)
+
+        print(
+            "MEME2_COPYABILITY_WALLET_DONE "
+            + json.dumps(
                 {
-                    "timestamp": datetime.fromtimestamp(t / 1000, tz=timezone.utc).isoformat(),
-                    "symbol": symbol,
-                    "spot_bid": sb,
-                    "spot_ask": sa,
-                    "perp_bid": pb,
-                    "perp_ask": pa,
-                    "funding_rate": rate,
-                    "next_funding_time_ms": nft,
-                }
-            )
+                    "wallet": wallet[:8],
+                    "paired_trades": row["paired_trades"],
+                    "raw_pf": row["raw_pf"],
+                    "pf_cost_6_5": row.get("pf_cost_6_5"),
+                    "median_hold_sec": row["median_hold_sec"],
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
 
-    (OUT / "bf1_v4_static_quality.json").write_text(json.dumps(quality, indent=2), encoding="utf-8")
+    # Aggregate across wallets.
+    aggregate_raw = [float(x["raw_return_pct"]) for x in all_pairs]
+    aggregate = {
+        "wallets": len(wallet_rows),
+        "paired_trades": len(all_pairs),
+        "raw_pf": round(pf(aggregate_raw), 4),
+        "raw_sum_return_pct": round(sum(aggregate_raw), 4),
+        "raw_win_rate_pct": round(
+            100.0 * sum(1 for x in aggregate_raw if x > 0)
+            / len(aggregate_raw),
+            2,
+        ) if aggregate_raw else 0.0,
+    }
 
-    if any(q["aligned_rows"] < MIN_ROWS for q in quality.values()):
-        print("BF4_STATIC_INVALID " + json.dumps(quality, separators=(",", ":")), flush=True)
-        raise RuntimeError("BF4 static archive proxy coverage below 95%")
+    for cost in COST_SCENARIOS_PCT:
+        vals = [net_after_flat_cost(x, cost) for x in aggregate_raw]
+        tag = str(cost).replace(".", "_")
+        aggregate[f"pf_cost_{tag}"] = round(pf(vals), 4)
+        aggregate[f"sum_cost_{tag}"] = round(sum(vals), 4)
+        aggregate[f"win_rate_cost_{tag}"] = round(
+            100.0 * sum(1 for x in vals if x > 0) / len(vals),
+            2,
+        ) if vals else 0.0
 
-    snap_path = OUT / "bf1_v4_static_snapshots.csv"
-    snapshots.sort(key=lambda r: (r["timestamp"], r["symbol"]))
-    with snap_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(snapshots)
+    # Ranking: use 6.5% cost scenario as a conservative central screen.
+    wallet_rows.sort(
+        key=lambda r: (
+            r.get("paired_trades", 0) >= 20,
+            r.get("pf_cost_6_5", 0.0),
+            r.get("sum_cost_6_5", 0.0),
+        ),
+        reverse=True,
+    )
 
-    out_path = OUT / "bf1_v4_static_outcomes.csv"
-    run_adapter(snap_path, out_path)
-    summary = summarize(out_path, quality)
-    (OUT / "bf1_v4_static_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print("BF4_STATIC_RESULT " + json.dumps(summary, separators=(",", ":")), flush=True)
-    print("BF4_STATIC_DONE", flush=True)
+    wallet_csv = OUT / "meme2_wallet_copyability.csv"
+    pair_csv = OUT / "meme2_copyability_pairs.csv"
+    report_json = OUT / "meme2_copyability_report.json"
+
+    if wallet_rows:
+        with wallet_csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(wallet_rows[0].keys()))
+            w.writeheader()
+            w.writerows(wallet_rows)
+
+    if all_pairs:
+        with pair_csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(all_pairs[0].keys()))
+            w.writeheader()
+            w.writerows(all_pairs)
+
+    report = {
+        "method": "simple_swap_sol_flow_copyability_screen",
+        "limitations": [
+            "No historical liquidity snapshot; cannot reproduce live liquidity gate or impact exactly.",
+            "SOL/token transaction-price proxy is used instead of historical USD pool price.",
+            "Only simple one-nonstable-token-change transactions are retained to avoid ambiguous multi-token SOL-flow attribution.",
+            "PF is a screening metric only; a final liquidity-aware replay is required before live use.",
+        ],
+        "aggregate": aggregate,
+        "wallets": wallet_rows,
+    }
+    report_json.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print(
+        "MEME2_COPYABILITY_SUMMARY "
+        + json.dumps(aggregate, separators=(",", ":")),
+        flush=True,
+    )
+
+    print("MEME2_COPYABILITY_TOP", flush=True)
+    for r in wallet_rows[:10]:
+        print(
+            json.dumps(
+                {
+                    "wallet": r["wallet"][:8],
+                    "trades": r["paired_trades"],
+                    "pf6_5": r.get("pf_cost_6_5"),
+                    "sum6_5": r.get("sum_cost_6_5"),
+                    "median_hold_sec": r.get("median_hold_sec"),
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+
+    print("MEME2_COPYABILITY_DONE", flush=True)
 
 
 if __name__ == "__main__":
     main()
-    print("BF4_TO_BF5_HANDOFF", flush=True)
-    subprocess.run(
-        [
-            sys.executable,
-            "bf1_historical_v5_ab.py",
-            "--snapshots",
-            str(OUT / "bf1_v4_static_snapshots.csv"),
-            "--out-dir",
-            "data/bf1_v5_ab",
-        ],
-        check=True,
-    )
