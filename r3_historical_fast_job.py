@@ -7,12 +7,15 @@ R3 historical adapter. Historical-only; no database export and no live writes.
 from __future__ import annotations
 
 import csv
+import json
 import os
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import historical_data as hd
 
@@ -33,6 +36,8 @@ DATA = Path(
 )
 DATA.mkdir(parents=True, exist_ok=True)
 
+MARK_PRICE_PATH = "/openApi/swap/v1/market/markPriceKlines"
+
 
 def parse_end(value: str) -> datetime:
     s = value
@@ -42,6 +47,201 @@ def parse_end(value: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _mark_row_ts(row) -> int:
+    if isinstance(row, (list, tuple)):
+        return int(float(row[0]))
+    if isinstance(row, dict):
+        return int(float(
+            row.get("time",
+            row.get("openTime",
+            row.get("open_time", 0)))
+        ))
+    return 0
+
+
+def _fetch_mark_page(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1440,
+):
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "startTime": int(start_ms),
+        "endTime": int(end_ms),
+        "limit": min(int(limit), 1440),
+    }
+    url = (
+        f"{hd.API_BASE}{MARK_PRICE_PATH}?"
+        f"{urlencode(params)}"
+    )
+    req = Request(
+        url,
+        headers={"User-Agent": "r3-historical-mark-fallback/1.0"},
+    )
+
+    last_error = None
+    for attempt in range(6):
+        try:
+            with urlopen(req, timeout=30) as resp:
+                payload = json.loads(
+                    resp.read().decode("utf-8")
+                )
+
+            code = payload.get("code")
+            if code in (0, "0", None):
+                rows = payload.get("data") or []
+                rows.sort(key=_mark_row_ts)
+                return rows
+
+            last_error = RuntimeError(
+                f"BingX mark-price error: {payload}"
+            )
+            if str(code) == "100410":
+                delay = min(
+                    3.0 * (2 ** attempt),
+                    48.0,
+                )
+                print(
+                    "BingX mark-price temporary 100410; "
+                    f"retry {attempt + 1}/6 "
+                    f"after {delay:.1f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+            raise last_error
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 5:
+                break
+            delay = min(
+                3.0 * (2 ** attempt),
+                48.0,
+            )
+            print(
+                "BingX mark-price request failed "
+                f"({type(exc).__name__}: {exc}); "
+                f"retry {attempt + 1}/6 "
+                f"after {delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        "BingX mark-price request failed after retries: "
+        f"{last_error}"
+    )
+
+
+def _normalize_mark_row(
+    symbol: str,
+    interval: str,
+    row,
+):
+    if isinstance(row, (list, tuple)):
+        if len(row) < 6:
+            raise ValueError(
+                f"unexpected mark-price kline row: {row}"
+            )
+        ts = _mark_row_ts(row)
+        open_v = float(row[1])
+        high_v = float(row[2])
+        low_v = float(row[3])
+        close_v = float(row[4])
+        volume_v = float(row[5] or 0.0)
+    elif isinstance(row, dict):
+        ts = _mark_row_ts(row)
+        open_v = float(row.get("open") or 0.0)
+        high_v = float(row.get("high") or 0.0)
+        low_v = float(row.get("low") or 0.0)
+        close_v = float(row.get("close") or 0.0)
+        volume_v = float(row.get("volume") or 0.0)
+    else:
+        raise TypeError(
+            "unsupported mark-price kline row type: "
+            f"{type(row).__name__}"
+        )
+
+    return {
+        "timestamp": hd.iso_utc(ts),
+        "symbol": symbol,
+        "interval": interval,
+        "open": open_v,
+        "high": high_v,
+        "low": low_v,
+        "close": close_v,
+        "volume": volume_v,
+        "quote_volume": volume_v * close_v,
+        "trades": 0,
+        "taker_buy_base": 0.0,
+        "taker_buy_quote": 0.0,
+    }
+
+
+def download_mark_price_symbol(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    request_pause_sec: float,
+):
+    step = hd.INTERVAL_MS[interval]
+    cursor_end = end_ms
+    result = []
+    seen = set()
+
+    while cursor_end >= start_ms:
+        page = _fetch_mark_page(
+            symbol,
+            interval,
+            start_ms,
+            cursor_end,
+        )
+        if not page:
+            break
+
+        page_ts = [
+            _mark_row_ts(raw)
+            for raw in page
+            if _mark_row_ts(raw) > 0
+        ]
+        if not page_ts:
+            break
+
+        for raw in page:
+            ts = _mark_row_ts(raw)
+            if (
+                ts < start_ms
+                or ts > end_ms
+                or ts in seen
+            ):
+                continue
+            seen.add(ts)
+            result.append(
+                _normalize_mark_row(
+                    symbol,
+                    interval,
+                    raw,
+                )
+            )
+
+        earliest_ts = min(page_ts)
+        if earliest_ts <= start_ms:
+            break
+
+        next_end = earliest_ts - step
+        if next_end >= cursor_end:
+            break
+        cursor_end = next_end
+        time.sleep(max(0.0, request_pause_sec))
+
+    result.sort(key=lambda r: r["timestamp"])
+    return result
 
 
 def download_interval(
@@ -77,6 +277,35 @@ def download_interval(
             end_ms,
             REQUEST_PAUSE,
         )
+
+        expected_rows = int(
+            (end_ms - start_ms)
+            // hd.INTERVAL_MS[interval]
+        )
+        minimum_rows = int(expected_rows * 0.95)
+
+        if len(rows) < minimum_rows:
+            original_count = len(rows)
+            fallback = download_mark_price_symbol(
+                symbol,
+                interval,
+                start_ms,
+                end_ms,
+                REQUEST_PAUSE,
+            )
+            if len(fallback) > len(rows):
+                rows = fallback
+            print(
+                "R3_FAST_FALLBACK "
+                "source=bingx_mark_price_klines "
+                f"symbol={symbol} interval={interval} "
+                f"v3_rows={original_count} "
+                f"fallback_rows={len(fallback)} "
+                f"selected_rows={len(rows)} "
+                f"minimum={minimum_rows}",
+                flush=True,
+            )
+
         fresh = [
             r for r in rows
             if (
@@ -288,8 +517,6 @@ def main():
     print("R3_FAST_RUN", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
 
-    # Complete the isolated historical router reporting pipeline without
-    # rerunning the slow original R3 adapter. No database or live data access.
     regime_path = DATA / "market_features.csv"
     subprocess.run([
         sys.executable, "market_regime.py",
