@@ -1,36 +1,28 @@
 """
-BF1 V6 Structural Historical Test
-(replaces bf1_historical_v5_ab.py so the existing V4->V5 runner can execute it)
+BF1 V7 Two-Way Basis + Funding Historical Research
+(replaces bf1_historical_v5_ab.py so the existing V4->handoff runner executes it)
 
-Goal
-----
-Test the structural bottleneck found in V5:
-- Current BF1 rejects most rows because open_basis must be > 0
-- Current BF1 also hard-requires funding >= 0
-- MIN_EDGE / lower-cost changes did NOT materially increase trade count
+Research goals
+--------------
+V6 proved that removing the positive-basis gate only increased the sample
+from 2 trades to ~3 trades. V7 therefore tests the structural question:
 
-V6 tests:
-1) BASELINE: current BF1 behavior.
-2) FLEX_POS_FUND:
-   - basis may be negative down to BASIS_FLOOR
-   - funding must still be >= 0
-   - entry is based on projected total economics
-3) FLEX_ANY_FUND:
-   - basis may be negative down to BASIS_FLOOR
-   - funding sign is not hard-gated
-   - projected total economics must still pass MIN_EDGE
+A) CASH_AND_CARRY
+   Buy spot + short perpetual.
+   Benefits from perp premium and positive funding.
 
-Funding projection:
-- 24h = current funding rate * 3 events
-- 48h = current funding rate * 6 events
-No future funding lookahead is used for ENTRY.
+B) REVERSE_CARRY
+   Short spot + long perpetual.
+   Benefits from perp discount and negative funding.
+   IMPORTANT: requires spot borrow/margin availability in real execution.
 
-V6 exit logic for FLEX variants:
-- positive-basis entries can close when basis converges
-- close if funding turns materially adverse
-- close on max hold
-- close on adverse basis widening stop
-- take profit if basis improves enough versus entry
+V7 also compares:
+- current taker-style execution costs
+- lower-cost / maker-like research costs
+- zero exchange fee/slippage diagnostic (borrow cost still applied)
+
+No future funding lookahead is used for ENTRY. The current funding rate is
+projected over 24h or 48h.
 
 Historical research only.
 No DATABASE_URL.
@@ -52,25 +44,26 @@ from pathlib import Path
 
 os.environ.pop("DATABASE_URL", None)
 
-NOTIONAL = float(os.getenv("BF6_NOTIONAL", "100"))
-MAX_OPEN = int(os.getenv("BF6_MAX_OPEN", "3"))
+NOTIONAL = float(os.getenv("BF7_NOTIONAL", "100"))
+MAX_OPEN = int(os.getenv("BF7_MAX_OPEN", "3"))
+MAX_HOURS = float(os.getenv("BF7_MAX_HOLD_HOURS", "48"))
 
-SPOT_FEE = float(os.getenv("BF6_SPOT_FEE", "0.0010"))
-PERP_FEE = float(os.getenv("BF6_PERP_FEE", "0.0005"))
-SLIP = float(os.getenv("BF6_SLIP_PER_LEG", "0.0001"))
+# Exit / risk parameters in percentage points.
+CLOSE_BASIS = float(os.getenv("BF7_CLOSE_BASIS_PCT", "0.05"))
+BASIS_ADVERSE_STOP = float(os.getenv("BF7_BASIS_ADVERSE_STOP_PCT", "0.25"))
+BASIS_TAKE_PROFIT = float(os.getenv("BF7_BASIS_TAKE_PROFIT_PCT", "0.15"))
 
-CLOSE_BASIS = float(os.getenv("BF6_CLOSE_BASIS_PCT", "0.05"))
-FUNDING_EXIT = float(os.getenv("BF6_FUNDING_EXIT_RATE", "-0.0002"))
-MAX_HOURS = float(os.getenv("BF6_MAX_HOLD_HOURS", "48"))
+# Funding sign reversal exit threshold:
+# cash short-perp exits if funding <= -threshold
+# reverse long-perp exits if funding >= +threshold
+FUNDING_ADVERSE_ABS = float(os.getenv("BF7_FUNDING_ADVERSE_ABS", "0.0002"))
 
-# Structural risk guards for flexible carry entries.
-BASIS_FLOOR = float(os.getenv("BF6_BASIS_FLOOR_PCT", "-0.30"))
-BASIS_ADVERSE_STOP = float(os.getenv("BF6_BASIS_ADVERSE_STOP_PCT", "0.25"))
-BASIS_TAKE_PROFIT = float(os.getenv("BF6_BASIS_TAKE_PROFIT_PCT", "0.15"))
+# Reverse carry needs spot borrow. Default 10% APR research assumption.
+BORROW_APR = float(os.getenv("BF7_SPOT_BORROW_APR", "0.10"))
 
 EDGE_THRESHOLDS = [
     float(x.strip())
-    for x in os.getenv("BF6_EDGE_THRESHOLDS", "0.00,0.05,0.10").split(",")
+    for x in os.getenv("BF7_EDGE_THRESHOLDS", "0.00,0.05").split(",")
     if x.strip()
 ]
 
@@ -78,14 +71,44 @@ DEFAULT_OUT = "data/bf1_v5_ab"
 
 
 @dataclass(frozen=True)
+class CostModel:
+    name: str
+    spot_fee: float
+    perp_fee: float
+    slip_per_leg: float
+
+
+@dataclass(frozen=True)
 class Variant:
     name: str
-    mode: str
+    cost_name: str
     funding_projection_events: int
+    projected_hold_hours: float
     min_edge_pct: float
-    require_positive_funding: bool
-    require_positive_basis: bool
-    flexible_exit: bool
+    enable_cash: bool
+    enable_reverse: bool
+
+
+COST_MODELS = {
+    "TAKER": CostModel(
+        "TAKER",
+        float(os.getenv("BF7_TAKER_SPOT_FEE", "0.0010")),
+        float(os.getenv("BF7_TAKER_PERP_FEE", "0.0005")),
+        float(os.getenv("BF7_TAKER_SLIP_PER_LEG", "0.0001")),
+    ),
+    "LOWCOST": CostModel(
+        "LOWCOST",
+        float(os.getenv("BF7_LOW_SPOT_FEE", "0.0005")),
+        float(os.getenv("BF7_LOW_PERP_FEE", "0.0002")),
+        float(os.getenv("BF7_LOW_SLIP_PER_LEG", "0.00005")),
+    ),
+    "ZEROEX": CostModel(
+        "ZEROEX",
+        0.0,
+        0.0,
+        0.0,
+    ),
+}
 
 
 def parse_dt(s: str) -> datetime:
@@ -95,217 +118,317 @@ def parse_dt(s: str) -> datetime:
     return x.astimezone(timezone.utc)
 
 
-def variants() -> list[Variant]:
+def build_variants() -> list[Variant]:
     out = [
         Variant(
             name="BASELINE_CURRENT",
-            mode="BASELINE",
+            cost_name="TAKER",
             funding_projection_events=1,
+            projected_hold_hours=8.0,
             min_edge_pct=0.10,
-            require_positive_funding=True,
-            require_positive_basis=True,
-            flexible_exit=False,
+            enable_cash=True,
+            enable_reverse=False,
         )
     ]
 
-    for events, horizon in [(3, "24H"), (6, "48H")]:
-        for edge in EDGE_THRESHOLDS:
-            out.append(
-                Variant(
-                    name=f"FLEX_POS_FUND_{horizon}_E{edge:.2f}",
-                    mode="FLEX_POS_FUND",
-                    funding_projection_events=events,
-                    min_edge_pct=edge,
-                    require_positive_funding=True,
-                    require_positive_basis=False,
-                    flexible_exit=True,
+    for cost in ("TAKER", "LOWCOST", "ZEROEX"):
+        for events, hours, label in ((3, 24.0, "24H"), (6, 48.0, "48H")):
+            for edge in EDGE_THRESHOLDS:
+                out.append(
+                    Variant(
+                        name=f"TWOWAY_{cost}_{label}_E{edge:.2f}",
+                        cost_name=cost,
+                        funding_projection_events=events,
+                        projected_hold_hours=hours,
+                        min_edge_pct=edge,
+                        enable_cash=True,
+                        enable_reverse=True,
+                    )
                 )
-            )
-            out.append(
-                Variant(
-                    name=f"FLEX_ANY_FUND_{horizon}_E{edge:.2f}",
-                    mode="FLEX_ANY_FUND",
-                    funding_projection_events=events,
-                    min_edge_pct=edge,
-                    require_positive_funding=False,
-                    require_positive_basis=False,
-                    flexible_exit=True,
-                )
-            )
     return out
 
 
-def snap(raw: dict, v: Variant) -> dict:
-    sb = float(raw["spot_bid"])
-    sa = float(raw["spot_ask"])
-    pb = float(raw["perp_bid"])
-    pa = float(raw["perp_ask"])
-    fr = float(raw.get("funding_rate") or 0.0)
-
-    open_basis = (pb / sa - 1.0) * 100.0
-    close_basis = (pa / sb - 1.0) * 100.0
-
-    fee_pct = 2.0 * (SPOT_FEE + PERP_FEE) * 100.0
-    slip_pct = 4.0 * SLIP * 100.0
-    projected_funding_pct = fr * 100.0 * v.funding_projection_events
-
-    expected_edge = (
-        open_basis
-        - CLOSE_BASIS
-        + projected_funding_pct
-        - fee_pct
-        - slip_pct
-    )
-
+def quote_fields(raw: dict) -> dict:
     return {
         "t": parse_dt(raw["timestamp"]),
         "symbol": raw["symbol"].upper(),
-        "spot_bid": sb,
-        "spot_ask": sa,
-        "perp_bid": pb,
-        "perp_ask": pa,
-        "funding_rate": fr,
+        "spot_bid": float(raw["spot_bid"]),
+        "spot_ask": float(raw["spot_ask"]),
+        "perp_bid": float(raw["perp_bid"]),
+        "perp_ask": float(raw["perp_ask"]),
+        "funding_rate": float(raw.get("funding_rate") or 0.0),
         "next_funding_time_ms": int(float(raw.get("next_funding_time_ms") or 0)),
-        "open_basis_pct": open_basis,
-        "close_basis_pct": close_basis,
-        "projected_funding_pct": projected_funding_pct,
-        "expected_net_edge_pct": expected_edge,
     }
 
 
-def should_open(s: dict, n_open: int, v: Variant):
-    if n_open >= MAX_OPEN:
-        return False, "MAX_OPEN"
-
-    if v.require_positive_funding and s["funding_rate"] < 0:
-        return False, "FUNDING_BELOW_ZERO"
-
-    if v.require_positive_basis and s["open_basis_pct"] <= 0:
-        return False, "NO_POSITIVE_PREMIUM"
-
-    if not v.require_positive_basis and s["open_basis_pct"] < BASIS_FLOOR:
-        return False, "BASIS_BELOW_FLOOR"
-
-    if s["expected_net_edge_pct"] < v.min_edge_pct:
-        return False, "NET_EDGE_TOO_SMALL"
-
-    return True, "OPEN"
+def round_trip_exchange_cost_pct(cm: CostModel) -> float:
+    return (
+        2.0 * (cm.spot_fee + cm.perp_fee) * 100.0
+        + 4.0 * cm.slip_per_leg * 100.0
+    )
 
 
-def should_close(pos: dict, s: dict, v: Variant):
+def projected_borrow_pct(hours: float) -> float:
+    return BORROW_APR * (hours / (365.0 * 24.0)) * 100.0
+
+
+def cash_metrics(s: dict, v: Variant, cm: CostModel) -> dict:
+    # Entry: buy spot ask, short perp bid.
+    entry_basis = (s["perp_bid"] / s["spot_ask"] - 1.0) * 100.0
+    projected_funding = s["funding_rate"] * 100.0 * v.funding_projection_events
+    exchange_cost = round_trip_exchange_cost_pct(cm)
+
+    # Assume eventual close near CLOSE_BASIS residual.
+    expected_edge = (
+        entry_basis
+        - CLOSE_BASIS
+        + projected_funding
+        - exchange_cost
+    )
+
+    return {
+        "direction": "CASH",
+        "entry_basis_pct": entry_basis,
+        "projected_funding_pct": projected_funding,
+        "projected_borrow_pct": 0.0,
+        "exchange_cost_pct": exchange_cost,
+        "expected_edge_pct": expected_edge,
+    }
+
+
+def reverse_metrics(s: dict, v: Variant, cm: CostModel) -> dict:
+    # Entry: short spot bid, long perp ask.
+    # Positive reverse basis means spot > perp.
+    entry_basis = (s["spot_bid"] / s["perp_ask"] - 1.0) * 100.0
+
+    # Negative funding benefits long perp.
+    projected_funding = (-s["funding_rate"]) * 100.0 * v.funding_projection_events
+    exchange_cost = round_trip_exchange_cost_pct(cm)
+    borrow_pct = projected_borrow_pct(v.projected_hold_hours)
+
+    expected_edge = (
+        entry_basis
+        - CLOSE_BASIS
+        + projected_funding
+        - exchange_cost
+        - borrow_pct
+    )
+
+    return {
+        "direction": "REVERSE",
+        "entry_basis_pct": entry_basis,
+        "projected_funding_pct": projected_funding,
+        "projected_borrow_pct": borrow_pct,
+        "exchange_cost_pct": exchange_cost,
+        "expected_edge_pct": expected_edge,
+    }
+
+
+def choose_entry(s: dict, v: Variant, cm: CostModel):
+    candidates = []
+
+    if v.enable_cash:
+        candidates.append(cash_metrics(s, v, cm))
+
+    if v.enable_reverse:
+        candidates.append(reverse_metrics(s, v, cm))
+
+    if not candidates:
+        return None, "NO_DIRECTION_ENABLED"
+
+    best = max(candidates, key=lambda x: x["expected_edge_pct"])
+
+    if best["expected_edge_pct"] < v.min_edge_pct:
+        cash_edge = next((x["expected_edge_pct"] for x in candidates if x["direction"] == "CASH"), None)
+        rev_edge = next((x["expected_edge_pct"] for x in candidates if x["direction"] == "REVERSE"), None)
+
+        if cash_edge is not None and rev_edge is not None:
+            if cash_edge < v.min_edge_pct and rev_edge < v.min_edge_pct:
+                return None, "BOTH_EDGE_TOO_SMALL"
+        return None, f'{best["direction"]}_EDGE_TOO_SMALL'
+
+    return best, "OPEN"
+
+
+def current_close_basis(s: dict, direction: str) -> float:
+    if direction == "CASH":
+        # Exit: sell spot bid, buy perp ask.
+        return (s["perp_ask"] / s["spot_bid"] - 1.0) * 100.0
+
+    # REVERSE exit: buy spot ask, sell perp bid.
+    return (s["spot_ask"] / s["perp_bid"] - 1.0) * 100.0
+
+
+def should_close(pos: dict, s: dict):
     age_h = (s["t"] - pos["opened_at"]).total_seconds() / 3600.0
+    now_basis = current_close_basis(s, pos["direction"])
+    entry_basis = pos["entry_basis_pct"]
 
-    if not v.flexible_exit:
-        if s["close_basis_pct"] <= CLOSE_BASIS:
-            return "BASIS_CONVERGED"
-        if s["funding_rate"] <= FUNDING_EXIT:
-            return "FUNDING_TURNED_ADVERSE"
-        if age_h >= MAX_HOURS:
-            return "MAX_HOLD"
-        return None
+    favorable = entry_basis - now_basis
+    adverse = now_basis - entry_basis
 
-    # FLEX logic:
-    entry_basis = pos["entry_open_basis_pct"]
-    basis_change_favorable = entry_basis - s["close_basis_pct"]
-    basis_change_adverse = s["close_basis_pct"] - entry_basis
+    if entry_basis > CLOSE_BASIS and now_basis <= CLOSE_BASIS:
+        return "BASIS_CONVERGED", now_basis
 
-    # If this was a classic positive-basis cash-and-carry entry, preserve
-    # the convergence exit.
-    if entry_basis > CLOSE_BASIS and s["close_basis_pct"] <= CLOSE_BASIS:
-        return "BASIS_CONVERGED"
+    if favorable >= BASIS_TAKE_PROFIT:
+        return "BASIS_TAKE_PROFIT", now_basis
 
-    # For negative/low basis carry entries, convergence upward can hurt.
-    # Exit if basis widens upward too far versus entry.
-    if basis_change_adverse >= BASIS_ADVERSE_STOP:
-        return "BASIS_ADVERSE_STOP"
+    if adverse >= BASIS_ADVERSE_STOP:
+        return "BASIS_ADVERSE_STOP", now_basis
 
-    # If basis improves materially in our favor, crystallize the spread gain.
-    if basis_change_favorable >= BASIS_TAKE_PROFIT:
-        return "BASIS_TAKE_PROFIT"
-
-    if s["funding_rate"] <= FUNDING_EXIT:
-        return "FUNDING_TURNED_ADVERSE"
+    if pos["direction"] == "CASH":
+        if s["funding_rate"] <= -FUNDING_ADVERSE_ABS:
+            return "FUNDING_TURNED_ADVERSE", now_basis
+    else:
+        if s["funding_rate"] >= FUNDING_ADVERSE_ABS:
+            return "FUNDING_TURNED_ADVERSE", now_basis
 
     if age_h >= MAX_HOURS:
-        return "MAX_HOLD"
+        return "MAX_HOLD", now_basis
 
-    return None
+    return None, now_basis
 
 
-def close_calc(pos: dict, s: dict):
+def accrue_funding(pos: dict, s: dict):
+    nxt = int(pos.get("next_funding") or 0)
+    last = int(pos.get("last_funding") or 0)
+
+    if not nxt:
+        return
+
+    if int(s["t"].timestamp() * 1000) < nxt:
+        return
+
+    if last >= nxt:
+        return
+
+    perp_mid = (s["perp_bid"] + s["perp_ask"]) / 2.0
+    base = pos["qty"] * perp_mid * s["funding_rate"]
+
+    if pos["direction"] == "CASH":
+        # Short perp receives positive funding.
+        funding_usdt = base
+    else:
+        # Long perp receives negative funding.
+        funding_usdt = -base
+
+    pos["funding"] += funding_usdt
+    pos["funding_events"] += 1
+    pos["last_funding"] = nxt
+
+    new_next = int(s["next_funding_time_ms"] or 0)
+    if new_next > nxt:
+        pos["next_funding"] = new_next
+
+
+def close_pnl(pos: dict, s: dict, cm: CostModel):
     q = pos["qty"]
 
-    gross = (
-        q * (s["spot_bid"] - pos["entry_spot"])
-        + q * (pos["entry_perp"] - s["perp_ask"])
-        + pos["funding"]
-    )
+    if pos["direction"] == "CASH":
+        # Long spot + short perp.
+        gross = (
+            q * (s["spot_bid"] - pos["entry_spot"])
+            + q * (pos["entry_perp"] - s["perp_ask"])
+            + pos["funding"]
+        )
 
-    fee = q * (
-        pos["entry_spot"] * SPOT_FEE
-        + s["spot_bid"] * SPOT_FEE
-        + pos["entry_perp"] * PERP_FEE
-        + s["perp_ask"] * PERP_FEE
-    )
+        fee = q * (
+            pos["entry_spot"] * cm.spot_fee
+            + s["spot_bid"] * cm.spot_fee
+            + pos["entry_perp"] * cm.perp_fee
+            + s["perp_ask"] * cm.perp_fee
+        )
 
-    slip = q * (
-        pos["entry_spot"] + s["spot_bid"]
-        + pos["entry_perp"] + s["perp_ask"]
-    ) * SLIP
+        slip = q * (
+            pos["entry_spot"]
+            + s["spot_bid"]
+            + pos["entry_perp"]
+            + s["perp_ask"]
+        ) * cm.slip_per_leg
 
-    net = gross - fee - slip
+        borrow = 0.0
+
+    else:
+        # Short spot + long perp.
+        gross = (
+            q * (pos["entry_spot"] - s["spot_ask"])
+            + q * (s["perp_bid"] - pos["entry_perp"])
+            + pos["funding"]
+        )
+
+        fee = q * (
+            pos["entry_spot"] * cm.spot_fee
+            + s["spot_ask"] * cm.spot_fee
+            + pos["entry_perp"] * cm.perp_fee
+            + s["perp_bid"] * cm.perp_fee
+        )
+
+        slip = q * (
+            pos["entry_spot"]
+            + s["spot_ask"]
+            + pos["entry_perp"]
+            + s["perp_bid"]
+        ) * cm.slip_per_leg
+
+        hold_h = (s["t"] - pos["opened_at"]).total_seconds() / 3600.0
+        borrow = (
+            q
+            * pos["entry_spot"]
+            * BORROW_APR
+            * hold_h
+            / (365.0 * 24.0)
+        )
+
+    net = gross - fee - slip - borrow
     capital = q * pos["entry_spot"]
     ret = net / capital * 100.0 if capital > 0 else 0.0
-    return gross, fee, slip, net, ret
+
+    return gross, fee, slip, borrow, net, ret
 
 
-def run_one(raw_rows: list[dict], v: Variant):
-    rows = [snap(r, v) for r in raw_rows]
+def run_variant(raw_rows: list[dict], v: Variant):
+    cm = COST_MODELS[v.cost_name]
+
+    rows = [quote_fields(r) for r in raw_rows]
     rows.sort(key=lambda x: (x["t"], x["symbol"]))
 
     opens = {}
     trades = []
     rejects = Counter()
     closes = Counter()
-    entry_symbols = Counter()
+    direction_entries = Counter()
+    symbol_entries = Counter()
 
     for s in rows:
         sym = s["symbol"]
         pos = opens.get(sym)
 
         if pos:
-            nxt = int(pos.get("next_funding") or 0)
-            last = int(pos.get("last_funding") or 0)
+            accrue_funding(pos, s)
+            reason, exit_basis = should_close(pos, s)
 
-            if nxt and int(s["t"].timestamp() * 1000) >= nxt and last < nxt:
-                perp_mid = (s["perp_bid"] + s["perp_ask"]) / 2.0
-                pos["funding"] += pos["qty"] * perp_mid * s["funding_rate"]
-                pos["funding_events"] += 1
-                pos["last_funding"] = nxt
-
-                new_next = int(s["next_funding_time_ms"] or 0)
-                if new_next > nxt:
-                    pos["next_funding"] = new_next
-
-            reason = should_close(pos, s, v)
             if reason:
-                gross, fee, slip, net, ret = close_calc(pos, s)
+                gross, fee, slip, borrow, net, ret = close_pnl(pos, s, cm)
                 hold_h = (s["t"] - pos["opened_at"]).total_seconds() / 3600.0
 
                 trades.append({
                     "variant": v.name,
-                    "mode": v.mode,
+                    "cost_name": v.cost_name,
+                    "direction": pos["direction"],
                     "symbol": sym,
                     "opened_at": pos["opened_at"].isoformat(),
                     "closed_at": s["t"].isoformat(),
                     "hold_hours": round(hold_h, 4),
-                    "entry_open_basis_pct": round(pos["entry_open_basis_pct"], 6),
+                    "entry_basis_pct": round(pos["entry_basis_pct"], 6),
                     "entry_funding_rate": round(pos["entry_funding_rate"], 10),
                     "entry_projected_funding_pct": round(pos["entry_projected_funding_pct"], 6),
-                    "entry_expected_net_edge_pct": round(pos["entry_expected_net_edge_pct"], 6),
-                    "exit_close_basis_pct": round(s["close_basis_pct"], 6),
+                    "entry_projected_borrow_pct": round(pos["entry_projected_borrow_pct"], 6),
+                    "entry_exchange_cost_pct": round(pos["entry_exchange_cost_pct"], 6),
+                    "entry_expected_edge_pct": round(pos["entry_expected_edge_pct"], 6),
+                    "exit_basis_pct": round(exit_basis, 6),
                     "funding_events": pos["funding_events"],
                     "funding_usdt": round(pos["funding"], 8),
+                    "borrow_usdt": round(borrow, 8),
                     "gross_pnl_usdt": round(gross, 8),
                     "fee_usdt": round(fee, 8),
                     "slippage_usdt": round(slip, 8),
@@ -318,31 +441,51 @@ def run_one(raw_rows: list[dict], v: Variant):
                 del opens[sym]
 
         if sym not in opens:
-            ok, reason = should_open(s, len(opens), v)
-            if not ok:
+            if len(opens) >= MAX_OPEN:
+                rejects["MAX_OPEN"] += 1
+                continue
+
+            choice, reason = choose_entry(s, v, cm)
+            if choice is None:
                 rejects[reason] += 1
+                continue
+
+            direction = choice["direction"]
+
+            if direction == "CASH":
+                entry_spot = s["spot_ask"]
+                entry_perp = s["perp_bid"]
             else:
-                qty = NOTIONAL / s["spot_ask"]
-                opens[sym] = {
-                    "opened_at": s["t"],
-                    "qty": qty,
-                    "entry_spot": s["spot_ask"],
-                    "entry_perp": s["perp_bid"],
-                    "entry_open_basis_pct": s["open_basis_pct"],
-                    "entry_funding_rate": s["funding_rate"],
-                    "entry_projected_funding_pct": s["projected_funding_pct"],
-                    "entry_expected_net_edge_pct": s["expected_net_edge_pct"],
-                    "funding": 0.0,
-                    "funding_events": 0,
-                    "last_funding": 0,
-                    "next_funding": int(s["next_funding_time_ms"] or 0),
-                }
-                entry_symbols[sym] += 1
+                entry_spot = s["spot_bid"]
+                entry_perp = s["perp_ask"]
 
-    return trades, rejects, closes, entry_symbols, len(opens)
+            qty = NOTIONAL / max(entry_spot, 1e-12)
+
+            opens[sym] = {
+                "direction": direction,
+                "opened_at": s["t"],
+                "qty": qty,
+                "entry_spot": entry_spot,
+                "entry_perp": entry_perp,
+                "entry_basis_pct": choice["entry_basis_pct"],
+                "entry_funding_rate": s["funding_rate"],
+                "entry_projected_funding_pct": choice["projected_funding_pct"],
+                "entry_projected_borrow_pct": choice["projected_borrow_pct"],
+                "entry_exchange_cost_pct": choice["exchange_cost_pct"],
+                "entry_expected_edge_pct": choice["expected_edge_pct"],
+                "funding": 0.0,
+                "funding_events": 0,
+                "last_funding": 0,
+                "next_funding": int(s["next_funding_time_ms"] or 0),
+            }
+
+            direction_entries[direction] += 1
+            symbol_entries[(direction, sym)] += 1
+
+    return trades, rejects, closes, direction_entries, symbol_entries, len(opens)
 
 
-def pf(vals):
+def profit_factor(vals):
     gp = sum(x for x in vals if x > 0)
     gl = abs(sum(x for x in vals if x < 0))
     if gl > 0:
@@ -352,60 +495,74 @@ def pf(vals):
     return 0.0
 
 
-def drawdown(vals):
-    eq = peak = worst = 0.0
+def max_drawdown(vals):
+    eq = 0.0
+    peak = 0.0
+    worst = 0.0
+
     for x in vals:
         eq += x
         peak = max(peak, eq)
         worst = min(worst, eq - peak)
+
     return abs(worst)
 
 
-def summary(v, trades, rejects, closes, entries, open_left):
-    vals = [float(x["net_return_pct"]) for x in trades]
+def make_summary(v, trades, rejects, closes, direction_entries, symbol_entries, open_left):
+    vals = [float(t["net_return_pct"]) for t in trades]
     wins = [x for x in vals if x > 0]
     losses = [x for x in vals if x < 0]
-    p = pf(vals)
+    p = profit_factor(vals)
 
-    sym = defaultdict(list)
+    by_dir = defaultdict(list)
+    by_sym = defaultdict(list)
+
     for t in trades:
-        sym[t["symbol"]].append(float(t["net_return_pct"]))
+        by_dir[t["direction"]].append(float(t["net_return_pct"]))
+        by_sym[t["symbol"]].append(float(t["net_return_pct"]))
 
     return {
         "variant": v.name,
-        "mode": v.mode,
+        "cost_name": v.cost_name,
         "funding_projection_events": v.funding_projection_events,
+        "projected_hold_hours": v.projected_hold_hours,
         "min_edge_pct": v.min_edge_pct,
-        "require_positive_funding": v.require_positive_funding,
-        "require_positive_basis": v.require_positive_basis,
         "closed": len(vals),
         "wins": len(wins),
         "losses": len(losses),
-        "win_rate_pct": round(len(wins) * 100 / len(vals), 2) if vals else 0.0,
+        "win_rate_pct": round(100 * len(wins) / len(vals), 2) if vals else 0.0,
         "profit_factor": "INF" if math.isinf(p) else round(p, 4),
         "sum_net_return_pct": round(sum(vals), 4),
         "avg_net_return_pct": round(sum(vals) / len(vals), 6) if vals else 0.0,
-        "worst_trade_pct": round(min(vals), 6) if vals else 0.0,
         "best_trade_pct": round(max(vals), 6) if vals else 0.0,
-        "max_drawdown_trade_points_pct": round(drawdown(vals), 4),
+        "worst_trade_pct": round(min(vals), 6) if vals else 0.0,
+        "max_drawdown_trade_points_pct": round(max_drawdown(vals), 4),
         "avg_hold_hours": round(
-            sum(float(x["hold_hours"]) for x in trades) / len(trades), 4
+            sum(float(t["hold_hours"]) for t in trades) / len(trades), 4
         ) if trades else 0.0,
         "open_left": open_left,
-        "entries_BTC": entries.get("BTC-USDT", 0),
-        "entries_ETH": entries.get("ETH-USDT", 0),
-        "entries_SOL": entries.get("SOL-USDT", 0),
-        "BTC_sum_pct": round(sum(sym["BTC-USDT"]), 4),
-        "ETH_sum_pct": round(sum(sym["ETH-USDT"]), 4),
-        "SOL_sum_pct": round(sum(sym["SOL-USDT"]), 4),
+        "cash_entries": direction_entries.get("CASH", 0),
+        "reverse_entries": direction_entries.get("REVERSE", 0),
+        "cash_closed": len(by_dir["CASH"]),
+        "reverse_closed": len(by_dir["REVERSE"]),
+        "cash_sum_pct": round(sum(by_dir["CASH"]), 4),
+        "reverse_sum_pct": round(sum(by_dir["REVERSE"]), 4),
+        "BTC_sum_pct": round(sum(by_sym["BTC-USDT"]), 4),
+        "ETH_sum_pct": round(sum(by_sym["ETH-USDT"]), 4),
+        "SOL_sum_pct": round(sum(by_sym["SOL-USDT"]), 4),
+        "cash_BTC_entries": symbol_entries.get(("CASH", "BTC-USDT"), 0),
+        "cash_ETH_entries": symbol_entries.get(("CASH", "ETH-USDT"), 0),
+        "cash_SOL_entries": symbol_entries.get(("CASH", "SOL-USDT"), 0),
+        "reverse_BTC_entries": symbol_entries.get(("REVERSE", "BTC-USDT"), 0),
+        "reverse_ETH_entries": symbol_entries.get(("REVERSE", "ETH-USDT"), 0),
+        "reverse_SOL_entries": symbol_entries.get(("REVERSE", "SOL-USDT"), 0),
         "reject_MAX_OPEN": rejects.get("MAX_OPEN", 0),
-        "reject_FUNDING_BELOW_ZERO": rejects.get("FUNDING_BELOW_ZERO", 0),
-        "reject_NO_POSITIVE_PREMIUM": rejects.get("NO_POSITIVE_PREMIUM", 0),
-        "reject_BASIS_BELOW_FLOOR": rejects.get("BASIS_BELOW_FLOOR", 0),
-        "reject_NET_EDGE_TOO_SMALL": rejects.get("NET_EDGE_TOO_SMALL", 0),
+        "reject_BOTH_EDGE_TOO_SMALL": rejects.get("BOTH_EDGE_TOO_SMALL", 0),
+        "reject_CASH_EDGE_TOO_SMALL": rejects.get("CASH_EDGE_TOO_SMALL", 0),
+        "reject_REVERSE_EDGE_TOO_SMALL": rejects.get("REVERSE_EDGE_TOO_SMALL", 0),
         "close_BASIS_CONVERGED": closes.get("BASIS_CONVERGED", 0),
-        "close_BASIS_ADVERSE_STOP": closes.get("BASIS_ADVERSE_STOP", 0),
         "close_BASIS_TAKE_PROFIT": closes.get("BASIS_TAKE_PROFIT", 0),
+        "close_BASIS_ADVERSE_STOP": closes.get("BASIS_ADVERSE_STOP", 0),
         "close_FUNDING_TURNED_ADVERSE": closes.get("FUNDING_TURNED_ADVERSE", 0),
         "close_MAX_HOLD": closes.get("MAX_HOLD", 0),
     }
@@ -430,27 +587,38 @@ def main():
         raw_rows = list(csv.DictReader(f))
 
     if not raw_rows:
-        raise RuntimeError("BF6 no snapshots")
+        raise RuntimeError("BF7 no snapshots")
 
-    vs = variants()
+    vs = build_variants()
     all_trades = []
     summaries = []
 
     print(
-        f"BF6_START snapshots={len(raw_rows)} variants={len(vs)} "
-        f"basis_floor={BASIS_FLOOR} adverse_stop={BASIS_ADVERSE_STOP} "
-        f"take_profit={BASIS_TAKE_PROFIT} historical_only=true",
+        f"BF7_START snapshots={len(raw_rows)} variants={len(vs)} "
+        f"borrow_apr={BORROW_APR:.4f} max_hold={MAX_HOURS} historical_only=true",
         flush=True,
     )
 
     for i, v in enumerate(vs, 1):
-        trades, rejects, closes, entries, open_left = run_one(raw_rows, v)
-        s = summary(v, trades, rejects, closes, entries, open_left)
-        all_trades.extend(trades)
+        trades, rejects, closes, direction_entries, symbol_entries, open_left = run_variant(
+            raw_rows, v
+        )
+
+        s = make_summary(
+            v,
+            trades,
+            rejects,
+            closes,
+            direction_entries,
+            symbol_entries,
+            open_left,
+        )
+
         summaries.append(s)
+        all_trades.extend(trades)
 
         print(
-            "BF6_RESULT " + json.dumps(
+            "BF7_RESULT " + json.dumps(
                 {
                     "i": i,
                     "n": len(vs),
@@ -462,6 +630,10 @@ def main():
                     "profit_factor": s["profit_factor"],
                     "sum_net_return_pct": s["sum_net_return_pct"],
                     "max_dd": s["max_drawdown_trade_points_pct"],
+                    "cash_closed": s["cash_closed"],
+                    "reverse_closed": s["reverse_closed"],
+                    "cash_sum_pct": s["cash_sum_pct"],
+                    "reverse_sum_pct": s["reverse_sum_pct"],
                     "rejects": dict(rejects),
                     "closes": dict(closes),
                 },
@@ -470,11 +642,11 @@ def main():
             flush=True,
         )
 
-    # Sample-aware ranking: prefer >=200 closed trades, then PF, then return.
     def rank_key(x):
         n = int(x["closed"])
         deficit = max(0, 200 - n)
         p = 999.0 if x["profit_factor"] == "INF" else float(x["profit_factor"])
+
         return (
             deficit,
             -p,
@@ -484,16 +656,17 @@ def main():
         )
 
     ranked = sorted(summaries, key=rank_key)
+
     for rank, row in enumerate(ranked, 1):
         row["rank_sample_aware"] = rank
 
-    summary_csv = out_dir / "bf1_v6_summary.csv"
+    summary_csv = out_dir / "bf1_v7_summary.csv"
     with summary_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(ranked[0].keys()))
         w.writeheader()
         w.writerows(ranked)
 
-    trades_csv = out_dir / "bf1_v6_trades.csv"
+    trades_csv = out_dir / "bf1_v7_trades.csv"
     if all_trades:
         with trades_csv.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(all_trades[0].keys()))
@@ -502,22 +675,20 @@ def main():
     else:
         trades_csv.write_text("", encoding="utf-8")
 
-    json_path = out_dir / "bf1_v6_summary.json"
+    json_path = out_dir / "bf1_v7_summary.json"
     json_path.write_text(
         json.dumps(
             {
                 "source": args.snapshots,
                 "snapshot_rows": len(raw_rows),
-                "basis_floor_pct": BASIS_FLOOR,
-                "basis_adverse_stop_pct": BASIS_ADVERSE_STOP,
-                "basis_take_profit_pct": BASIS_TAKE_PROFIT,
+                "borrow_apr": BORROW_APR,
                 "notes": [
-                    "ENTRY funding projection uses current rate only; no future funding lookahead.",
-                    "Realized PnL accrues historical funding events from snapshots.",
-                    "FLEX modes remove the hard positive-basis requirement.",
-                    "FLEX_ANY_FUND also removes the hard positive-funding sign requirement.",
-                    "This remains a Binance proxy research test, not BingX execution performance.",
+                    "Reverse carry requires real spot borrow/margin capability; this historical test does not prove executability.",
+                    "Entry funding projection repeats the current funding rate only; it does not use future rates.",
+                    "ZEROEX removes exchange fee/slippage only as a diagnostic and still charges reverse spot borrow cost.",
+                    "This is Binance Data Vision proxy research, not BingX execution performance.",
                 ],
+                "cost_models": {k: asdict(v) for k, v in COST_MODELS.items()},
                 "variants": [asdict(v) for v in vs],
                 "ranked_results": ranked,
             },
@@ -527,7 +698,7 @@ def main():
     )
 
     print(
-        f"BF6_DONE summary={summary_csv} trades={trades_csv}",
+        f"BF7_DONE summary={summary_csv} trades={trades_csv}",
         flush=True,
     )
 
