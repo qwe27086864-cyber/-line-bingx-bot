@@ -1,33 +1,26 @@
 
 """
-Meme2 copyability delay/slippage stress test.
+Meme2 final robustness validation.
 
-Purpose
--------
-Historical-only screening for the 8 remaining Meme2 wallet candidates.
+Historical-only. No live/shadow DB. No orders.
 
-What this CAN test:
-1) Whether a copied trade would still be open after a detection/execution delay
-   of 5 / 10 / 20 / 30 seconds.
-2) Whether surviving trades retain positive expectancy after a base round-trip
-   cost plus extra adverse cost stress.
+Goals:
+1) Rebuild paired trades for the 8 surviving Meme2 wallet candidates.
+2) Require hold_sec > 20 seconds (copyability gate).
+3) Apply conservative total round-trip cost = 11.5 percentage points
+   (6.5% base + 5% extra adverse-cost stress).
+4) Stress extreme-return dependence by capping raw per-trade return at:
+   100%, 200%, 500%, and uncapped.
+5) Check month-by-month stability over the 360-day window.
+6) Measure concentration: how much gross profit comes from top 1 / top 10 trades.
+7) Produce FINAL_PASS / WATCH / FAIL.
 
-What this CANNOT honestly reconstruct:
-- The exact market price 5/10/20/30 seconds after the wallet's transaction,
-  because the raw historical archive contains wallet transactions but not
-  synchronized historical DEX price/liquidity snapshots at those delayed times.
-
-Therefore:
-- Trades with hold_sec <= delay are treated as UNFOLLOWABLE and excluded.
-- Surviving trades keep the wallet's observed raw return, then we subtract:
-    BASE_COST_PCT + EXTRA_COST_PCT
-- EXTRA_COST_PCT is stressed independently at 0 / 2 / 5 / 10 percentage points.
-  It is NOT claimed that a 10-second delay equals any specific cost.
-
-Historical-only:
-- no DATABASE_URL
-- no live/shadow writes
-- no orders
+Important:
+- This still cannot reconstruct exact delayed DEX prices because synchronized
+  historical liquidity/price snapshots were not archived.
+- This is a robustness screen, not proof of live-equivalent PF.
+- After completion the process intentionally sleeps forever so Render does NOT
+  restart the service and repeat the job.
 """
 
 from __future__ import annotations
@@ -52,7 +45,6 @@ MANIFEST_URL = f"{BASE}/{RAW_ROOT}/manifest.json"
 OUT = Path("data/bf1_v3")
 OUT.mkdir(parents=True, exist_ok=True)
 
-# 8 candidates from the completed 20-wallet copyability screen.
 TARGET_WALLETS = [
     "BNnN2MqfWLvgThYBsv6v8JQaYZXYKYahC5YCy27Ct1cX",
     "8MoW9mtbEz6z3gPuAdYb1yWhjCAxQSYqpcTb1CQgN5qb",
@@ -64,13 +56,11 @@ TARGET_WALLETS = [
     "An9sREpLnAXVi4KMaTGuGvgET51CyaukLUTMtxzmLYSB",
 ]
 
-DELAY_SECONDS = [5, 10, 20, 30]
-
-# The earlier screen used 6.5% round-trip cost as a conservative baseline.
+DELAY_SEC = 20
 BASE_COST_PCT = 6.5
-
-# Extra round-trip adverse-cost stress, independent of delay.
-EXTRA_COST_PCTS = [0.0, 2.0, 5.0, 10.0]
+EXTRA_COST_PCT = 5.0
+TOTAL_COST_PCT = BASE_COST_PCT + EXTRA_COST_PCT
+RETURN_CAPS = [100.0, 200.0, 500.0, None]
 
 MIN_SOL_FLOW = 0.0001
 HTTP_TIMEOUT_SEC = 45
@@ -84,10 +74,16 @@ IGNORE_MINTS = {WSOL, USDC, USDT}
 LAMPORTS_PER_SOL = 1_000_000_000.0
 
 
+def hold_forever():
+    print("MEME2_FINAL_HOLD process_complete=true restart_prevention=true", flush=True)
+    while True:
+        time.sleep(3600)
+
+
 def get_json(url: str):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "meme2-delay-stress/1.0", "Connection": "close"},
+        headers={"User-Agent": "meme2-final-validation/1.0", "Connection": "close"},
     )
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as r:
         return json.loads(r.read().decode("utf-8"))
@@ -140,11 +136,9 @@ def wallet_change(wallet: str, tx: dict):
     for mint in set(pre_map) | set(post_map):
         if not mint or mint in IGNORE_MINTS:
             continue
-
         delta = post_map.get(mint, 0.0) - pre_map.get(mint, 0.0)
         if abs(delta) <= 1e-15:
             continue
-
         changes.append({
             "mint": mint,
             "side": "BUY" if delta > 0 else "SELL",
@@ -152,7 +146,6 @@ def wallet_change(wallet: str, tx: dict):
             "sol_delta": sol_delta,
         })
 
-    # Same high-confidence simple-swap rule used in the earlier copyability screen.
     if len(changes) != 1:
         return None
 
@@ -182,19 +175,20 @@ def pf(vals):
     return 999.0 if gp > 0 else 0.0
 
 
-def pctile(vals, p):
-    if not vals:
-        return None
-    s = sorted(vals)
-    if len(s) == 1:
-        return s[0]
-    x = (len(s) - 1) * p
-    lo = int(math.floor(x))
-    hi = int(math.ceil(x))
-    if lo == hi:
-        return s[lo]
-    f = x - lo
-    return s[lo] * (1.0 - f) + s[hi] * f
+def metrics(vals):
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    total = sum(vals)
+    n = len(vals)
+    return {
+        "trades": n,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": round(100 * len(wins) / n, 2) if n else 0.0,
+        "profit_factor": round(pf(vals), 6),
+        "sum_net_return_pct": round(total, 6),
+        "avg_net_return_pct": round(total / n, 6) if n else 0.0,
+    }
 
 
 def scan_wallet_once(wallet: str, raw_url: str):
@@ -204,21 +198,16 @@ def scan_wallet_once(wallet: str, raw_url: str):
 
     req = urllib.request.Request(
         raw_url,
-        headers={
-            "User-Agent": "meme2-delay-stress/1.0",
-            "Connection": "close",
-        },
+        headers={"User-Agent": "meme2-final-validation/1.0", "Connection": "close"},
     )
 
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as r:
         stream = io.TextIOWrapper(r, encoding="utf-8")
         for line in stream:
             counters["raw_rows"] += 1
-
             if counters["raw_rows"] % 25000 == 0:
                 print(
-                    f"MEME2_STRESS_PROGRESS wallet={wallet[:8]} "
-                    f"rows={counters['raw_rows']}",
+                    f"MEME2_FINAL_PROGRESS wallet={wallet[:8]} rows={counters['raw_rows']}",
                     flush=True,
                 )
 
@@ -235,23 +224,18 @@ def scan_wallet_once(wallet: str, raw_url: str):
 
             ch = wallet_change(wallet, tx)
             if not ch:
-                counters["not_simple_swap"] += 1
                 continue
 
             block_time = tx.get("blockTime")
             if not block_time:
-                counters["missing_time"] += 1
                 continue
 
             t = datetime.fromtimestamp(float(block_time), tz=timezone.utc)
             key = (wallet, ch["mint"])
 
             if ch["side"] == "BUY":
-                counters["simple_buys"] += 1
                 if key in opens:
-                    counters["extra_buy_while_open"] += 1
                     continue
-
                 opens[key] = {
                     "opened": t,
                     "entry_px_sol": ch["price_sol_per_token"],
@@ -259,10 +243,8 @@ def scan_wallet_once(wallet: str, raw_url: str):
                 }
                 continue
 
-            counters["simple_sells"] += 1
             pos = opens.get(key)
             if not pos:
-                counters["sell_without_open"] += 1
                 continue
 
             exit_px = ch["price_sol_per_token"]
@@ -272,24 +254,22 @@ def scan_wallet_once(wallet: str, raw_url: str):
             pairs.append({
                 "wallet": wallet,
                 "mint": ch["mint"],
-                "opened_at": pos["opened"].isoformat(),
-                "closed_at": t.isoformat(),
+                "opened_at": pos["opened"],
+                "closed_at": t,
                 "hold_sec": hold_sec,
                 "raw_return_pct": raw_ret,
             })
             del opens[key]
 
-    counters["unclosed"] = len(opens)
-    return pairs, dict(counters)
+    return pairs
 
 
 def scan_wallet_with_retry(wallet: str, raw_url: str):
     last = None
-
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             print(
-                f"MEME2_STRESS_ATTEMPT wallet={wallet[:8]} "
+                f"MEME2_FINAL_ATTEMPT wallet={wallet[:8]} "
                 f"attempt={attempt}/{MAX_ATTEMPTS}",
                 flush=True,
             )
@@ -303,82 +283,76 @@ def scan_wallet_with_retry(wallet: str, raw_url: str):
         ) as exc:
             last = exc
             print(
-                f"MEME2_STRESS_RETRY wallet={wallet[:8]} "
+                f"MEME2_FINAL_RETRY wallet={wallet[:8]} "
                 f"attempt={attempt}/{MAX_ATTEMPTS} "
                 f"error={type(exc).__name__}:{exc}",
                 flush=True,
             )
             if attempt < MAX_ATTEMPTS:
                 time.sleep(RETRY_PAUSE_SEC * attempt)
-
-    raise RuntimeError(
-        f"wallet {wallet[:8]} failed after {MAX_ATTEMPTS} attempts: {last}"
-    )
+    raise RuntimeError(f"{wallet[:8]} failed after retries: {last}")
 
 
-def metrics(vals):
-    wins = [x for x in vals if x > 0]
-    losses = [x for x in vals if x < 0]
-    total = sum(vals)
-
-    return {
-        "trades": len(vals),
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate_pct": round(
-            100.0 * len(wins) / len(vals), 2
-        ) if vals else 0.0,
-        "profit_factor": round(pf(vals), 6),
-        "sum_net_return_pct": round(total, 6),
-        "avg_net_return_pct": round(
-            total / len(vals), 6
-        ) if vals else 0.0,
-    }
+def adjusted_values(pairs, cap):
+    out = []
+    for x in pairs:
+        raw = float(x["raw_return_pct"])
+        if cap is not None:
+            raw = min(raw, cap)
+        out.append(raw - TOTAL_COST_PCT)
+    return out
 
 
-def classify_wallet(rows):
-    """
-    Practical screening label, not a live-trading approval.
+def monthly_stats(pairs, cap):
+    buckets = defaultdict(list)
+    for x in pairs:
+        month = x["opened_at"].strftime("%Y-%m")
+        raw = float(x["raw_return_pct"])
+        if cap is not None:
+            raw = min(raw, cap)
+        buckets[month].append(raw - TOTAL_COST_PCT)
 
-    PASS:
-      - at 20s delay, >=50% of paired trades remain followable
-      - at 20s delay + base 6.5% + extra 5% cost:
-          >=200 trades, PF > 1.10, sum > 0
-      - at 30s delay + base 6.5% + extra 10% cost:
-          PF >= 0.90 (does not collapse completely)
+    rows = []
+    for month in sorted(buckets):
+        m = metrics(buckets[month])
+        rows.append({"month": month, **m})
+    return rows
 
-    BORDERLINE:
-      - at 20s delay + extra 2%:
-          >=100 trades, PF > 1.0, sum > 0
 
-    Otherwise FAIL.
-    """
-    by_key = {
-        (int(r["delay_sec"]), float(r["extra_cost_pct"])): r
-        for r in rows
-    }
+def concentration(vals):
+    pos = sorted((x for x in vals if x > 0), reverse=True)
+    gp = sum(pos)
+    if gp <= 0:
+        return 0.0, 0.0
+    top1 = 100.0 * sum(pos[:1]) / gp
+    top10 = 100.0 * sum(pos[:10]) / gp
+    return round(top1, 2), round(top10, 2)
 
-    a = by_key.get((20, 5.0))
-    b = by_key.get((30, 10.0))
-    c = by_key.get((20, 2.0))
+
+def classify(primary, months, top1_share, top10_share):
+    positive_months = sum(1 for m in months if m["sum_net_return_pct"] > 0)
+    month_pfs = [m["profit_factor"] for m in months if m["trades"] > 0]
+    median_month_pf = statistics.median(month_pfs) if month_pfs else 0.0
+
+    # Conservative FINAL_PASS uses capped-100% returns.
+    if (
+        primary["trades"] >= 200
+        and primary["profit_factor"] >= 1.15
+        and primary["sum_net_return_pct"] > 0
+        and positive_months >= 8
+        and median_month_pf > 1.0
+        and top1_share <= 15.0
+        and top10_share <= 40.0
+    ):
+        return "FINAL_PASS"
 
     if (
-        a and b
-        and a["followable_rate_pct"] >= 50.0
-        and a["trades"] >= 200
-        and a["profit_factor"] > 1.10
-        and a["sum_net_return_pct"] > 0
-        and b["profit_factor"] >= 0.90
+        primary["trades"] >= 150
+        and primary["profit_factor"] > 1.0
+        and primary["sum_net_return_pct"] > 0
+        and positive_months >= 6
     ):
-        return "PASS"
-
-    if (
-        c
-        and c["trades"] >= 100
-        and c["profit_factor"] > 1.0
-        and c["sum_net_return_pct"] > 0
-    ):
-        return "BORDERLINE"
+        return "WATCH"
 
     return "FAIL"
 
@@ -387,7 +361,6 @@ def write_csv(path: Path, rows):
     if not rows:
         path.write_text("", encoding="utf-8")
         return
-
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
@@ -397,26 +370,24 @@ def write_csv(path: Path, rows):
 def main():
     manifest = get_json(MANIFEST_URL)
     summary = manifest.get("summary") or {}
-
     if int(summary.get("complete_wallets", 0)) != 20:
         raise RuntimeError(f"raw history incomplete: {summary}")
 
     m_wallets = manifest.get("wallets") or {}
 
     print(
-        "MEME2_STRESS_START "
-        f"wallets={len(TARGET_WALLETS)} "
-        f"delays={DELAY_SECONDS} "
-        f"base_cost_pct={BASE_COST_PCT} "
-        f"extra_costs={EXTRA_COST_PCTS} "
+        "MEME2_FINAL_START "
+        f"wallets={len(TARGET_WALLETS)} delay_sec={DELAY_SEC} "
+        f"total_cost_pct={TOTAL_COST_PCT} caps={RETURN_CAPS} "
         "historical_only=true",
         flush=True,
     )
 
-    all_summary = []
-    wallet_classifications = []
+    final_rows = []
+    cap_rows = []
+    month_rows = []
 
-    for idx, wallet in enumerate(TARGET_WALLETS, start=1):
+    for idx, wallet in enumerate(TARGET_WALLETS, 1):
         meta = m_wallets.get(wallet)
         if not meta:
             raise RuntimeError(f"wallet missing from manifest: {wallet}")
@@ -425,164 +396,152 @@ def main():
         raw_url = f"{BASE}/{raw_file.lstrip('/')}"
 
         print(
-            f"MEME2_STRESS_WALLET_START wallet={idx}/{len(TARGET_WALLETS)} "
+            f"MEME2_FINAL_WALLET_START wallet={idx}/{len(TARGET_WALLETS)} "
             f"{wallet[:8]}.. raw_rows={meta.get('rows')}",
             flush=True,
         )
 
-        pairs, counters = scan_wallet_with_retry(wallet, raw_url)
-        total_pairs = len(pairs)
-        holds = [float(x["hold_sec"]) for x in pairs]
-
-        wallet_rows = []
-
-        for delay in DELAY_SECONDS:
-            followable = [
-                x for x in pairs
-                if float(x["hold_sec"]) > float(delay)
-            ]
-
-            followable_rate = (
-                100.0 * len(followable) / total_pairs
-                if total_pairs else 0.0
-            )
-
-            for extra_cost in EXTRA_COST_PCTS:
-                total_cost = BASE_COST_PCT + extra_cost
-                vals = [
-                    float(x["raw_return_pct"]) - total_cost
-                    for x in followable
-                ]
-                m = metrics(vals)
-
-                row = {
-                    "wallet": wallet,
-                    "delay_sec": delay,
-                    "base_cost_pct": BASE_COST_PCT,
-                    "extra_cost_pct": extra_cost,
-                    "total_cost_pct": total_cost,
-                    "paired_trades_total": total_pairs,
-                    "followable_trades": len(followable),
-                    "unfollowable_trades": total_pairs - len(followable),
-                    "followable_rate_pct": round(followable_rate, 2),
-                    "median_hold_sec": round(
-                        statistics.median(holds), 2
-                    ) if holds else None,
-                    "p25_hold_sec": round(
-                        pctile(holds, 0.25), 2
-                    ) if holds else None,
-                    **m,
-                }
-
-                wallet_rows.append(row)
-                all_summary.append(row)
-
-                print(
-                    "MEME2_STRESS_RESULT "
-                    + json.dumps(
-                        {
-                            "wallet": wallet[:8],
-                            "delay_sec": delay,
-                            "extra_cost_pct": extra_cost,
-                            "followable_rate_pct": row["followable_rate_pct"],
-                            "trades": row["trades"],
-                            "pf": row["profit_factor"],
-                            "sum_net_return_pct": row["sum_net_return_pct"],
-                        },
-                        separators=(",", ":"),
-                    ),
-                    flush=True,
-                )
-
-        classification = classify_wallet(wallet_rows)
-        key20_5 = next(
-            r for r in wallet_rows
-            if r["delay_sec"] == 20 and r["extra_cost_pct"] == 5.0
+        pairs = scan_wallet_with_retry(wallet, raw_url)
+        followable = [x for x in pairs if float(x["hold_sec"]) > DELAY_SEC]
+        followable_rate = (
+            100.0 * len(followable) / len(pairs) if pairs else 0.0
         )
 
-        wallet_classifications.append({
+        cap_results = {}
+        for cap in RETURN_CAPS:
+            vals = adjusted_values(followable, cap)
+            m = metrics(vals)
+            label = "uncapped" if cap is None else f"cap_{int(cap)}"
+            cap_results[label] = m
+
+            cap_rows.append({
+                "wallet": wallet,
+                "cap": label,
+                "followable_rate_pct": round(followable_rate, 2),
+                **m,
+            })
+
+        # Primary robustness result = raw return capped at +100% per trade.
+        primary_vals = adjusted_values(followable, 100.0)
+        primary = metrics(primary_vals)
+        months = monthly_stats(followable, 100.0)
+        top1, top10 = concentration(primary_vals)
+
+        for m in months:
+            month_rows.append({
+                "wallet": wallet,
+                "cap": "cap_100",
+                **m,
+            })
+
+        positive_months = sum(
+            1 for m in months if m["sum_net_return_pct"] > 0
+        )
+        negative_months = sum(
+            1 for m in months if m["sum_net_return_pct"] < 0
+        )
+        month_pfs = [m["profit_factor"] for m in months if m["trades"] > 0]
+        median_month_pf = (
+            round(statistics.median(month_pfs), 6)
+            if month_pfs else 0.0
+        )
+        worst_month_sum = (
+            min((m["sum_net_return_pct"] for m in months), default=0.0)
+        )
+
+        classification = classify(
+            primary, months, top1, top10
+        )
+
+        row = {
             "wallet": wallet,
             "classification": classification,
-            "paired_trades_total": total_pairs,
-            "median_hold_sec": key20_5["median_hold_sec"],
-            "followable_rate_20s_pct": key20_5["followable_rate_pct"],
-            "trades_20s_extra5": key20_5["trades"],
-            "pf_20s_extra5": key20_5["profit_factor"],
-            "sum_20s_extra5": key20_5["sum_net_return_pct"],
-        })
+            "paired_trades_total": len(pairs),
+            "followable_trades_20s": len(followable),
+            "followable_rate_20s_pct": round(followable_rate, 2),
+            "median_hold_sec": round(
+                statistics.median([x["hold_sec"] for x in pairs]), 2
+            ) if pairs else None,
+            "cap100_trades": primary["trades"],
+            "cap100_pf": primary["profit_factor"],
+            "cap100_sum_net_return_pct": primary["sum_net_return_pct"],
+            "positive_months": positive_months,
+            "negative_months": negative_months,
+            "median_month_pf": median_month_pf,
+            "worst_month_sum_pct": round(worst_month_sum, 6),
+            "top1_share_gross_profit_pct": top1,
+            "top10_share_gross_profit_pct": top10,
+            "uncapped_pf": cap_results["uncapped"]["profit_factor"],
+            "cap200_pf": cap_results["cap_200"]["profit_factor"],
+            "cap500_pf": cap_results["cap_500"]["profit_factor"],
+        }
+        final_rows.append(row)
 
         print(
-            "MEME2_STRESS_WALLET_DONE "
-            + json.dumps(
-                {
-                    "wallet": wallet[:8],
-                    "classification": classification,
-                    "paired_trades": total_pairs,
-                    "median_hold_sec": key20_5["median_hold_sec"],
-                    "followable_rate_20s_pct": key20_5[
-                        "followable_rate_pct"
-                    ],
-                    "pf_20s_extra5": key20_5["profit_factor"],
-                    "sum_20s_extra5": key20_5["sum_net_return_pct"],
-                },
-                separators=(",", ":"),
-            ),
+            "MEME2_FINAL_WALLET_DONE "
+            + json.dumps({
+                "wallet": wallet[:8],
+                "classification": classification,
+                "followable_rate_20s_pct": row["followable_rate_20s_pct"],
+                "cap100_trades": row["cap100_trades"],
+                "cap100_pf": row["cap100_pf"],
+                "positive_months": row["positive_months"],
+                "median_month_pf": row["median_month_pf"],
+                "top1_share_pct": row["top1_share_gross_profit_pct"],
+                "top10_share_pct": row["top10_share_gross_profit_pct"],
+            }, separators=(",", ":")),
             flush=True,
         )
 
-    # Sort PASS -> BORDERLINE -> FAIL, then stronger 20s/+5% PF.
-    order = {"PASS": 0, "BORDERLINE": 1, "FAIL": 2}
-    wallet_classifications.sort(
+    order = {"FINAL_PASS": 0, "WATCH": 1, "FAIL": 2}
+    final_rows.sort(
         key=lambda r: (
             order.get(r["classification"], 9),
-            -float(r["pf_20s_extra5"]),
-            -int(r["trades_20s_extra5"]),
+            -float(r["cap100_pf"]),
+            -int(r["cap100_trades"]),
         )
     )
 
-    write_csv(
-        OUT / "meme2_delay_stress_summary.csv",
-        all_summary,
-    )
-    write_csv(
-        OUT / "meme2_delay_stress_wallet_classification.csv",
-        wallet_classifications,
-    )
+    write_csv(OUT / "meme2_final_wallets.csv", final_rows)
+    write_csv(OUT / "meme2_final_caps.csv", cap_rows)
+    write_csv(OUT / "meme2_final_monthly.csv", month_rows)
 
     report = {
-        "purpose": "Meme2 delay/cost robustness screening",
-        "limitations": [
-            "No exact delayed historical DEX price snapshots are available.",
-            "Delay is modeled first as followability: hold_sec must exceed delay.",
-            "Additional adverse cost is stressed independently from delay.",
-            "Results are screening only, not final live-equivalent PF.",
-        ],
-        "delays_sec": DELAY_SECONDS,
+        "delay_sec": DELAY_SEC,
         "base_cost_pct": BASE_COST_PCT,
-        "extra_cost_pct": EXTRA_COST_PCTS,
-        "wallets": wallet_classifications,
+        "extra_cost_pct": EXTRA_COST_PCT,
+        "total_cost_pct": TOTAL_COST_PCT,
+        "primary_return_cap_pct": 100.0,
+        "limitations": [
+            "Exact delayed DEX prices/liquidity are not available in the archive.",
+            "20-second delay is modeled as a followability gate.",
+            "Primary PF caps each raw trade return at +100% to reduce outlier dependence.",
+            "This is robustness screening, not live-equivalent proof.",
+        ],
+        "wallets": final_rows,
     }
-
-    (OUT / "meme2_delay_stress_report.json").write_text(
+    (OUT / "meme2_final_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    for row in wallet_classifications:
+    for row in final_rows:
         print(
-            "MEME2_STRESS_CLASSIFICATION "
+            "MEME2_FINAL_CLASSIFICATION "
             + json.dumps(row, separators=(",", ":")),
             flush=True,
         )
 
     print(
-        "MEME2_STRESS_DONE "
-        "summary=data/bf1_v3/meme2_delay_stress_summary.csv "
-        "classification=data/bf1_v3/"
-        "meme2_delay_stress_wallet_classification.csv "
-        "report=data/bf1_v3/meme2_delay_stress_report.json",
+        "MEME2_FINAL_DONE "
+        "wallets=data/bf1_v3/meme2_final_wallets.csv "
+        "caps=data/bf1_v3/meme2_final_caps.csv "
+        "monthly=data/bf1_v3/meme2_final_monthly.csv "
+        "report=data/bf1_v3/meme2_final_report.json",
         flush=True,
     )
+
+    hold_forever()
 
 
 if __name__ == "__main__":
