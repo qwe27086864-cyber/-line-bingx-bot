@@ -64,6 +64,35 @@ def row_ts(row) -> int:
     raise TypeError(f"unsupported kline row type: {type(row).__name__}")
 
 
+def normalize_quote_volume(raw_quote, volume, close) -> float:
+    """Return quote turnover with a safe fallback.
+
+    BingX historical rows can omit quote-volume on some response shapes.
+    R3 uses rolling 24h quote turnover as a liquidity gate, so treating a
+    missing value as zero incorrectly removes every candidate.
+
+    If a positive quote-volume is supplied, preserve it. Otherwise estimate
+    quote turnover as base volume * close price.
+    """
+    try:
+        q = float(raw_quote)
+    except (TypeError, ValueError):
+        q = 0.0
+
+    if q > 0:
+        return q
+
+    try:
+        v = float(volume)
+        px = float(close)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if v > 0 and px > 0:
+        return v * px
+    return 0.0
+
+
 def fetch_page(
     symbol: str,
     interval: str,
@@ -135,7 +164,11 @@ def normalize_row(symbol: str, interval: str, row) -> dict:
             "low": float(row[3]),
             "close": float(row[4]),
             "volume": float(row[5]),
-            "quote_volume": float(row[7]) if len(row) > 7 and row[7] not in (None, "") else 0.0,
+            "quote_volume": normalize_quote_volume(
+                row[7] if len(row) > 7 else None,
+                row[5],
+                row[4],
+            ),
             "trades": int(float(row[8])) if len(row) > 8 and row[8] not in (None, "") else 0,
             "taker_buy_base": float(row[9]) if len(row) > 9 and row[9] not in (None, "") else 0.0,
             "taker_buy_quote": float(row[10]) if len(row) > 10 and row[10] not in (None, "") else 0.0,
@@ -158,7 +191,11 @@ def normalize_row(symbol: str, interval: str, row) -> dict:
             "low": float(first("low")),
             "close": float(first("close")),
             "volume": float(first("volume")),
-            "quote_volume": float(first("quoteVolume", "quote_volume", "quoteAssetVolume")),
+            "quote_volume": normalize_quote_volume(
+                first("quoteVolume", "quote_volume", "quoteAssetVolume", default=None),
+                first("volume"),
+                first("close"),
+            ),
             "trades": int(float(first("trades", "tradeCount", "count"))),
             "taker_buy_base": float(first("takerBuyBaseVolume", "taker_buy_base", "takerBuyBaseAssetVolume")),
             "taker_buy_quote": float(first("takerBuyQuoteVolume", "taker_buy_quote", "takerBuyQuoteAssetVolume")),
