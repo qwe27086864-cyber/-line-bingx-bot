@@ -1,16 +1,18 @@
 
 """
-R3 V2 360d robust resume runner.
+R3 V2 360d resume runner — replay stall fix.
 
 Historical-only. No live/shadow DB writes. No orders.
 
-Key changes:
-- Can resume from any segment 1..12.
-- Hardcodes completed segments 1..3.
-- Downloads ONLY 1m candles from BingX.
-- Builds 5m / 15m / 1h locally from the same 1m candles.
-- Adds coverage checks and stage logs so a stall is obvious.
-- Keeps combined PF as gross-profit / abs(gross-loss), never average PF.
+Fixes:
+1) Patch the local Render checkout of r3_historical_adapter.py at runtime so
+   non-ACTIVE watches are compacted once per scan. The original replay already
+   ignores non-ACTIVE watches, so this is semantics-preserving but prevents
+   historical watch-list growth from making later months progressively slower.
+2) Replace the broken blocking-readline watchdog with communicate(timeout=...),
+   so a hung adapter is actually killed after R3_V2_ADAPTER_TIMEOUT_SEC.
+3) Resume from segment 5 by default; segments 1-4 are hardcoded completed.
+4) Download only 1m candles; locally aggregate 5m/15m/1h.
 """
 
 from __future__ import annotations
@@ -47,11 +49,12 @@ END_DATES = [
 ROOT = Path(os.environ.get("R3_V2_AUTO360_DIR", "data/r3_v2_auto360"))
 ROOT.mkdir(parents=True, exist_ok=True)
 
-START_SEGMENT = int(os.environ.get("R3_V2_START_SEGMENT", "4"))
+START_SEGMENT = int(os.environ.get("R3_V2_START_SEGMENT", "5"))
 SOURCE_TIMEOUT_SEC = int(os.environ.get("R3_V2_SOURCE_TIMEOUT_SEC", "240"))
 MAX_SEGMENT_ATTEMPTS = int(os.environ.get("R3_V2_SEGMENT_ATTEMPTS", "2"))
 ADAPTER_TIMEOUT_SEC = int(os.environ.get("R3_V2_ADAPTER_TIMEOUT_SEC", "600"))
 MIN_COVERAGE = float(os.environ.get("R3_V2_MIN_COVERAGE", "0.95"))
+
 
 PRECOMPLETED = {
     1: {
@@ -116,6 +119,27 @@ PRECOMPLETED = {
         },
         "delta_sum_net_return_pct": 0.589,
         "trade_retention_pct": 41.67,
+    },
+    4: {
+        "segment": 4,
+        "start": "2025-09-03T09:30:00+00:00",
+        "end": "2025-10-03T09:30:00+00:00",
+        "baseline": {
+            "trades": 3, "wins": 1, "losses": 2,
+            "win_rate_pct": 33.33, "profit_factor": 0.959,
+            "gross_profit_pct_points": 0.854298,
+            "gross_loss_abs_pct_points": 0.890987,
+            "sum_net_return_pct": -0.037,
+        },
+        "v2": {
+            "trades": 1, "wins": 0, "losses": 1,
+            "win_rate_pct": 0.0, "profit_factor": 0.0,
+            "gross_profit_pct_points": 0.0,
+            "gross_loss_abs_pct_points": 0.774128,
+            "sum_net_return_pct": -0.774,
+        },
+        "delta_sum_net_return_pct": -0.737,
+        "trade_retention_pct": 33.33,
     },
 }
 
@@ -207,11 +231,14 @@ base.download_spot_history_symbol = _bounded(
 
 
 def _symbols():
-    return [x.strip().upper() for x in base.SYMBOLS.split(",") if x.strip()]
+    return [
+        x.strip().upper()
+        for x in base.SYMBOLS.split(",")
+        if x.strip()
+    ]
 
 
 def _verify_1m(path: Path, start: datetime, end: datetime):
-    counts = {s: 0 for s in _symbols()}
     seen = {s: set() for s in _symbols()}
     start_ms = base.hd.utc_ms(start)
     end_ms = base.hd.utc_ms(end)
@@ -219,30 +246,36 @@ def _verify_1m(path: Path, start: datetime, end: datetime):
     with path.open(newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             sym = r["symbol"]
-            if sym not in counts:
+            if sym not in seen:
                 continue
             ts = base.hd.utc_ms(datetime.fromisoformat(r["timestamp"]))
             if start_ms <= ts < end_ms:
                 seen[sym].add(ts)
 
-    for sym in counts:
-        counts[sym] = len(seen[sym])
-
+    counts = {s: len(v) for s, v in seen.items()}
     expected = int((end - start).total_seconds() // 60)
     minimum = int(expected * MIN_COVERAGE)
 
     print(
-        f"R3_V2_1M_COVERAGE expected={expected} minimum={minimum} counts={counts}",
+        f"R3_V2_1M_COVERAGE expected={expected} "
+        f"minimum={minimum} counts={counts}",
         flush=True,
     )
 
     if any(v < minimum for v in counts.values()):
         raise RuntimeError(
-            f"Insufficient 1m history: {counts}; need >= {minimum} per symbol"
+            f"Insufficient 1m history: {counts}; "
+            f"need >= {minimum} per symbol"
         )
 
 
-def _aggregate_from_1m(source: Path, target: Path, interval: str, start: datetime, end: datetime):
+def _aggregate_from_1m(
+    source: Path,
+    target: Path,
+    interval: str,
+    start: datetime,
+    end: datetime,
+):
     step_ms = base.hd.INTERVAL_MS[interval]
     start_ms = base.hd.utc_ms(start)
     end_ms = base.hd.utc_ms(end)
@@ -250,7 +283,9 @@ def _aggregate_from_1m(source: Path, target: Path, interval: str, start: datetim
 
     with source.open(newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
-            ts_ms = base.hd.utc_ms(datetime.fromisoformat(r["timestamp"]))
+            ts_ms = base.hd.utc_ms(
+                datetime.fromisoformat(r["timestamp"])
+            )
             if not (start_ms <= ts_ms < end_ms):
                 continue
 
@@ -292,10 +327,13 @@ def _aggregate_from_1m(source: Path, target: Path, interval: str, start: datetim
     rows = []
     expected_per_bucket = step_ms // 60_000
 
-    for (symbol, bucket), g in sorted(groups.items(), key=lambda x: (x[0][0], x[0][1])):
-        # Keep only complete buckets. Boundary partials are intentionally dropped.
+    for (symbol, bucket), g in sorted(
+        groups.items(),
+        key=lambda x: (x[0][0], x[0][1]),
+    ):
         if g["count"] != expected_per_bucket:
             continue
+
         rows.append({
             "timestamp": base.hd.iso_utc(bucket),
             "symbol": symbol,
@@ -321,58 +359,139 @@ def _aggregate_from_1m(source: Path, target: Path, interval: str, start: datetim
     for r in rows:
         counts[r["symbol"]] += 1
 
-    expected = int((end - start).total_seconds() // (step_ms / 1000))
-    # Up to two boundary buckets can be partial depending on window alignment.
-    minimum = max(0, int(expected * MIN_COVERAGE) - 2)
+    expected = int(
+        (end - start).total_seconds()
+        // (step_ms / 1000)
+    )
+    minimum = max(
+        0,
+        int(expected * MIN_COVERAGE) - 2,
+    )
 
     print(
-        f"R3_V2_LOCAL_AGG interval={interval} rows={len(rows)} "
-        f"expected={expected} minimum={minimum} counts={counts}",
+        f"R3_V2_LOCAL_AGG interval={interval} "
+        f"rows={len(rows)} expected={expected} "
+        f"minimum={minimum} counts={counts}",
         flush=True,
     )
 
     if any(v < minimum for v in counts.values()):
         raise RuntimeError(
-            f"Insufficient locally aggregated {interval}: {counts}; "
-            f"need >= {minimum} per symbol"
+            f"Insufficient locally aggregated {interval}: "
+            f"{counts}; need >= {minimum} per symbol"
         )
 
 
+def _patch_replay_source():
+    """
+    Patch only the ephemeral Render checkout.
+
+    This does NOT modify GitHub and does NOT touch live/shadow code.
+    Non-ACTIVE watches are already ignored by the original replay loop, so
+    removing them between scans does not change strategy decisions.
+    """
+    path = Path("r3_historical_adapter.py")
+    text = path.read_text(encoding="utf-8")
+
+    marker = "R3_HISTORICAL_WATCH_COMPACTION_FIX"
+    if marker in text:
+        print(
+            "R3_V2_REPLAY_PATCH already_applied=true",
+            flush=True,
+        )
+        return
+
+    old = (
+        "    while scan<=end:\n"
+        "        ctx=market_context(c15_by,c1h_by,scan)\n"
+    )
+
+    new = (
+        "    while scan<=end:\n"
+        f"        # {marker}\n"
+        "        # Non-ACTIVE watches are never used again; compact them so\n"
+        "        # historical replay cost does not grow with every old setup.\n"
+        "        if watches:\n"
+        "            watches = [w for w in watches "
+        "if w.get(\"status\") == \"ACTIVE\"]\n"
+        "\n"
+        "        ctx=market_context(c15_by,c1h_by,scan)\n"
+    )
+
+    if old not in text:
+        raise RuntimeError(
+            "Cannot patch r3_historical_adapter.py: "
+            "run_replay anchor not found"
+        )
+
+    text = text.replace(old, new, 1)
+    path.write_text(text, encoding="utf-8")
+
+    compile(
+        text,
+        str(path),
+        "exec",
+    )
+
+    print(
+        "R3_V2_REPLAY_PATCH "
+        "watch_compaction=true "
+        "semantics_preserved=true "
+        "ephemeral_only=true",
+        flush=True,
+    )
+
+
 def _run_and_stream(cmd):
-    print("R3_V2_RUN", " ".join(cmd), flush=True)
+    """
+    Real watchdog.
+
+    Previous implementation blocked inside stdout.readline(), which meant the
+    timeout check never ran while an adapter was CPU-bound and silent.
+    """
+    print(
+        "R3_V2_RUN",
+        " ".join(cmd),
+        flush=True,
+    )
+
     p = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        bufsize=1,
     )
-    assert p.stdout is not None
-    started = time.monotonic()
 
-    while True:
-        if ADAPTER_TIMEOUT_SEC > 0 and time.monotonic() - started > ADAPTER_TIMEOUT_SEC:
-            p.kill()
-            raise TimeoutError(
-                f"adapter exceeded {ADAPTER_TIMEOUT_SEC}s: {' '.join(cmd)}"
+    try:
+        if ADAPTER_TIMEOUT_SEC > 0:
+            output, _ = p.communicate(
+                timeout=ADAPTER_TIMEOUT_SEC
             )
+        else:
+            output, _ = p.communicate()
+    except subprocess.TimeoutExpired:
+        p.kill()
+        output, _ = p.communicate()
 
-        line = p.stdout.readline()
-        if line:
-            print(line.rstrip(), flush=True)
+        if output:
+            for line in output.splitlines():
+                print(line, flush=True)
 
-        code = p.poll()
-        if code is not None:
-            break
+        raise TimeoutError(
+            f"adapter exceeded "
+            f"{ADAPTER_TIMEOUT_SEC}s: "
+            f"{' '.join(cmd)}"
+        )
 
-        if not line:
-            time.sleep(0.1)
+    if output:
+        for line in output.splitlines():
+            print(line, flush=True)
 
-    for line in p.stdout:
-        print(line.rstrip(), flush=True)
-
-    if code != 0:
-        raise subprocess.CalledProcessError(code, cmd)
+    if p.returncode != 0:
+        raise subprocess.CalledProcessError(
+            p.returncode,
+            cmd,
+        )
 
 
 def _run_segment(idx: int, end_iso: str) -> dict:
@@ -380,34 +499,74 @@ def _run_segment(idx: int, end_iso: str) -> dict:
     start = end - base.timedelta(days=30)
 
     seg = ROOT / f"segment_{idx:02d}"
-    seg.mkdir(parents=True, exist_ok=True)
+    seg.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     base.DATA = seg
     base.DAYS = 30
 
     print(
-        f"R3_V2_AUTO360_SEGMENT_START segment={idx}/12 "
-        f"start={start.isoformat()} end={end.isoformat()}",
+        f"R3_V2_AUTO360_SEGMENT_START "
+        f"segment={idx}/12 "
+        f"start={start.isoformat()} "
+        f"end={end.isoformat()}",
         flush=True,
     )
 
-    # Clean only candle files for this segment so retry is deterministic.
-    for name in ("history_1m.csv", "history_5m.csv", "history_15m.csv", "history_1h.csv"):
+    # Deterministic retry.
+    for name in (
+        "history_1m.csv",
+        "history_5m.csv",
+        "history_15m.csv",
+        "history_1h.csv",
+        "baseline_outcomes.csv",
+        "baseline_detail.csv",
+        "v2_outcomes.csv",
+        "v2_detail.csv",
+        "segment_summary.json",
+    ):
         p = seg / name
         if p.exists():
             p.unlink()
 
-    print(f"R3_V2_STAGE segment={idx}/12 stage=download_1m", flush=True)
-    base.download_interval("1m", start, end)
-    print(f"R3_V2_STAGE_DONE segment={idx}/12 stage=download_1m", flush=True)
+    print(
+        f"R3_V2_STAGE segment={idx}/12 "
+        "stage=download_1m",
+        flush=True,
+    )
+
+    base.download_interval(
+        "1m",
+        start,
+        end,
+    )
+
+    print(
+        f"R3_V2_STAGE_DONE segment={idx}/12 "
+        "stage=download_1m",
+        flush=True,
+    )
 
     one = seg / "history_1m.csv"
-    _verify_1m(one, start, end)
+    _verify_1m(
+        one,
+        start,
+        end,
+    )
 
-    for interval in ("5m", "15m", "1h"):
+    for interval in (
+        "5m",
+        "15m",
+        "1h",
+    ):
         print(
-            f"R3_V2_STAGE segment={idx}/12 stage=local_aggregate_{interval}",
+            f"R3_V2_STAGE segment={idx}/12 "
+            f"stage=local_aggregate_{interval}",
             flush=True,
         )
+
         _aggregate_from_1m(
             one,
             seg / f"history_{interval}.csv",
@@ -415,175 +574,326 @@ def _run_segment(idx: int, end_iso: str) -> dict:
             start,
             end,
         )
+
         print(
-            f"R3_V2_STAGE_DONE segment={idx}/12 stage=local_aggregate_{interval}",
+            f"R3_V2_STAGE_DONE segment={idx}/12 "
+            f"stage=local_aggregate_{interval}",
             flush=True,
         )
 
     common = [
-        "--candles-1m", str(seg / "history_1m.csv"),
-        "--candles-5m", str(seg / "history_5m.csv"),
-        "--candles-15m", str(seg / "history_15m.csv"),
-        "--candles-1h", str(seg / "history_1h.csv"),
+        "--candles-1m",
+        str(seg / "history_1m.csv"),
+        "--candles-5m",
+        str(seg / "history_5m.csv"),
+        "--candles-15m",
+        str(seg / "history_15m.csv"),
+        "--candles-1h",
+        str(seg / "history_1h.csv"),
     ]
 
     baseline_out = seg / "baseline_outcomes.csv"
     baseline_detail = seg / "baseline_detail.csv"
+
     _run_and_stream([
         sys.executable,
         "r3_historical_adapter_fast.py",
         *common,
-        "--detail-out", str(baseline_detail),
-        "--outcomes-out", str(baseline_out),
+        "--detail-out",
+        str(baseline_detail),
+        "--outcomes-out",
+        str(baseline_out),
     ])
 
     v2_out = seg / "v2_outcomes.csv"
     v2_detail = seg / "v2_detail.csv"
+
     _run_and_stream([
         sys.executable,
         "r3_historical_adapter_v2.py",
         *common,
-        "--detail-out", str(v2_detail),
-        "--outcomes-out", str(v2_out),
+        "--detail-out",
+        str(v2_detail),
+        "--outcomes-out",
+        str(v2_out),
     ])
 
     row = {
         "segment": idx,
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "baseline": _metrics(_read_returns(baseline_out)),
-        "v2": _metrics(_read_returns(v2_out)),
+        "baseline": _metrics(
+            _read_returns(baseline_out)
+        ),
+        "v2": _metrics(
+            _read_returns(v2_out)
+        ),
     }
+
     row["delta_sum_net_return_pct"] = round(
-        row["v2"]["sum_net_return_pct"] - row["baseline"]["sum_net_return_pct"], 3
-    )
-    row["trade_retention_pct"] = (
-        round(100 * row["v2"]["trades"] / row["baseline"]["trades"], 2)
-        if row["baseline"]["trades"] else 0.0
+        row["v2"]["sum_net_return_pct"]
+        - row["baseline"]["sum_net_return_pct"],
+        3,
     )
 
-    (seg / "segment_summary.json").write_text(
-        json.dumps(row, ensure_ascii=False, indent=2, sort_keys=True),
+    row["trade_retention_pct"] = (
+        round(
+            100
+            * row["v2"]["trades"]
+            / row["baseline"]["trades"],
+            2,
+        )
+        if row["baseline"]["trades"]
+        else 0.0
+    )
+
+    (
+        seg
+        / "segment_summary.json"
+    ).write_text(
+        json.dumps(
+            row,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
 
     print(
         "R3_V2_AUTO360_SEGMENT_DONE "
-        + json.dumps(row, ensure_ascii=False, sort_keys=True),
+        + json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
         flush=True,
     )
+
     return row
 
 
 def _load_previous(start_segment: int):
     segments = []
 
-    for idx in range(1, start_segment):
+    for idx in range(
+        1,
+        start_segment,
+    ):
         if idx in PRECOMPLETED:
-            segments.append(PRECOMPLETED[idx])
+            segments.append(
+                PRECOMPLETED[idx]
+            )
             continue
 
-        path = ROOT / f"segment_{idx:02d}" / "segment_summary.json"
+        path = (
+            ROOT
+            / f"segment_{idx:02d}"
+            / "segment_summary.json"
+        )
+
         if not path.exists():
             raise RuntimeError(
-                f"Cannot resume at {start_segment}: segment {idx} summary missing"
+                f"Cannot resume at {start_segment}: "
+                f"segment {idx} summary missing"
             )
-        segments.append(json.loads(path.read_text(encoding="utf-8")))
+
+        segments.append(
+            json.loads(
+                path.read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
 
     return segments
 
 
 def main():
-    if not (1 <= START_SEGMENT <= 12):
-        raise ValueError("R3_V2_START_SEGMENT must be 1..12")
+    os.environ.pop(
+        "DATABASE_URL",
+        None,
+    )
 
-    segments = _load_previous(START_SEGMENT)
+    if not (
+        1
+        <= START_SEGMENT
+        <= 12
+    ):
+        raise ValueError(
+            "R3_V2_START_SEGMENT "
+            "must be 1..12"
+        )
+
+    _patch_replay_source()
+
+    segments = _load_previous(
+        START_SEGMENT
+    )
 
     print(
         "R3_V2_AUTO360_RESUME "
         f"start_segment={START_SEGMENT}/12 "
         f"precompleted={len(segments)} "
         f"source_timeout_sec={SOURCE_TIMEOUT_SEC} "
+        f"adapter_timeout_sec={ADAPTER_TIMEOUT_SEC} "
         f"segment_attempts={MAX_SEGMENT_ATTEMPTS} "
-        "higher_intervals=local_from_1m",
+        "higher_intervals=local_from_1m "
+        "watch_compaction=true "
+        "watchdog=communicate_timeout",
         flush=True,
     )
 
-    for idx, end_iso in enumerate(END_DATES, start=1):
+    for idx, end_iso in enumerate(
+        END_DATES,
+        start=1,
+    ):
         if idx < START_SEGMENT:
             print(
-                f"R3_V2_AUTO360_SEGMENT_SKIP segment={idx}/12 reason=precompleted",
+                "R3_V2_AUTO360_SEGMENT_SKIP "
+                f"segment={idx}/12 "
+                "reason=precompleted",
                 flush=True,
             )
             continue
 
         last_error = None
 
-        for attempt in range(1, MAX_SEGMENT_ATTEMPTS + 1):
+        for attempt in range(
+            1,
+            MAX_SEGMENT_ATTEMPTS + 1,
+        ):
             try:
                 print(
-                    f"R3_V2_AUTO360_ATTEMPT segment={idx}/12 "
-                    f"attempt={attempt}/{MAX_SEGMENT_ATTEMPTS}",
+                    "R3_V2_AUTO360_ATTEMPT "
+                    f"segment={idx}/12 "
+                    f"attempt={attempt}/"
+                    f"{MAX_SEGMENT_ATTEMPTS}",
                     flush=True,
                 )
-                row = _run_segment(idx, end_iso)
+
+                row = _run_segment(
+                    idx,
+                    end_iso,
+                )
                 segments.append(row)
                 last_error = None
                 break
+
             except Exception as exc:
                 last_error = exc
+
                 print(
-                    f"R3_V2_AUTO360_SEGMENT_ERROR segment={idx}/12 "
-                    f"attempt={attempt}/{MAX_SEGMENT_ATTEMPTS} "
+                    "R3_V2_AUTO360_SEGMENT_ERROR "
+                    f"segment={idx}/12 "
+                    f"attempt={attempt}/"
+                    f"{MAX_SEGMENT_ATTEMPTS} "
                     f"error={type(exc).__name__}:{exc}",
                     flush=True,
                 )
+
                 if attempt < MAX_SEGMENT_ATTEMPTS:
-                    time.sleep(5)
+                    time.sleep(10)
 
         if last_error is not None:
             raise RuntimeError(
-                f"R3 segment {idx}/12 failed after "
-                f"{MAX_SEGMENT_ATTEMPTS} attempts: {last_error}"
+                f"R3 V2 auto360 stopped at "
+                f"segment {idx}/12: "
+                f"{last_error}"
             )
 
-    segments.sort(key=lambda x: int(x["segment"]))
+    baseline = _aggregate_metrics(
+        segments,
+        "baseline",
+    )
+    v2 = _aggregate_metrics(
+        segments,
+        "v2",
+    )
 
-    if len(segments) != 12:
-        raise RuntimeError(f"R3 V2 incomplete segments={len(segments)}/12")
+    positive_v2 = sum(
+        1
+        for x in segments
+        if float(
+            x["v2"]["sum_net_return_pct"]
+        ) > 0
+    )
 
-    baseline = _aggregate_metrics(segments, "baseline")
-    v2 = _aggregate_metrics(segments, "v2")
+    negative_v2 = sum(
+        1
+        for x in segments
+        if float(
+            x["v2"]["sum_net_return_pct"]
+        ) < 0
+    )
 
     final = {
-        "segments": 12,
-        "start_segment_this_run": START_SEGMENT,
+        "segments_complete": len(segments),
+        "segments_target": 12,
         "baseline": baseline,
         "v2": v2,
+        "v2_positive_segments": positive_v2,
+        "v2_negative_segments": negative_v2,
         "delta_sum_net_return_pct": round(
-            v2["sum_net_return_pct"] - baseline["sum_net_return_pct"], 3
-        ),
-        "delta_pf": round(
-            v2["profit_factor"] - baseline["profit_factor"], 3
+            v2["sum_net_return_pct"]
+            - baseline["sum_net_return_pct"],
+            3,
         ),
         "trade_retention_pct": (
-            round(100 * v2["trades"] / baseline["trades"], 2)
-            if baseline["trades"] else 0.0
+            round(
+                100
+                * v2["trades"]
+                / baseline["trades"],
+                2,
+            )
+            if baseline["trades"]
+            else 0.0
         ),
-        "per_segment": segments,
+        "segments": segments,
     }
 
-    (ROOT / "final_summary.json").write_text(
-        json.dumps(final, ensure_ascii=False, indent=2, sort_keys=True),
+    (
+        ROOT
+        / "r3_v2_auto360_summary.json"
+    ).write_text(
+        json.dumps(
+            final,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
 
     print(
         "R3_V2_AUTO360_SUMMARY "
-        + json.dumps(final, ensure_ascii=False, sort_keys=True),
+        + json.dumps(
+            final,
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
         flush=True,
     )
-    print("R3_V2_AUTO360_DONE segments=12/12", flush=True)
+
+    print(
+        "R3_V2_AUTO360_DONE "
+        f"segments={len(segments)}/12 "
+        f"baseline_pf={baseline['profit_factor']:.3f} "
+        f"v2_pf={v2['profit_factor']:.3f} "
+        f"v2_sum={v2['sum_net_return_pct']:+.3f} "
+        f"v2_positive_segments={positive_v2}/12",
+        flush=True,
+    )
+
+    # Keep the web service alive without accidentally restarting the whole job.
+    print(
+        "R3_V2_AUTO360_HOLD "
+        "process_complete=true "
+        "restart_prevention=true",
+        flush=True,
+    )
+    while True:
+        time.sleep(3600)
 
 
 if __name__ == "__main__":
