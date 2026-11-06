@@ -1,515 +1,370 @@
 from __future__ import annotations
 
 import csv
-import hashlib
+import importlib
 import json
 import os
-import shutil
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
-import historical_data as hd
+DATA_ROOT = Path(os.environ.get("F1_DATA_ROOT", "data/backtest_3y"))
+OUT_ROOT = Path(os.environ.get("F1_OUT_ROOT", "data/f1_r0"))
+OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-NAME = "BACKTEST-3Y"
-ROOT = Path(os.environ.get("BACKTEST3_DATA_DIR", "data/backtest_3y"))
-ROOT.mkdir(parents=True, exist_ok=True)
+SPREAD = float(os.environ.get("F1_SPREAD_PCT", "0.12"))
+SEGMENTS = int(os.environ.get("F1_SEGMENTS", "37"))
 
-SYMBOLS = [
-    s.strip().upper()
-    for s in os.environ.get(
-        "BACKTEST3_SYMBOLS",
-        "BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,LTC-USDT,TRX-USDT,BCH-USDT,DOT-USDT,UNI-USDT",
-    ).split(",")
-    if s.strip()
+# Safety: refuse to run if the fixed 3Y dataset is not complete.
+manifest_path = DATA_ROOT / "manifest.json"
+if not manifest_path.exists():
+    raise RuntimeError(f"Missing fixed-data manifest: {manifest_path}")
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if not manifest.get("complete"):
+    raise RuntimeError("BACKTEST-3Y dataset is not marked complete")
+
+# Patch only the ephemeral checkout so inactive watches do not accumulate.
+adapter = Path("r3_historical_adapter.py")
+text = adapter.read_text(encoding="utf-8")
+old = "    while scan<=end:\n        ctx=market_context(c15_by,c1h_by,scan)\n"
+new = (
+    "    while scan<=end:\n"
+    "        if watches:\n"
+    "            watches=[w for w in watches if w.get('status')=='ACTIVE']\n"
+    "        ctx=market_context(c15_by,c1h_by,scan)\n"
+)
+if old in text:
+    adapter.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+import r3_historical_adapter as r3
+r3 = importlib.reload(r3)
+r3.CORE = "R3_BASELINE_FOR_F1"
+
+CANDIDATE_FIELDS = [
+    "timestamp", "symbol", "original_side", "side", "trigger",
+    "entry_price", "exit_time", "exit_price", "exit_reason",
+    "gross_return_pct", "net_return_pct",
+]
+BASE_FIELDS = [
+    "timestamp", "symbol", "side", "exit_time", "exit_reason",
+    "net_return_pct",
 ]
 
-DAYS = int(os.environ.get("BACKTEST3_DAYS", "1096"))
-SEGMENT_DAYS = int(os.environ.get("BACKTEST3_SEGMENT_DAYS", "30"))
-MIN_COVERAGE = float(os.environ.get("BACKTEST3_MIN_COVERAGE", "0.95"))
-REQUEST_PAUSE = float(os.environ.get("BACKTEST3_REQUEST_PAUSE_SEC", "0.15"))
-END_ISO = os.environ.get(
-    "BACKTEST3_END_ISO",
-    "2026-11-02T11:00:00+00:00",
-).strip()
 
-BYBIT_API = "https://api.bybit.com/v5/market/kline"
+def parse_dt(value: str) -> datetime:
+    x = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if x.tzinfo is None:
+        x = x.replace(tzinfo=timezone.utc)
+    return x.astimezone(timezone.utc)
 
 
-def dt(value: str) -> datetime:
-    s = value.replace("Z", "+00:00")
-    out = datetime.fromisoformat(s)
-    if out.tzinfo is None:
-        out = out.replace(tzinfo=timezone.utc)
-    return out.astimezone(timezone.utc)
-
-
-END = dt(END_ISO)
-START = END - timedelta(days=DAYS)
-
-
-def ms(value: datetime) -> int:
-    return int(value.timestamp() * 1000)
-
-
-def iso(ms_value: int) -> str:
-    return datetime.fromtimestamp(ms_value / 1000, tz=timezone.utc).isoformat()
-
-
-def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for block in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
-def rowcount(path: Path) -> int:
-    with path.open(newline="", encoding="utf-8-sig") as f:
-        return max(sum(1 for _ in f) - 1, 0)
-
-
-def ranges():
-    out = []
-    a = START
-    while a < END:
-        b = min(a + timedelta(days=SEGMENT_DAYS), END)
-        out.append((a, b))
-        a = b
+def merge_maps(paths: list[Path], minutes: int):
+    out = defaultdict(list)
+    for path in paths:
+        part = r3.read_candles(path, minutes)
+        for symbol, rows in part.items():
+            out[symbol].extend(rows)
+    for symbol in out:
+        by_t = {x["t"]: x for x in out[symbol]}
+        out[symbol] = sorted(by_t.values(), key=lambda x: x["t"])
     return out
 
 
-def bybit_page(symbol: str, start_ms: int, end_ms: int) -> list:
-    params = {
-        "category": "linear",
-        "symbol": symbol.replace("-", ""),
-        "interval": "1",
-        "start": int(start_ms),
-        "end": int(end_ms),
-        "limit": 1000,
+def metrics(values):
+    vals = [float(x) for x in values]
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    pf = gp / gl if gl else (999.0 if gp else 0.0)
+
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for x in vals:
+        equity += x
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+
+    return {
+        "trades": len(vals),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": round(100 * len(wins) / len(vals), 2) if vals else 0.0,
+        "profit_factor": round(pf, 4),
+        "sum_net_return_pct": round(sum(vals), 4),
+        "avg_net_return_pct": round(sum(vals) / len(vals), 4) if vals else 0.0,
+        "max_drawdown_pct_points": round(max_dd, 4),
     }
-    req = Request(
-        BYBIT_API + "?" + urlencode(params),
-        headers={"User-Agent": "backtest-3y-data/2.0"},
-    )
-
-    last = None
-    for attempt in range(7):
-        try:
-            with urlopen(req, timeout=30) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-
-            if int(payload.get("retCode", 0)) != 0:
-                raise RuntimeError(f"Bybit error: {payload}")
-
-            return ((payload.get("result") or {}).get("list") or [])
-
-        except Exception as exc:
-            last = exc
-            if attempt >= 6:
-                break
-
-            delay = min(1.5 * (2 ** attempt), 30.0)
-            print(
-                f"BACKTEST3_BYBIT_RETRY symbol={symbol} "
-                f"attempt={attempt + 1}/7 delay={delay:.1f}s "
-                f"error={type(exc).__name__}:{exc}",
-                flush=True,
-            )
-            time.sleep(delay)
-
-    raise RuntimeError(f"Bybit kline failed for {symbol}: {last}")
 
 
-def download_bybit_symbol(
-    symbol: str,
-    start: datetime,
-    end: datetime,
-) -> list[dict]:
-    start_ms = ms(start)
-    cursor_end = ms(end) - 60_000
-    seen = set()
-    rows_out = []
-
-    while cursor_end >= start_ms:
-        page = bybit_page(symbol, start_ms, cursor_end)
-        if not page:
-            break
-
-        timestamps = []
-        for row in page:
-            ts = int(row[0])
-            timestamps.append(ts)
-
-            if ts < start_ms or ts >= ms(end) or ts in seen:
-                continue
-
-            seen.add(ts)
-            rows_out.append({
-                "timestamp": iso(ts),
-                "symbol": symbol,
-                "interval": "1m",
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]),
-                "quote_volume": float(row[6]),
-                "trades": 0,
-                "taker_buy_base": 0.0,
-                "taker_buy_quote": 0.0,
-            })
-
-        if not timestamps:
-            break
-
-        earliest = min(timestamps)
-        if earliest <= start_ms:
-            break
-
-        next_end = earliest - 1
-        if next_end >= cursor_end:
-            break
-
-        cursor_end = next_end
-        time.sleep(max(0.0, REQUEST_PAUSE))
-
-    rows_out.sort(key=lambda r: r["timestamp"])
-    return rows_out
+def proxy_entry(c1, symbol: str, side: str, when: datetime):
+    q = r3.ticker_proxy(c1, symbol, when, SPREAD)
+    if not q:
+        return None
+    return float(q["ask"] if side == "LONG" else q["bid"])
 
 
-def verify_1m(path: Path, start: datetime, end: datetime) -> dict[str, int]:
-    seen = {s: set() for s in SYMBOLS}
-    start_ms, end_ms = ms(start), ms(end)
+def simulate_reverse(c1, when: datetime, symbol: str, original_side: str):
+    side = "SHORT" if original_side == "LONG" else "LONG"
+    entry = proxy_entry(c1, symbol, side, when)
+    if entry is None:
+        return None
 
-    with path.open(newline="", encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            symbol = r["symbol"]
-            if symbol not in seen:
-                continue
+    result = r3.simulate_exit(side, entry, when, c1.get(symbol, []))
+    exit_time, exit_price, exit_reason, gross, net, _, _, _, resolved = result
+    if not resolved or not exit_time:
+        return None
 
-            ts = ms(datetime.fromisoformat(r["timestamp"]))
-            if start_ms <= ts < end_ms:
-                seen[symbol].add(ts)
-
-    counts = {s: len(v) for s, v in seen.items()}
-    expected = int((end - start).total_seconds() // 60)
-    minimum = int(expected * MIN_COVERAGE)
-
-    print(
-        f"BACKTEST3_1M_COVERAGE expected={expected} "
-        f"minimum={minimum} counts={counts}",
-        flush=True,
-    )
-
-    if any(n < minimum for n in counts.values()):
-        raise RuntimeError(
-            f"Insufficient Bybit 1m history: {counts}; "
-            f"need >= {minimum} per symbol"
-        )
-
-    return counts
+    return {
+        "timestamp": when.isoformat(),
+        "symbol": symbol,
+        "original_side": original_side,
+        "side": side,
+        "entry_price": round(entry, 12),
+        "exit_time": exit_time.isoformat(),
+        "exit_price": round(float(exit_price), 12),
+        "exit_reason": exit_reason,
+        "gross_return_pct": round(float(gross), 6),
+        "net_return_pct": round(float(net), 6),
+    }
 
 
-def aggregate_from_1m(
-    source: Path,
-    target: Path,
-    interval: str,
-    start: datetime,
-    end: datetime,
-) -> dict[str, int]:
-    step_ms = hd.INTERVAL_MS[interval]
-    start_ms, end_ms = ms(start), ms(end)
-    groups = {}
-
-    with source.open(newline="", encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            ts = ms(datetime.fromisoformat(r["timestamp"]))
-            if not (start_ms <= ts < end_ms):
-                continue
-
-            bucket = (ts // step_ms) * step_ms
-            key = (r["symbol"], bucket)
-            g = groups.get(key)
-
-            if g is None:
-                groups[key] = {
-                    "first_ts": ts,
-                    "last_ts": ts,
-                    "open": float(r["open"]),
-                    "high": float(r["high"]),
-                    "low": float(r["low"]),
-                    "close": float(r["close"]),
-                    "volume": float(r["volume"] or 0),
-                    "quote_volume": float(r["quote_volume"] or 0),
-                    "trades": int(float(r["trades"] or 0)),
-                    "taker_buy_base": float(r["taker_buy_base"] or 0),
-                    "taker_buy_quote": float(r["taker_buy_quote"] or 0),
-                    "count": 1,
-                }
-            else:
-                if ts < g["first_ts"]:
-                    g["first_ts"] = ts
-                    g["open"] = float(r["open"])
-
-                if ts >= g["last_ts"]:
-                    g["last_ts"] = ts
-                    g["close"] = float(r["close"])
-
-                g["high"] = max(g["high"], float(r["high"]))
-                g["low"] = min(g["low"], float(r["low"]))
-                g["volume"] += float(r["volume"] or 0)
-                g["quote_volume"] += float(r["quote_volume"] or 0)
-                g["trades"] += int(float(r["trades"] or 0))
-                g["taker_buy_base"] += float(r["taker_buy_base"] or 0)
-                g["taker_buy_quote"] += float(r["taker_buy_quote"] or 0)
-                g["count"] += 1
-
-    expected_per_bucket = step_ms // 60_000
-    rows = []
-
-    for (symbol, bucket), g in sorted(
-        groups.items(),
-        key=lambda x: (x[0][0], x[0][1]),
-    ):
-        if g["count"] != expected_per_bucket:
-            continue
-
-        rows.append({
-            "timestamp": hd.iso_utc(bucket),
-            "symbol": symbol,
-            "interval": interval,
-            "open": g["open"],
-            "high": g["high"],
-            "low": g["low"],
-            "close": g["close"],
-            "volume": g["volume"],
-            "quote_volume": g["quote_volume"],
-            "trades": g["trades"],
-            "taker_buy_base": g["taker_buy_base"],
-            "taker_buy_quote": g["taker_buy_quote"],
-        })
-
-    with target.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=hd.FIELDS)
+def write_csv(path: Path, fields, rows):
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
 
-    counts = {s: 0 for s in SYMBOLS}
-    for r in rows:
-        counts[r["symbol"]] += 1
 
-    expected = int(
-        (end - start).total_seconds()
-        // (step_ms / 1000)
-    )
-    minimum = max(0, int(expected * MIN_COVERAGE) - 2)
-
-    print(
-        f"BACKTEST3_AGG interval={interval} rows={len(rows)} "
-        f"expected={expected} minimum={minimum} counts={counts}",
-        flush=True,
-    )
-
-    if any(n < minimum for n in counts.values()):
-        raise RuntimeError(
-            f"Insufficient aggregated {interval}: {counts}; "
-            f"need >= {minimum} per symbol"
-        )
-
-    return counts
+def read_all_rows(filename: str):
+    rows = []
+    for i in range(1, SEGMENTS + 1):
+        path = OUT_ROOT / f"segment_{i:02d}" / filename
+        if not path.exists():
+            continue
+        with path.open(newline="", encoding="utf-8-sig") as f:
+            rows.extend(csv.DictReader(f))
+    return rows
 
 
-def load_complete_segment(seg: Path):
-    meta = seg / "meta.json"
-    if not meta.exists():
-        return None
+def summarize(segment_summaries):
+    candidate_rows = read_all_rows("candidates.csv")
+    baseline_rows = read_all_rows("baseline.csv")
 
-    try:
-        obj = json.loads(meta.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-    for interval in ("1m", "5m", "15m", "1h"):
-        p = seg / f"history_{interval}.csv"
-        if not p.exists() or p.stat().st_size == 0:
-            return None
-
-    return obj
-
-
-def run_segment(
-    idx: int,
-    total: int,
-    start: datetime,
-    end: datetime,
-) -> dict:
-    seg = ROOT / f"segment_{idx:02d}"
-    cached = load_complete_segment(seg)
-
-    if cached:
-        print(
-            f"BACKTEST3_SEGMENT_SKIP segment={idx}/{total} "
-            f"reason=complete",
-            flush=True,
-        )
-        return cached
-
-    if seg.exists():
-        shutil.rmtree(seg)
-    seg.mkdir(parents=True, exist_ok=True)
-
-    one = seg / "history_1m.csv"
-
-    print(
-        f"BACKTEST3_SEGMENT_START segment={idx}/{total} "
-        f"start={start.isoformat()} end={end.isoformat()} "
-        f"source=bybit_usdt_perpetual",
-        flush=True,
-    )
-
-    for n, symbol in enumerate(SYMBOLS, 1):
-        rows = download_bybit_symbol(symbol, start, end)
-        hd.append_rows(one, rows)
-
-        print(
-            f"BACKTEST3_DOWNLOAD segment={idx}/{total} "
-            f"symbol={n}/{len(SYMBOLS)} {symbol} "
-            f"bars={len(rows)} source=bybit",
-            flush=True,
-        )
-
-    verify_1m(one, start, end)
-
-    for interval in ("5m", "15m", "1h"):
-        aggregate_from_1m(
-            one,
-            seg / f"history_{interval}.csv",
-            interval,
-            start,
-            end,
-        )
-
-    meta = {
-        "segment": idx,
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "source": "bybit_usdt_perpetual_1m",
-        "files": {},
+    overall = {
+        "baseline_r3": metrics([x["net_return_pct"] for x in baseline_rows]),
     }
+    yearly = {}
 
-    for interval in ("1m", "5m", "15m", "1h"):
-        p = seg / f"history_{interval}.csv"
-        meta["files"][interval] = {
-            "rows": rowcount(p),
-            "bytes": p.stat().st_size,
-            "sha256": sha256(p),
-            "path": f"segment_{idx:02d}/history_{interval}.csv",
+    for trigger in ("REFERENCE_BREAK", "ANY_INVALIDATION", "LOSING_TRADE_EXIT"):
+        rows = [x for x in candidate_rows if x["trigger"] == trigger]
+        overall[trigger] = metrics([x["net_return_pct"] for x in rows])
+
+        by_year = defaultdict(list)
+        for row in rows:
+            by_year[str(parse_dt(row["timestamp"]).year)].append(
+                float(row["net_return_pct"])
+            )
+        yearly[trigger] = {
+            year: metrics(vals)
+            for year, vals in sorted(by_year.items())
         }
 
-    (seg / "meta.json").write_text(
-        json.dumps(meta, indent=2, sort_keys=True),
-        encoding="utf-8",
+    ranking = []
+    for trigger in ("REFERENCE_BREAK", "ANY_INVALIDATION", "LOSING_TRADE_EXIT"):
+        m = overall[trigger]
+        ranking.append({
+            "trigger": trigger,
+            "trades": m["trades"],
+            "profit_factor": m["profit_factor"],
+            "sum_net_return_pct": m["sum_net_return_pct"],
+            "avg_net_return_pct": m["avg_net_return_pct"],
+            "eligible_200_trades": m["trades"] >= 200,
+        })
+    ranking.sort(
+        key=lambda x: (
+            x["eligible_200_trades"],
+            x["profit_factor"],
+            x["sum_net_return_pct"],
+        ),
+        reverse=True,
     )
 
-    print(
-        "BACKTEST3_SEGMENT_DONE "
-        + json.dumps(meta, separators=(",", ":")),
-        flush=True,
-    )
-
-    return meta
-
-
-def main():
-    spans = ranges()
-
-    manifest = {
-        "name": NAME,
-        "version": "v2-bybit",
-        "source": "Bybit USDT perpetual",
+    final = {
+        "core": "F1_R0_FAILURE_REVERSAL_RESEARCH",
         "historical_only": True,
-        "period": {
-            "start": START.isoformat(),
-            "end": END.isoformat(),
-            "days": DAYS,
-        },
-        "segment_days": SEGMENT_DAYS,
-        "segments_target": len(spans),
-        "symbols": SYMBOLS,
-        "intervals": ["1m", "5m", "15m", "1h"],
-        "higher_intervals": "local_from_1m",
-        "segments": [],
-        "complete": False,
+        "data_source": "BACKTEST-3Y fixed Bybit USDT perpetual",
+        "spread_pct": SPREAD,
+        "exit_model": "same R3 2/4/8 TP, 2.5 SL, 4h timeout, 0.16% round-trip cost",
+        "signal_edge_only": True,
+        "portfolio_limits_applied_to_f1": False,
+        "completed_segments": len(segment_summaries),
+        "overall": overall,
+        "yearly": yearly,
+        "ranking": ranking,
+        "segments": segment_summaries,
     }
+    (OUT_ROOT / "summary.json").write_text(
+        json.dumps(final, indent=2), encoding="utf-8"
+    )
+    return final
 
-    old_manifest = ROOT / "manifest.json"
-    if old_manifest.exists():
+
+def run_segment(index: int):
+    seg_out = OUT_ROOT / f"segment_{index:02d}"
+    seg_out.mkdir(parents=True, exist_ok=True)
+    done = seg_out / "summary.json"
+
+    if done.exists():
         try:
-            previous = json.loads(old_manifest.read_text(encoding="utf-8"))
-            if (
-                previous.get("version") == "v2-bybit"
-                and previous.get("period") == manifest["period"]
-                and previous.get("symbols") == manifest["symbols"]
-            ):
-                manifest["segments"] = previous.get("segments", [])
+            obj = json.loads(done.read_text(encoding="utf-8"))
+            if obj.get("complete"):
+                print(f"F1_SEGMENT_SKIP segment={index}/{SEGMENTS}", flush=True)
+                return obj
         except Exception:
             pass
 
-    old_manifest.write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
-    )
+    current = DATA_ROOT / f"segment_{index:02d}"
+    meta = json.loads((current / "meta.json").read_text(encoding="utf-8"))
+    roots = [current]
+    if index > 1:
+        previous = DATA_ROOT / f"segment_{index-1:02d}"
+        if previous.exists():
+            roots.insert(0, previous)
+
+    c1 = merge_maps([x / "history_1m.csv" for x in roots], 1)
+    c5 = merge_maps([x / "history_5m.csv" for x in roots], 5)
+    c15 = merge_maps([x / "history_15m.csv" for x in roots], 15)
+    c1h = merge_maps([x / "history_1h.csv" for x in roots], 60)
+
+    start = parse_dt(meta["start"])
+    end = parse_dt(meta["end"])
+    cutoff = end - timedelta(hours=4)
 
     print(
-        "BACKTEST3_START "
-        + json.dumps(
-            {
-                "start": START.isoformat(),
-                "end": END.isoformat(),
-                "days": DAYS,
-                "segments": len(spans),
-                "symbols": len(SYMBOLS),
-                "intervals": ["1m", "5m", "15m", "1h"],
-                "source": "bybit_usdt_perpetual_1m",
-                "higher_intervals": "local_from_1m",
-                "data_dir": str(ROOT),
-            },
-            separators=(",", ":"),
-        ),
+        f"F1_REPLAY_START segment={index}/{SEGMENTS} "
+        f"start={start.isoformat()} end={end.isoformat()}",
         flush=True,
     )
 
-    completed = []
+    details, trades = r3.run_replay(c1, c5, c15, c1h, SPREAD)
 
-    for idx, (start, end) in enumerate(spans, 1):
-        meta = run_segment(idx, len(spans), start, end)
-        completed.append(meta)
+    candidates = []
+    baseline_rows = []
 
-        manifest["segments"] = completed
-        manifest["complete"] = False
+    for trade in trades:
+        if not trade.get("resolved") or not trade.get("exit_time"):
+            continue
+        if not (start <= trade["entry_time"] < end):
+            continue
+        baseline_rows.append({
+            "timestamp": trade["entry_time"].isoformat(),
+            "symbol": trade["symbol"],
+            "side": trade["side"],
+            "exit_time": trade["exit_time"].isoformat(),
+            "exit_reason": trade["exit_reason"],
+            "net_return_pct": round(float(trade["net_return_pct"]), 6),
+        })
 
-        old_manifest.write_text(
-            json.dumps(manifest, indent=2),
-            encoding="utf-8",
+    # F1A: reverse only after the old breakout reference is invalidated.
+    # F1B: reverse after any setup invalidation, including over-deep pullback.
+    for event in details:
+        if event.get("event") != "INVALIDATED":
+            continue
+
+        when = parse_dt(event["timestamp"])
+        if not (start <= when < cutoff):
+            continue
+
+        reason = str(event.get("reason") or "")
+        rev = simulate_reverse(c1, when, event["symbol"], event["side"])
+        if not rev:
+            continue
+
+        row = dict(rev)
+        row["trigger"] = "ANY_INVALIDATION"
+        candidates.append(row)
+
+        if "reference invalidated" in reason:
+            row = dict(rev)
+            row["trigger"] = "REFERENCE_BREAK"
+            candidates.append(row)
+
+    # F1C: literal old losing trade -> reverse after it proves wrong.
+    for trade in trades:
+        if not trade.get("resolved") or not trade.get("exit_time"):
+            continue
+        if float(trade.get("net_return_pct") or 0) >= 0:
+            continue
+
+        when = trade["exit_time"]
+        if not (start <= when < cutoff):
+            continue
+
+        rev = simulate_reverse(c1, when, trade["symbol"], trade["side"])
+        if not rev:
+            continue
+
+        row = dict(rev)
+        row["trigger"] = "LOSING_TRADE_EXIT"
+        candidates.append(row)
+
+    write_csv(seg_out / "candidates.csv", CANDIDATE_FIELDS, candidates)
+    write_csv(seg_out / "baseline.csv", BASE_FIELDS, baseline_rows)
+
+    variants = {}
+    for trigger in ("REFERENCE_BREAK", "ANY_INVALIDATION", "LOSING_TRADE_EXIT"):
+        vals = [
+            float(x["net_return_pct"])
+            for x in candidates
+            if x["trigger"] == trigger
+        ]
+        variants[trigger] = metrics(vals)
+
+    obj = {
+        "segment": index,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "complete": True,
+        "baseline_r3": metrics([x["net_return_pct"] for x in baseline_rows]),
+        "variants": variants,
+    }
+
+    done.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    print("F1_SEGMENT_DONE " + json.dumps(obj, separators=(",", ":")), flush=True)
+    return obj
+
+
+def main():
+    print(
+        f"F1_START segments={SEGMENTS} spread={SPREAD} "
+        f"data_root={DATA_ROOT} research_only=true",
+        flush=True,
+    )
+
+    summaries = []
+    for index in range(1, SEGMENTS + 1):
+        summaries.append(run_segment(index))
+        interim = summarize(summaries)
+        leader = interim["ranking"][0] if interim["ranking"] else {}
+        print(
+            "F1_PROGRESS "
+            + json.dumps({"segment": index, "leader": leader}, separators=(",", ":")),
+            flush=True,
         )
 
-    manifest["complete"] = True
-    old_manifest.write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
+    final = summarize(summaries)
+    final["complete"] = True
+    (OUT_ROOT / "summary.json").write_text(
+        json.dumps(final, indent=2), encoding="utf-8"
     )
 
     print(
-        "BACKTEST3_DONE "
+        "F1_DONE "
         + json.dumps(
-            {
-                "segments": len(completed),
-                "complete": True,
-                "source": "bybit_usdt_perpetual_1m",
-            },
+            {"overall": final["overall"], "ranking": final["ranking"]},
             separators=(",", ":"),
         ),
         flush=True,
