@@ -1,8 +1,10 @@
 import os
 
-MODE = os.environ.get("RESEARCH_MODE", "F2").upper()
+MODE = os.environ.get("RESEARCH_MODE", "PAPER").upper()
 
-if MODE == "F1":
+if MODE == "PAPER":
+    from f2_paper_live import main
+elif MODE == "F1":
     from f1_failure_reversal import main
 else:
     from f2_regime_research import main
