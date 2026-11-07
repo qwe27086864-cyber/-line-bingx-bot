@@ -13,11 +13,19 @@ DATA_ROOT = Path("data/backtest_3y")
 F1_ROOT = Path("data/f1_r0")
 OUT_ROOT = Path("data/f2_regime")
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
-SEGMENTS = 37
 
-RET6_GRID = (-999.0, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40)
-RET24_GRID = (-999.0, 0.0, 0.50, 1.00)
-EXTRA_COST_GRID = (0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12)
+SEGMENTS = 37
+THRESHOLDS = tuple(round(0.25 + 0.025 * i, 3) for i in range(11))  # 0.25..0.50
+EXTRA_COSTS = (0.00, 0.04, 0.06, 0.08)
+
+# Architecture is intentionally frozen from F2 R1:
+# event_type=REFERENCE, side=BOTH, align_min=0, ret24 disabled.
+FIXED_RULE = {
+    "event_type": "REFERENCE",
+    "side": "BOTH",
+    "align_min": 0,
+    "ret24_min": -999.0,
+}
 
 def parse_dt(v):
     x = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
@@ -26,8 +34,6 @@ def parse_dt(v):
     return x.astimezone(timezone.utc)
 
 def ema(vals, n):
-    if not vals:
-        return None
     a = 2.0 / (n + 1.0)
     e = vals[0]
     for x in vals[1:]:
@@ -37,8 +43,8 @@ def ema(vals, n):
 def pct(a, b):
     return (a / b - 1.0) * 100.0 if b else 0.0
 
-def metrics(rows, extra_cost_pct=0.0):
-    vals = [float(r["net_return_pct"]) - extra_cost_pct for r in rows]
+def metrics(rows, extra_cost=0.0):
+    vals = [float(r["net_return_pct"]) - extra_cost for r in rows]
     wins = [x for x in vals if x > 0]
     losses = [x for x in vals if x < 0]
     gp = sum(wins)
@@ -68,9 +74,9 @@ def metrics(rows, extra_cost_pct=0.0):
         "active_segments": len(segs),
     }
 
-def load_f1_candidates():
-    any_rows = []
-    ref_keys = set()
+def load_f1_reference():
+    out = []
+    seen = set()
 
     for i in range(1, SEGMENTS + 1):
         p = F1_ROOT / f"segment_{i:02d}" / "candidates.csv"
@@ -79,26 +85,21 @@ def load_f1_candidates():
 
         with p.open(newline="", encoding="utf-8-sig") as f:
             for r in csv.DictReader(f):
-                r["segment"] = i
+                if r["trigger"] != "REFERENCE_BREAK":
+                    continue
+
                 key = (
                     r["timestamp"], r["symbol"], r["original_side"], r["side"],
                     r["exit_time"], r["net_return_pct"]
                 )
-                if r["trigger"] == "REFERENCE_BREAK":
-                    ref_keys.add(key)
-                elif r["trigger"] == "ANY_INVALIDATION":
-                    any_rows.append((key, r))
+                if key in seen:
+                    continue
+                seen.add(key)
 
-    out = []
-    seen = set()
-    for key, r in any_rows:
-        if key in seen:
-            continue
-        seen.add(key)
-        x = dict(r)
-        x["event_type"] = "REFERENCE" if key in ref_keys else "DEEP_PULLBACK"
-        x["timestamp_dt"] = parse_dt(x["timestamp"])
-        out.append(x)
+                x = dict(r)
+                x["segment"] = i
+                x["timestamp_dt"] = parse_dt(x["timestamp"])
+                out.append(x)
 
     return out
 
@@ -128,7 +129,6 @@ def load_market(interval):
             "t": [x[0] for x in rows],
             "c": [x[1] for x in rows],
         }
-
     return out
 
 def state_at(series, when):
@@ -157,7 +157,11 @@ def h1_features(series, when):
     c = cs[j]
     r6 = pct(c, cs[j - 6])
     r24 = pct(c, cs[j - 24])
-    rets = [pct(cs[k], cs[k - 1]) for k in range(max(1, j - 23), j + 1)]
+
+    rets = [
+        pct(cs[k], cs[k - 1])
+        for k in range(max(1, j - 23), j + 1)
+    ]
     vol24 = statistics.pstdev(rets) if len(rets) >= 8 else 0.0
     return r6, r24, vol24
 
@@ -189,100 +193,164 @@ def enrich(rows, m15, m1h):
 
     return out
 
-def subset(rows, rule):
-    out = []
-
-    for r in rows:
-        if rule["event_type"] != "ALL" and r["event_type"] != rule["event_type"]:
-            continue
-        if rule["side"] != "BOTH" and r["side"] != rule["side"]:
-            continue
-        if int(r["reverse_market_alignment"]) < rule["align_min"]:
-            continue
-        if float(r["market_6h_directional_pct"]) < rule["ret6_min"]:
-            continue
-        if float(r["market_24h_directional_pct"]) < rule["ret24_min"]:
-            continue
-        out.append(r)
-
-    return out
-
-def score_rule(mt, mv):
-    if mt["trades"] < 80 or mv["trades"] < 35:
-        return -1e9
-
-    a = min(mt["profit_factor"], 5.0)
-    b = min(mv["profit_factor"], 5.0)
-    score = min(a, b)
-    score += 0.002 * (mt["sum_net_return_pct"] + mv["sum_net_return_pct"])
-    score += 0.03 * (mt["positive_segments"] + mv["positive_segments"])
-
-    if mt["sum_net_return_pct"] <= 0:
-        score -= 1.0
-    if mv["sum_net_return_pct"] <= 0:
-        score -= 1.0
-
-    return score
-
-def strict_pass(train_m, valid_m, oos_m, overall_m):
-    return bool(
-        train_m["trades"] >= 80
-        and valid_m["trades"] >= 35
-        and oos_m["trades"] >= 35
-        and overall_m["trades"] >= 200
-        and train_m["profit_factor"] >= 1.0
-        and valid_m["profit_factor"] >= 1.0
-        and oos_m["profit_factor"] >= 1.0
-        and train_m["sum_net_return_pct"] > 0
-        and valid_m["sum_net_return_pct"] > 0
-        and oos_m["sum_net_return_pct"] > 0
-    )
-
-def segment_breakdown(rows):
-    by_seg = defaultdict(list)
-    for r in rows:
-        by_seg[int(r["segment"])].append(r)
-
-    out = []
-    for seg in sorted(by_seg):
-        m = metrics(by_seg[seg])
-        out.append({
-            "segment": seg,
-            "trades": m["trades"],
-            "pf": m["profit_factor"],
-            "net": m["sum_net_return_pct"],
-            "win_rate_pct": m["win_rate_pct"],
-            "max_dd": m["max_drawdown_pct_points"],
-        })
-    return out
-
-def cost_stress(rows):
+def select(rows, threshold):
     return [
-        {
-            "extra_cost_pct_per_trade": c,
-            **metrics(rows, extra_cost_pct=c),
-        }
-        for c in EXTRA_COST_GRID
+        r for r in rows
+        if float(r["market_6h_directional_pct"]) >= threshold
     ]
 
-def neighborhood(rows, best_rule):
-    results = []
+def threshold_surface(rows, extra_cost=0.0):
+    out = []
+    for t in THRESHOLDS:
+        m = metrics(select(rows, t), extra_cost=extra_cost)
+        out.append({"threshold": t, **m})
+    return out
 
-    for ret6 in RET6_GRID:
-        rule = dict(best_rule)
-        rule["ret6_min"] = ret6
-        selected = subset(rows, rule)
-        results.append({
-            "ret6_min": ret6,
-            **metrics(selected),
+def row_for(surface, t):
+    for x in surface:
+        if abs(x["threshold"] - t) < 1e-9:
+            return x
+    return None
+
+def plateau_score(surface, t):
+    here = row_for(surface, t)
+    if not here or here["trades"] < 80 or here["sum_net_return_pct"] <= 0:
+        return -1e9
+
+    idx = THRESHOLDS.index(t)
+    neighbors = [t]
+    if idx > 0:
+        neighbors.append(THRESHOLDS[idx - 1])
+    if idx < len(THRESHOLDS) - 1:
+        neighbors.append(THRESHOLDS[idx + 1])
+
+    neighbor_rows = [row_for(surface, x) for x in neighbors]
+    floor_pf = min(x["profit_factor"] for x in neighbor_rows if x)
+    floor_net = min(x["sum_net_return_pct"] for x in neighbor_rows if x)
+    min_trades = min(x["trades"] for x in neighbor_rows if x)
+
+    # Favor a broad plateau, not a single-point spike.
+    score = floor_pf
+    score += 0.001 * min(floor_net, 100.0)
+    score += 0.0002 * min(min_trades, 500)
+    return score
+
+def choose_threshold(prior_rows):
+    surface = threshold_surface(prior_rows, extra_cost=0.0)
+
+    scored = []
+    for t in THRESHOLDS:
+        scored.append((plateau_score(surface, t), t))
+
+    scored.sort(reverse=True)
+    best_score, best_t = scored[0]
+
+    if best_score <= -1e8:
+        # Fallback: still no future information; pick the threshold with
+        # highest PF among thresholds with at least 60 prior trades.
+        eligible = [
+            x for x in surface
+            if x["trades"] >= 60 and x["sum_net_return_pct"] > 0
+        ]
+        if not eligible:
+            return None, surface
+        eligible.sort(
+            key=lambda x: (x["profit_factor"], x["sum_net_return_pct"], x["trades"]),
+            reverse=True,
+        )
+        best_t = eligible[0]["threshold"]
+
+    return best_t, surface
+
+def seg_range(rows, lo, hi):
+    return [r for r in rows if lo <= int(r["segment"]) <= hi]
+
+def walk_forward(rows):
+    # Each evaluation block is unseen when its threshold is selected.
+    folds = [
+        (1, 18, 19, 21),
+        (1, 21, 22, 24),
+        (1, 24, 25, 27),
+        (1, 27, 28, 30),
+        (1, 30, 31, 33),
+        (1, 33, 34, 37),
+    ]
+
+    out = []
+    combined_eval_rows = []
+
+    for train_lo, train_hi, test_lo, test_hi in folds:
+        prior = seg_range(rows, train_lo, train_hi)
+        unseen = seg_range(rows, test_lo, test_hi)
+
+        threshold, surface = choose_threshold(prior)
+        if threshold is None:
+            out.append({
+                "train_segments": [train_lo, train_hi],
+                "test_segments": [test_lo, test_hi],
+                "threshold": None,
+                "status": "NO_ELIGIBLE_THRESHOLD",
+            })
+            continue
+
+        chosen = select(unseen, threshold)
+        combined_eval_rows.extend(chosen)
+
+        out.append({
+            "train_segments": [train_lo, train_hi],
+            "test_segments": [test_lo, test_hi],
+            "threshold": threshold,
+            "prior_metrics": row_for(surface, threshold),
+            "test_metrics": metrics(chosen),
+            "test_cost_004": metrics(chosen, 0.04),
+            "test_cost_006": metrics(chosen, 0.06),
         })
 
-    return results
+    return out, combined_eval_rows
+
+def frozen_oos(rows):
+    pre_oos = seg_range(rows, 1, 27)
+    oos = seg_range(rows, 28, 37)
+
+    threshold, surface = choose_threshold(pre_oos)
+    if threshold is None:
+        return {
+            "threshold": None,
+            "status": "NO_ELIGIBLE_THRESHOLD",
+        }
+
+    chosen = select(oos, threshold)
+    return {
+        "threshold": threshold,
+        "selection_surface_1_27": surface,
+        "oos": metrics(chosen),
+        "oos_cost_004": metrics(chosen, 0.04),
+        "oos_cost_006": metrics(chosen, 0.06),
+        "oos_cost_008": metrics(chosen, 0.08),
+    }
+
+def stability_table(rows):
+    splits = {
+        "train_1_18": seg_range(rows, 1, 18),
+        "validation_19_27": seg_range(rows, 19, 27),
+        "oos_28_37": seg_range(rows, 28, 37),
+        "pre_oos_1_27": seg_range(rows, 1, 27),
+        "all_1_37": seg_range(rows, 1, 37),
+    }
+
+    out = {}
+    for name, part in splits.items():
+        out[name] = {
+            "base": threshold_surface(part, 0.0),
+            "cost_004": threshold_surface(part, 0.04),
+            "cost_006": threshold_surface(part, 0.06),
+        }
+    return out
 
 def main():
     print(
-        "F2_STRESS_START source=F1_R0 "
-        "train=1-18 validation=19-27 oos=28-37",
+        "F2_WF_START thresholds=0.25..0.50 step=0.025 "
+        "architecture=REFERENCE_ONLY",
         flush=True,
     )
 
@@ -291,158 +359,101 @@ def main():
     if not F1_ROOT.exists():
         raise RuntimeError("missing F1 output")
 
-    base = load_f1_candidates()
-    print(f"F2_STRESS_F1_ROWS unique_any_invalidation={len(base)}", flush=True)
+    base = load_f1_reference()
+    print(f"F2_WF_REFERENCE_ROWS rows={len(base)}", flush=True)
 
     m15 = load_market("15m")
     m1h = load_market("1h")
     rows = enrich(base, m15, m1h)
-    print(f"F2_STRESS_FEATURE_ROWS enriched={len(rows)}", flush=True)
+    print(f"F2_WF_FEATURE_ROWS rows={len(rows)}", flush=True)
 
-    train = [r for r in rows if int(r["segment"]) <= 18]
-    valid = [r for r in rows if 19 <= int(r["segment"]) <= 27]
-    oos = [r for r in rows if int(r["segment"]) >= 28]
+    wf, wf_rows = walk_forward(rows)
+    frozen = frozen_oos(rows)
+    stability = stability_table(rows)
 
-    rules = []
+    wf_metrics = metrics(wf_rows)
+    wf_cost_004 = metrics(wf_rows, 0.04)
+    wf_cost_006 = metrics(wf_rows, 0.06)
 
-    for event_type in ("ALL", "REFERENCE", "DEEP_PULLBACK"):
-        for side in ("BOTH", "LONG", "SHORT"):
-            for align_min in (0, 1, 2, 3, 4):
-                for ret6_min in RET6_GRID:
-                    for ret24_min in RET24_GRID:
-                        rule = {
-                            "event_type": event_type,
-                            "side": side,
-                            "align_min": align_min,
-                            "ret6_min": ret6_min,
-                            "ret24_min": ret24_min,
-                        }
-
-                        tr = subset(train, rule)
-                        va = subset(valid, rule)
-                        mt = metrics(tr)
-                        mv = metrics(va)
-
-                        rules.append({
-                            "rule": rule,
-                            "train": mt,
-                            "validation": mv,
-                            "selection_score": score_rule(mt, mv),
-                        })
-
-    rules.sort(key=lambda x: x["selection_score"], reverse=True)
-
-    shortlist = rules[:50]
-    final_rows = []
-
-    for item in shortlist:
-        rule = item["rule"]
-        oos_rows = subset(oos, rule)
-        all_rows = subset(rows, rule)
-
-        mo = metrics(oos_rows)
-        ma = metrics(all_rows)
-
-        x = dict(item)
-        x["oos"] = mo
-        x["overall"] = ma
-        x["strict_pass"] = strict_pass(item["train"], item["validation"], mo, ma)
-        final_rows.append(x)
-
-    strict = [x for x in final_rows if x["strict_pass"]]
-    best = strict[0] if strict else (final_rows[0] if final_rows else None)
-
-    if best is None:
-        raise RuntimeError("no F2 rules produced")
-
-    best_rule = best["rule"]
-
-    best_train_rows = subset(train, best_rule)
-    best_valid_rows = subset(valid, best_rule)
-    best_oos_rows = subset(oos, best_rule)
-    best_all_rows = subset(rows, best_rule)
-
-    stress = {
-        "train": cost_stress(best_train_rows),
-        "validation": cost_stress(best_valid_rows),
-        "oos": cost_stress(best_oos_rows),
-        "overall": cost_stress(best_all_rows),
-    }
-
-    neighborhood_result = {
-        "train": neighborhood(train, best_rule),
-        "validation": neighborhood(valid, best_rule),
-        "oos": neighborhood(oos, best_rule),
-        "overall": neighborhood(rows, best_rule),
-    }
-
-    oos_segments = segment_breakdown(best_oos_rows)
-
-    oos_break_even_extra_cost = (
-        best["oos"]["sum_net_return_pct"] / best["oos"]["trades"]
-        if best["oos"]["trades"]
-        else 0.0
+    # Conservative pass:
+    # - frozen OOS PF >= 1.05
+    # - frozen OOS stays >=1 under +0.04% extra cost
+    # - combined walk-forward PF >=1.05
+    # - combined walk-forward stays >=1 under +0.04% extra cost
+    conservative_pass = bool(
+        frozen.get("oos", {}).get("trades", 0) >= 35
+        and frozen.get("oos", {}).get("profit_factor", 0) >= 1.05
+        and frozen.get("oos_cost_004", {}).get("profit_factor", 0) >= 1.00
+        and wf_metrics["trades"] >= 80
+        and wf_metrics["profit_factor"] >= 1.05
+        and wf_cost_004["profit_factor"] >= 1.00
     )
 
     result = {
-        "core": "F2_R1_STRESS_VALIDATION",
-        "historical_only": True,
-        "selection_policy": (
-            "Rules ranked only on segments 1-18 train + 19-27 validation. "
-            "Segments 28-37 remain held-out OOS."
+        "core": "F2_R2_FINE_GRID_WALK_FORWARD",
+        "fixed_architecture": FIXED_RULE,
+        "thresholds": THRESHOLDS,
+        "selection_method": (
+            "Choose threshold only from prior segments. "
+            "Score uses the minimum PF/net/trades across the threshold and "
+            "its immediate neighbors to favor plateaus over spikes."
         ),
-        "base_rows": len(base),
-        "enriched_rows": len(rows),
-        "strict_pass_count_in_top50": len(strict),
-        "best": best,
-        "oos_break_even_extra_cost_pct_per_trade": round(oos_break_even_extra_cost, 6),
-        "extra_cost_grid_pct_per_trade": list(EXTRA_COST_GRID),
-        "cost_stress": stress,
-        "ret6_neighborhood": neighborhood_result,
-        "oos_segment_breakdown": oos_segments,
-        "top50": final_rows,
+        "walk_forward": wf,
+        "walk_forward_combined": wf_metrics,
+        "walk_forward_cost_004": wf_cost_004,
+        "walk_forward_cost_006": wf_cost_006,
+        "frozen_oos": frozen,
+        "stability": stability,
+        "conservative_pass": conservative_pass,
     }
 
-    (OUT_ROOT / "f2_stress.json").write_text(
+    (OUT_ROOT / "f2_walkforward.json").write_text(
         json.dumps(result, indent=2),
         encoding="utf-8",
     )
 
-    with (OUT_ROOT / "f2_oos_segments.csv").open("w", newline="", encoding="utf-8") as f:
-        fields = ["segment", "trades", "pf", "net", "win_rate_pct", "max_dd"]
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(oos_segments)
-
-    with (OUT_ROOT / "f2_cost_stress.csv").open("w", newline="", encoding="utf-8") as f:
+    with (OUT_ROOT / "f2_threshold_surface.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as f:
         fields = [
-            "split", "extra_cost_pct_per_trade", "trades", "profit_factor",
+            "split", "cost", "threshold", "trades", "profit_factor",
             "sum_net_return_pct", "avg_net_return_pct", "win_rate_pct",
-            "max_drawdown_pct_points",
+            "max_drawdown_pct_points", "positive_segments", "active_segments",
         ]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        for split_name, rows_ in stress.items():
-            for item in rows_:
-                w.writerow({
-                    "split": split_name,
-                    **{k: item[k] for k in fields if k != "split"},
-                })
+
+        for split_name, cost_map in stability.items():
+            for cost_name, surface in cost_map.items():
+                for row in surface:
+                    w.writerow({
+                        "split": split_name,
+                        "cost": cost_name,
+                        **{k: row[k] for k in fields if k not in ("split", "cost")},
+                    })
 
     summary = {
-        "strict_pass_count_top50": len(strict),
-        "best_rule": best_rule,
-        "train": best["train"],
-        "validation": best["validation"],
-        "oos": best["oos"],
-        "overall": best["overall"],
-        "oos_break_even_extra_cost_pct_per_trade": round(oos_break_even_extra_cost, 6),
-        "oos_cost_stress": stress["oos"],
-        "oos_ret6_neighborhood": neighborhood_result["oos"],
-        "oos_segment_breakdown": oos_segments,
+        "conservative_pass": conservative_pass,
+        "frozen_threshold": frozen.get("threshold"),
+        "frozen_oos": frozen.get("oos"),
+        "frozen_oos_cost_004": frozen.get("oos_cost_004"),
+        "wf_combined": wf_metrics,
+        "wf_cost_004": wf_cost_004,
+        "wf_cost_006": wf_cost_006,
+        "folds": [
+            {
+                "test_segments": x.get("test_segments"),
+                "threshold": x.get("threshold"),
+                "test_metrics": x.get("test_metrics"),
+            }
+            for x in wf
+        ],
     }
 
-    print("F2_STRESS_DONE " + json.dumps(summary, separators=(",", ":")), flush=True)
+    print(
+        "F2_WF_DONE " + json.dumps(summary, separators=(",", ":")),
+        flush=True,
+    )
 
     while True:
         time.sleep(3600)
