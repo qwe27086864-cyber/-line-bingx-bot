@@ -22,6 +22,7 @@ PAPER-TRADING INFRASTRUCTURE FIX ONLY.
 """
 
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -41,6 +42,47 @@ if (_FIX_ENABLED or _PERSIST_ENABLED) and importlib.util.find_spec("psycopg2") i
 
     _DEX_BASE = "https://api.dexscreener.com/tokens/v1/solana/"
     _FIX_MAX_CACHE_SEC = 15.0
+
+    # ------------------------------------------------------------------
+    # M2R3 wallet filter: blocks NEW source events only.
+    # Existing open positions remain managed until they close.
+    # ------------------------------------------------------------------
+    _BLOCK_WALLET_PREFIXES = [
+        x.strip()
+        for x in os.getenv("M2R3_BLOCK_WALLETS", "").split(",")
+        if x.strip()
+    ]
+    if _BLOCK_WALLET_PREFIXES:
+        _ORIG_URLOPEN = urllib.request.urlopen
+
+        def _m2r3_filtered_urlopen(req, *args, **kwargs):
+            url = getattr(req, "full_url", str(req))
+            if str(url).startswith("https://m2n-3tfx.onrender.com"):
+                with _ORIG_URLOPEN(req, *args, **kwargs) as resp:
+                    raw = resp.read()
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                    events = data.get("recent_events")
+                    if isinstance(events, list):
+                        data["recent_events"] = [
+                            e for e in events
+                            if not any(
+                                str((e or {}).get("wallet") or "").startswith(prefix)
+                                for prefix in _BLOCK_WALLET_PREFIXES
+                            )
+                        ]
+                    raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
+                except Exception:
+                    pass
+                return io.BytesIO(raw)
+            return _ORIG_URLOPEN(req, *args, **kwargs)
+
+        urllib.request.urlopen = _m2r3_filtered_urlopen
+        print(
+            "M2R3_WALLET_FILTER active block="
+            + ",".join(_BLOCK_WALLET_PREFIXES),
+            flush=True,
+        )
 
     def _safe_float(v, default=0.0):
         try:
