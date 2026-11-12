@@ -1,29 +1,42 @@
 """
-M2R3 price-source hotfix.
+M2R3 runtime hotfix + persistent state.
 
 Upload this file as `sitecustomize.py` to the ROOT of the
 `meme2-development-branch` branch.
 
-It is inert unless the environment variable below is enabled:
+Required env vars on M2R3:
     M2R3_PRICE_SOURCE_FIX=1
+    M2R3_PERSIST=1
+    PYTHONPATH=.
 
-When enabled, it patches `meme2_wallet_copy_job` so entry/confirm/fallback
-prices all use the same Dexscreener highest-liquidity-pool selection rule
-as M2R3's live paper-position manager.
+Optional:
+    M2R3_STATE_KEY=m2r3_hotfix_20261112
 
-This avoids fake instant TP/SL events caused by mixing GeckoTerminal pool
-prices with Dexscreener prices.
+Behavior:
+1) Entry/confirm/fallback market reads use the same Dexscreener
+   highest-liquidity-pool selection rule used by M2R3 live monitoring.
+2) M2R3 in-memory state is saved to the existing Render Postgres database.
+3) On restart/redeploy, that state is restored before the main loop runs.
 
 PAPER-TRADING INFRASTRUCTURE FIX ONLY.
 """
 
+import importlib.util
 import json
 import os
+import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 
-if os.getenv("M2R3_PRICE_SOURCE_FIX", "").strip() == "1":
+_FIX_ENABLED = os.getenv("M2R3_PRICE_SOURCE_FIX", "").strip() == "1"
+_PERSIST_ENABLED = os.getenv("M2R3_PERSIST", "").strip() == "1"
+
+# During Render's build phase, sitecustomize may run before requirements are
+# installed. Skip cleanly there; runtime Python will load this file again.
+if (_FIX_ENABLED or _PERSIST_ENABLED) and importlib.util.find_spec("psycopg2") is not None:
+    import psycopg2
     import meme2_wallet_copy_job as _old
 
     _DEX_BASE = "https://api.dexscreener.com/tokens/v1/solana/"
@@ -37,134 +50,356 @@ if os.getenv("M2R3_PRICE_SOURCE_FIX", "").strip() == "1":
         except (TypeError, ValueError):
             return default
 
-    def _dex_rows_for_mint(mint):
-        url = _DEX_BASE + urllib.parse.quote(str(mint))
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "M2R3-price-source-fix/1.0",
-                "Accept": "application/json",
-            },
-            method="GET",
-        )
-        last_exc = None
-        retries = max(1, int(getattr(_old, "HTTP_RETRIES", 4) or 4))
-        base_delay = max(
-            0.5, float(getattr(_old, "HTTP_RETRY_BASE_SEC", 1.0) or 1.0)
-        )
+    # ------------------------------------------------------------------
+    # Price-source consistency hotfix
+    # ------------------------------------------------------------------
+    if _FIX_ENABLED:
+        def _dex_rows_for_mint(mint):
+            url = _DEX_BASE + urllib.parse.quote(str(mint))
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "M2R3-price-source-fix/2.0",
+                    "Accept": "application/json",
+                },
+                method="GET",
+            )
+            last_exc = None
+            retries = max(1, int(getattr(_old, "HTTP_RETRIES", 4) or 4))
+            base_delay = max(
+                0.5,
+                float(getattr(_old, "HTTP_RETRY_BASE_SEC", 1.0) or 1.0),
+            )
 
-        for attempt in range(retries):
+            for attempt in range(retries):
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        return json.loads(resp.read().decode("utf-8")) or []
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt >= retries - 1:
+                        break
+                    time.sleep(min(3.0, base_delay * (2 ** attempt)))
+
+            raise RuntimeError(f"Dexscreener request failed: {last_exc}")
+
+        def _best_market(mint):
             try:
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    return json.loads(resp.read().decode("utf-8")) or []
-            except Exception as exc:
-                last_exc = exc
-                if attempt >= retries - 1:
-                    break
-                time.sleep(min(3.0, base_delay * (2 ** attempt)))
+                rows = _dex_rows_for_mint(mint)
+            except Exception:
+                return None
 
-        raise RuntimeError(f"Dexscreener request failed: {last_exc}")
+            best = None
+            for row in rows:
+                row = row or {}
+                base = (row.get("baseToken") or {}).get("address")
+                quote = (row.get("quoteToken") or {}).get("address")
 
-    def _best_market(mint):
-        try:
-            rows = _dex_rows_for_mint(mint)
-        except Exception:
+                if mint not in (base, quote):
+                    continue
+
+                price = _safe_float(row.get("priceUsd"))
+                liq = _safe_float((row.get("liquidity") or {}).get("usd"))
+
+                if price <= 0:
+                    continue
+
+                market = {
+                    "price": price,
+                    "liq": liq,
+                    "pool_address": row.get("pairAddress"),
+                    "pool_name": row.get("dexId"),
+                    "liquidity_source": "dexscreener",
+                }
+
+                if best is None or market["liq"] > best["liq"]:
+                    best = market
+
+            return best
+
+        def get_token_market(mint):
+            return _best_market(mint)
+
+        def get_token_market_cached(mint, force=False):
+            now = time.time()
+            cached = _old._MARKET_CACHE.get(mint)
+
+            configured_ttl = _safe_float(
+                getattr(_old, "MARKET_CACHE_TTL_SEC", _FIX_MAX_CACHE_SEC),
+                _FIX_MAX_CACHE_SEC,
+            )
+            effective_ttl = min(max(configured_ttl, 0.0), _FIX_MAX_CACHE_SEC)
+
+            if (
+                cached
+                and not force
+                and now - cached.get("ts", 0) <= effective_ttl
+            ):
+                row = dict(cached["market"])
+                row["liquidity_age_sec"] = max(0.0, now - cached["ts"])
+                row["liquidity_source"] = "dex_cache"
+                return row
+
+            market = _best_market(mint)
+            if market:
+                _old._MARKET_CACHE[mint] = {
+                    "ts": now,
+                    "market": dict(market),
+                }
+                row = dict(market)
+                row["liquidity_age_sec"] = 0.0
+                row["liquidity_source"] = "dex_fresh"
+                return row
+
+            if cached:
+                row = dict(cached["market"])
+                row["liquidity_age_sec"] = max(
+                    0.0, now - cached.get("ts", now)
+                )
+                row["liquidity_source"] = "dex_stale_cache"
+                return row
+
             return None
 
-        best = None
-        for row in rows:
-            row = row or {}
-            base = (row.get("baseToken") or {}).get("address")
-            quote = (row.get("quoteToken") or {}).get("address")
+        def get_prices(mints):
+            out = {}
+            uniq = list(dict.fromkeys([m for m in mints if m]))
+            for mint in uniq:
+                market = _best_market(mint)
+                if market and market["price"] > 0:
+                    out[mint] = market["price"]
+            return out
 
-            if mint not in (base, quote):
-                continue
+        _old.get_token_market = get_token_market
+        _old.get_token_market_cached = get_token_market_cached
+        _old.get_prices = get_prices
 
-            # Intentionally mirrors M2R3's existing dex_prices() logic exactly.
-            price = _safe_float(row.get("priceUsd"))
-            liq = _safe_float((row.get("liquidity") or {}).get("usd"))
-
-            if price <= 0:
-                continue
-
-            market = {
-                "price": price,
-                "liq": liq,
-                "pool_address": row.get("pairAddress"),
-                "pool_name": row.get("dexId"),
-                "liquidity_source": "dexscreener",
-            }
-
-            if best is None or market["liq"] > best["liq"]:
-                best = market
-
-        return best
-
-    def get_token_market(mint):
-        return _best_market(mint)
-
-    def get_token_market_cached(mint, force=False):
-        now = time.time()
-        cached = _old._MARKET_CACHE.get(mint)
-
-        # M2R3 sets MARKET_CACHE_TTL_SEC=300, but a 5-minute entry-price cache
-        # can create an artificial instant TP after the 90-second confirmation.
-        # Cap the effective cache at 15 seconds for this hotfix.
-        configured_ttl = _safe_float(
-            getattr(_old, "MARKET_CACHE_TTL_SEC", _FIX_MAX_CACHE_SEC),
-            _FIX_MAX_CACHE_SEC,
+        print(
+            "M2R3_PRICE_SOURCE_FIX active "
+            "source=DEXSCREENER pool=highest_liquidity cache_max_sec=15",
+            flush=True,
         )
-        effective_ttl = min(max(configured_ttl, 0.0), _FIX_MAX_CACHE_SEC)
 
-        if (
-            cached
-            and not force
-            and now - cached.get("ts", 0) <= effective_ttl
-        ):
-            row = dict(cached["market"])
-            row["liquidity_age_sec"] = max(0.0, now - cached["ts"])
-            row["liquidity_source"] = "dex_cache"
-            return row
+    # ------------------------------------------------------------------
+    # Persistent state hotfix
+    # ------------------------------------------------------------------
+    if _PERSIST_ENABLED:
+        _DB_URL = os.getenv("DATABASE_URL", "").strip()
+        _STATE_KEY = os.getenv(
+            "M2R3_STATE_KEY", "m2r3_hotfix_20261112"
+        ).strip()
+        _SAVE_EVERY_SEC = 20.0
+        _restored_once = False
+        _saver_started = False
 
-        market = _best_market(mint)
-        if market:
-            _old._MARKET_CACHE[mint] = {
-                "ts": now,
-                "market": dict(market),
-            }
-            row = dict(market)
-            row["liquidity_age_sec"] = 0.0
-            row["liquidity_source"] = "dex_fresh"
-            return row
+        def _to_jsonable(v):
+            if isinstance(v, set):
+                return list(v)
+            if isinstance(v, dict):
+                return {str(k): _to_jsonable(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [_to_jsonable(x) for x in v]
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                return v
+            return str(v)
 
-        # If Dexscreener is temporarily unavailable, keep the last same-source
-        # market rather than switching to a different provider mid-trade.
-        if cached:
-            row = dict(cached["market"])
-            row["liquidity_age_sec"] = max(0.0, now - cached.get("ts", now))
-            row["liquidity_source"] = "dex_stale_cache"
-            return row
+        def _restore_shape(payload):
+            if not isinstance(payload, dict):
+                return {}
+            out = dict(payload)
+            out["seen"] = set(out.get("seen") or [])
+            for key, default in (
+                ("pending", {}),
+                ("pos", []),
+                ("closed", []),
+                ("errors", []),
+                ("last_open", {}),
+                ("price_cache", {}),
+            ):
+                if key not in out or out[key] is None:
+                    out[key] = default.copy() if isinstance(default, dict) else list(default)
+            out["events"] = int(out.get("events") or 0)
+            out["scans"] = int(out.get("scans") or 0)
+            out["price_cache_t"] = float(out.get("price_cache_t") or 0)
+            return out
 
-        return None
+        def _db_connect():
+            return psycopg2.connect(_DB_URL, sslmode="require")
 
-    def get_prices(mints):
-        out = {}
-        uniq = list(dict.fromkeys([m for m in mints if m]))
+        def _ensure_table(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS m2r3_runtime_state (
+                        state_key TEXT PRIMARY KEY,
+                        payload JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+            conn.commit()
 
-        for mint in uniq:
-            market = _best_market(mint)
-            if market and market["price"] > 0:
-                out[mint] = market["price"]
+        def _load_state():
+            conn = _db_connect()
+            try:
+                _ensure_table(conn)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT payload FROM m2r3_runtime_state WHERE state_key=%s;",
+                        (_STATE_KEY,),
+                    )
+                    row = cur.fetchone()
+                return row[0] if row else None
+            finally:
+                conn.close()
 
-        return out
+        def _save_state(state_obj):
+            payload = _to_jsonable(state_obj)
+            conn = _db_connect()
+            try:
+                _ensure_table(conn)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO m2r3_runtime_state(state_key,payload,updated_at)
+                        VALUES(%s,%s::jsonb,NOW())
+                        ON CONFLICT(state_key) DO UPDATE SET
+                            payload=EXCLUDED.payload,
+                            updated_at=NOW();
+                        """,
+                        (_STATE_KEY, json.dumps(payload, separators=(",", ":"))),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
 
-    # Patch only this Python process.
-    _old.get_token_market = get_token_market
-    _old.get_token_market_cached = get_token_market_cached
-    _old.get_prices = get_prices
+        def _save_loop(state_obj):
+            while True:
+                time.sleep(_SAVE_EVERY_SEC)
+                try:
+                    _save_state(state_obj)
+                    print(
+                        "M2R3_STATE_SAVE "
+                        + json.dumps(
+                            {
+                                "key": _STATE_KEY,
+                                "scans": int(state_obj.get("scans") or 0),
+                                "events": int(state_obj.get("events") or 0),
+                                "pending": len(state_obj.get("pending") or {}),
+                                "open": sum(
+                                    1
+                                    for x in (state_obj.get("pos") or [])
+                                    if x.get("status") == "OPEN"
+                                ),
+                                "closed": len(state_obj.get("closed") or []),
+                            },
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        "M2R3_STATE_SAVE_ERROR "
+                        + json.dumps(
+                            {"error": f"{type(exc).__name__}:{str(exc)[:180]}"},
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
 
-    print(
-        "M2R3_PRICE_SOURCE_FIX active "
-        "source=DEXSCREENER pool=highest_liquidity cache_max_sec=15",
-        flush=True,
-    )
+        if not _DB_URL:
+            print(
+                "M2R3_PERSIST disabled reason=DATABASE_URL_missing",
+                flush=True,
+            )
+        else:
+            def _main_trace(frame, event, arg):
+                global _restored_once, _saver_started
+
+                if _restored_once:
+                    return None
+
+                if frame.f_code.co_filename != "<stdin>":
+                    return None
+
+                if event != "line":
+                    return _main_trace
+
+                g = frame.f_globals
+                state_obj = g.get("S")
+
+                # Detect M2R3's state object immediately after it is created.
+                required = {
+                    "seen",
+                    "pending",
+                    "pos",
+                    "closed",
+                    "events",
+                    "scans",
+                    "errors",
+                    "last_open",
+                    "price_cache",
+                    "price_cache_t",
+                }
+                if not isinstance(state_obj, dict) or not required.issubset(state_obj):
+                    return _main_trace
+
+                try:
+                    saved = _load_state()
+                    if saved:
+                        restored = _restore_shape(saved)
+                        state_obj.clear()
+                        state_obj.update(restored)
+                        print(
+                            "M2R3_STATE_RESTORE "
+                            + json.dumps(
+                                {
+                                    "key": _STATE_KEY,
+                                    "scans": int(state_obj.get("scans") or 0),
+                                    "events": int(state_obj.get("events") or 0),
+                                    "pending": len(state_obj.get("pending") or {}),
+                                    "open": sum(
+                                        1
+                                        for x in (state_obj.get("pos") or [])
+                                        if x.get("status") == "OPEN"
+                                    ),
+                                    "closed": len(state_obj.get("closed") or []),
+                                },
+                                separators=(",", ":"),
+                            ),
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "M2R3_STATE_RESTORE none key=" + _STATE_KEY,
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(
+                        "M2R3_STATE_RESTORE_ERROR "
+                        + json.dumps(
+                            {"error": f"{type(exc).__name__}:{str(exc)[:180]}"},
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+
+                _restored_once = True
+                sys.settrace(None)
+
+                if not _saver_started:
+                    _saver_started = True
+                    threading.Thread(
+                        target=_save_loop,
+                        args=(state_obj,),
+                        daemon=True,
+                        name="m2r3-state-saver",
+                    ).start()
+
+                return None
+
+            sys.settrace(_main_trace)
+            print(
+                "M2R3_PERSIST armed key=" + _STATE_KEY,
+                flush=True,
+            )
