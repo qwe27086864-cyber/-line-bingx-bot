@@ -26,6 +26,7 @@ import math
 import os
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -39,7 +40,13 @@ M2N = os.getenv("M2N_URL", "https://m2n-3tfx.onrender.com")
 COPY = os.getenv("M2_COPY_URL", "https://m2qq-fast-v3.onrender.com")
 POLL = float(os.getenv("M2_LEDGER_POLL_SEC", "5"))
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
+HELIUS_MIN_GAP_SEC = float(os.getenv("HELIUS_MIN_GAP_SEC", "0.35"))
+HELIUS_RETRIES = int(os.getenv("HELIUS_RETRIES", "4"))
+HELIUS_RETRY_BASE_SEC = float(os.getenv("HELIUS_RETRY_BASE_SEC", "1.0"))
 DATASET_START_ISO = os.getenv("M2_DATASET_START_TS", "2026-11-14T21:53:07Z")
+
+_HELIUS_RATE_LOCK = threading.Lock()
+_HELIUS_LAST_AT = 0.0
 
 old.RPC_HTTP = os.getenv("MEME2_RPC_HTTP", "https://solana-rpc.publicnode.com")
 old.HTTP_RETRIES = int(os.getenv("MEME2_HTTP_RETRIES", "3"))
@@ -62,6 +69,7 @@ S = {
     "scans": 0,
     "helius_ok": 0,
     "helius_fail": 0,
+    "helius_retry_429": 0,
     "fallback_ok": 0,
     "cutoff_reject": 0,
 }
@@ -198,19 +206,80 @@ def normalize_helius_result(payload):
     return None
 
 def helius_parsed_event(signature):
+    global _HELIUS_LAST_AT
+
     if not HELIUS_API_KEY:
         return None
+
     url = (
         "https://mainnet.helius-rpc.com/v1/parsed-events/transactions"
         "?api-key=" + urllib.parse.quote(HELIUS_API_KEY, safe="")
     )
-    payload = fetch_json(
-        url,
-        method="POST",
-        body={"transactions": [signature]},
-        timeout=25,
-    )
-    return normalize_helius_result(payload)
+
+    # Serialize Parsed Events calls and keep a minimum gap between requests.
+    # This mainly protects service restarts, when recent events can arrive as a burst.
+    with _HELIUS_RATE_LOCK:
+        gap = max(0.0, HELIUS_MIN_GAP_SEC - (time.time() - _HELIUS_LAST_AT))
+        if gap > 0:
+            time.sleep(gap)
+
+        last_exc = None
+        for attempt in range(max(1, HELIUS_RETRIES)):
+            try:
+                payload = fetch_json(
+                    url,
+                    method="POST",
+                    body={"transactions": [signature]},
+                    timeout=25,
+                )
+                _HELIUS_LAST_AT = time.time()
+                return normalize_helius_result(payload)
+
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                _HELIUS_LAST_AT = time.time()
+
+                if exc.code != 429 or attempt >= HELIUS_RETRIES - 1:
+                    raise
+
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                try:
+                    delay = float(retry_after) if retry_after else HELIUS_RETRY_BASE_SEC * (2 ** attempt)
+                except Exception:
+                    delay = HELIUS_RETRY_BASE_SEC * (2 ** attempt)
+
+                delay = max(HELIUS_MIN_GAP_SEC, delay)
+                S["helius_retry_429"] += 1
+                print(
+                    "M2LEDGER_V4_HELIUS_429 "
+                    + json.dumps(
+                        {
+                            "attempt": attempt + 1,
+                            "retry_in_sec": round(delay, 3),
+                            "signature": signature[:10],
+                        },
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
+                time.sleep(delay)
+
+            except Exception as exc:
+                last_exc = exc
+                _HELIUS_LAST_AT = time.time()
+
+                if attempt >= HELIUS_RETRIES - 1:
+                    raise
+
+                delay = max(
+                    HELIUS_MIN_GAP_SEC,
+                    HELIUS_RETRY_BASE_SEC * (2 ** attempt),
+                )
+                time.sleep(delay)
+
+        if last_exc:
+            raise last_exc
+        return None
 
 def pick_swap_parsed_data(h):
     if not isinstance(h, dict):
@@ -715,6 +784,7 @@ def persist(copy):
         "complete_rows": len(complete),
         "helius_ok": S["helius_ok"],
         "helius_fail": S["helius_fail"],
+        "helius_retry_429": S["helius_retry_429"],
         "fallback_ok": S["fallback_ok"],
         "cutoff_reject": S["cutoff_reject"],
         "copy_open": copy.get("open", 0),
@@ -794,6 +864,7 @@ while True:
                     "complete": d["complete_rows"],
                     "helius_ok": d["helius_ok"],
                     "helius_fail": d["helius_fail"],
+                    "helius_retry_429": d["helius_retry_429"],
                     "fallback_ok": d["fallback_ok"],
                     "copy_open": d["copy_open"],
                     "copy_closed": d["copy_closed"],
