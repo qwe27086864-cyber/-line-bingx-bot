@@ -1,14 +1,15 @@
 # sitecustomize.py
 # Safe bootstrap for M2 Ledger V4.
-# Python imports sitecustomize automatically when this repo is on PYTHONPATH.
-# IMPORTANT: Render also imports sitecustomize during build, so only bootstrap
-# during runtime when PORT is present.
+# This repo is put on PYTHONPATH only for the Ledger service.
+# Render also imports sitecustomize during build, so bootstrap ONLY when
+# the service's existing runtime command is `python -` (sys.argv[0] == "-").
 
 import os
 import sys
 
 if (
-    os.getenv("PORT")
+    sys.argv
+    and sys.argv[0] == "-"
     and os.getenv("M2_LEDGER_V4_BOOTSTRAP", "") == "1"
     and os.getenv("M2_LEDGER_V4_ACTIVE", "") != "1"
 ):
