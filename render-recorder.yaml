@@ -27,3 +27,44 @@ services:
         value: "20"
       - key: COARSE_CACHE_SEC
         value: "60"
+
+  - type: cron
+    name: core-discovery-engine
+    runtime: python
+    plan: starter
+    region: singapore
+    branch: historical-router-v1
+    schedule: "15 */6 * * *"
+    buildCommand: pip install 'psycopg[binary]'
+    startCommand: python core_discovery_engine.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bingx-bot-db
+          property: connectionString
+      - key: DISCOVERY_TRAIN_FRAC
+        value: "0.70"
+      - key: DISCOVERY_MIN_TRAIN
+        value: "60"
+      - key: DISCOVERY_MIN_OOS
+        value: "20"
+      - key: DISCOVERY_MIN_OBSERVED_HOURS
+        value: "24"
+      - key: DISCOVERY_CLIP_NET_PCT
+        value: "5.0"
+      - key: DISCOVERY_MIN_TRAIN_AVG
+        value: "0.12"
+      - key: DISCOVERY_MIN_OOS_AVG
+        value: "0.08"
+      - key: DISCOVERY_MIN_TRAIN_PF
+        value: "1.15"
+      - key: DISCOVERY_MIN_OOS_PF
+        value: "1.10"
+      - key: DISCOVERY_MIN_FILL
+        value: "0.50"
+      - key: DISCOVERY_PAPER_PASS_N
+        value: "30"
+      - key: DISCOVERY_LIVE_CANDIDATE_N
+        value: "100"
+      - key: DISCOVERY_LIVE_MIN_SPAN_HOURS
+        value: "168"
