@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: market-research-coarse-v1
+    runtime: python
+    plan: free
+    region: singapore
+    branch: historical-router-v1
+    autoDeployTrigger: off
+    buildCommand: pip install 'psycopg[binary]'
+    startCommand: python market_research_coarse.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bingx-bot-db
+          property: connectionString
+      - key: COARSE_REFRESH_SEC
+        value: "60"
