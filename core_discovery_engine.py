@@ -85,7 +85,7 @@ def metric(prefix):
  avg(greatest(-{CLIP},least({CLIP},net))) filter(where bucket='{prefix}' and filled) {prefix}_robust_avg,
  percentile_cont(0.5) within group(order by net) filter(where bucket='{prefix}' and filled) {prefix}_median,
  sum(net) filter(where bucket='{prefix}' and filled and net>0) {prefix}_gp,
- abs(sum(net)) filter(where bucket='{prefix}' and filled and net<0) {prefix}_gl,
+ abs(sum(net) filter(where bucket='{prefix}' and filled and net<0)) {prefix}_gl,
  avg(mfe) filter(where bucket='{prefix}' and filled) {prefix}_mfe,
  avg(mae) filter(where bucket='{prefix}' and filled) {prefix}_mae
  """
@@ -162,7 +162,7 @@ def paper(c,cid):
   if d in rule: wh.append(DIM[d]+'=%s'); args.append(rule[d])
  sql=f"""with p as(select coalesce((en.value->>'filled')::boolean,false) filled,case when coalesce((en.value->>'filled')::boolean,false) then nullif(en.value->>'net','')::double precision end net
  from market_research_v8_outcomes o cross join lateral jsonb_each(o.payload->'follow') fh cross join lateral jsonb_each(fh.value->'entries') en where {' and '.join(wh)})
- select count(*)::int,count(*) filter(where filled)::int,count(*) filter(where filled and net>0)::int,avg(net) filter(where filled),avg(greatest(-%s,least(%s,net))) filter(where filled),percentile_cont(.5) within group(order by net) filter(where filled),sum(net) filter(where filled and net>0),abs(sum(net)) filter(where filled and net<0) from p"""
+ select count(*)::int,count(*) filter(where filled)::int,count(*) filter(where filled and net>0)::int,avg(net) filter(where filled),avg(greatest(-%s,least(%s,net))) filter(where filled),percentile_cont(.5) within group(order by net) filter(where filled),sum(net) filter(where filled and net>0),abs(sum(net) filter(where filled and net<0)) from p"""
  total,n,wins,av,rav,med,gp,gl=read(c,sql,tuple(args+[CLIP,CLIP])).fetchone(); total=int(total or 0); n=int(n or 0); wins=int(wins or 0)
  pm={'total':total,'n':n,'wins':wins,'win_pct':100*wins/n if n else 0,'fill_pct':100*n/total if total else 0,'avg_net_pct':f(av),'robust_avg_net_pct':f(rav),'median_net_pct':f(med),'pf':pf(gp,gl),'paper_start_at':start.isoformat()}
  gate_pass=bool((metrics or {}).get('gate_pass',False)); status='PAPER_COLLECTING' if gate_pass else 'WATCH'; span=f((metrics or {}).get('observed_hours'))
