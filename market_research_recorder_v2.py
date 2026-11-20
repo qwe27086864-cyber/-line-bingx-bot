@@ -212,44 +212,64 @@ def coarse_reload(force=False):
 def coarse_update_event(e,net_pct,success):
     if not DBURL or e.get("event_type")=="NORMAL_CONTROL":return
     try:
-        et=e["event_type"];win=1 if success else 0
-        c=q("""insert into market_research_coarse_stats(event_type,n,wins,win_pct,avg_net_pct,sum_net_pct,updated_at)
-               values(%s,1,%s,%s,%s,%s,now())
-               on conflict(event_type) do update set
-                 n=market_research_coarse_stats.n+1,
-                 wins=market_research_coarse_stats.wins+excluded.wins,
-                 sum_net_pct=market_research_coarse_stats.sum_net_pct+excluded.sum_net_pct,
-                 win_pct=100.0*(market_research_coarse_stats.wins+excluded.wins)/(market_research_coarse_stats.n+1),
-                 avg_net_pct=(market_research_coarse_stats.sum_net_pct+excluded.sum_net_pct)/(market_research_coarse_stats.n+1),
-                 updated_at=now()
-               returning n,wins,win_pct,avg_net_pct,sum_net_pct""",
-            (et,win,100.0 if success else 0.0,net_pct,net_pct))
-        base=c.fetchone() if c else None
-        base_avg=float(base[3]) if base else 0.0
+        et=e["event_type"]
+        # Idempotent exact recompute from the source-of-truth outcomes table.
+        # This avoids double counting even if the separate coarse service runs concurrently.
+        c=q("""select count(*)::int n,
+                    sum(case when success then 1 else 0 end)::int wins,
+                    avg(case when success then 1.0 else 0.0 end)*100.0 win_pct,
+                    avg(net_pct) avg_net_pct,
+                    sum(net_pct) sum_net_pct
+             from market_research_v8_outcomes
+             where event_type=%s""",(et,))
+        r=c.fetchone() if c else None
+        if not r:return
+        n,w,wr,av,sn=r
+        q("""insert into market_research_coarse_stats(event_type,n,wins,win_pct,avg_net_pct,sum_net_pct,updated_at)
+             values(%s,%s,%s,%s,%s,%s,now())
+             on conflict(event_type) do update set
+               n=excluded.n,wins=excluded.wins,win_pct=excluded.win_pct,
+               avg_net_pct=excluded.avg_net_pct,sum_net_pct=excluded.sum_net_pct,updated_at=now()""",
+          (et,n,w,wr,av,sn))
+        base_avg=float(av or 0)
 
         parts=(e.get("pattern_key") or "").split("|")
         dims={
-          "trend":parts[1] if len(parts)>1 else None,
-          "volume":parts[2] if len(parts)>2 else None,
-          "spread":parts[3] if len(parts)>3 else None,
-          "regime":parts[4] if len(parts)>4 else None,
-          "atr":parts[5] if len(parts)>5 else None,
-          "session":parts[6] if len(parts)>6 else None,
+          "trend":(2,parts[1] if len(parts)>1 else None),
+          "volume":(3,parts[2] if len(parts)>2 else None),
+          "spread":(4,parts[3] if len(parts)>3 else None),
+          "regime":(5,parts[4] if len(parts)>4 else None),
+          "atr":(6,parts[5] if len(parts)>5 else None),
+          "session":(7,parts[6] if len(parts)>6 else None),
         }
-        for dim,val in dims.items():
+        for dim,(pos,val) in dims.items():
             if not val:continue
+            c=q(f"""select count(*)::int n,
+                          sum(case when success then 1 else 0 end)::int wins,
+                          avg(case when success then 1.0 else 0.0 end)*100.0 win_pct,
+                          avg(net_pct) avg_net_pct
+                   from market_research_v8_outcomes
+                   where event_type=%s and split_part(pattern_key,'|',{pos})=%s""",
+                (et,val))
+            rr=c.fetchone() if c else None
+            if not rr:continue
+            mn,mw,mwr,mav=rr; mavf=float(mav or 0)
             q("""insert into market_research_coarse_modifiers(event_type,dimension,value,n,wins,win_pct,avg_net_pct,base_avg_net_pct,delta_vs_base_net_pct,updated_at)
-                 values(%s,%s,%s,1,%s,%s,%s,%s,%s,now())
+                 values(%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
                  on conflict(event_type,dimension,value) do update set
-                   n=market_research_coarse_modifiers.n+1,
-                   wins=market_research_coarse_modifiers.wins+excluded.wins,
-                   win_pct=100.0*(market_research_coarse_modifiers.wins+excluded.wins)/(market_research_coarse_modifiers.n+1),
-                   avg_net_pct=(market_research_coarse_modifiers.avg_net_pct*market_research_coarse_modifiers.n+excluded.avg_net_pct)/(market_research_coarse_modifiers.n+1),
-                   base_avg_net_pct=excluded.base_avg_net_pct,
-                   delta_vs_base_net_pct=((market_research_coarse_modifiers.avg_net_pct*market_research_coarse_modifiers.n+excluded.avg_net_pct)/(market_research_coarse_modifiers.n+1))-excluded.base_avg_net_pct,
-                   updated_at=now()""",
-              (et,dim,val,win,100.0 if success else 0.0,net_pct,base_avg,net_pct-base_avg))
-        meta={"service":STATE["service"],"mode":"INCREMENTAL_PER_NEW_OUTCOME","last_event_id":e.get("id"),
+                   n=excluded.n,wins=excluded.wins,win_pct=excluded.win_pct,
+                   avg_net_pct=excluded.avg_net_pct,base_avg_net_pct=excluded.base_avg_net_pct,
+                   delta_vs_base_net_pct=excluded.delta_vs_base_net_pct,updated_at=now()""",
+              (et,dim,val,mn,mw,mwr,mavf,base_avg,mavf-base_avg))
+
+        # When the event-type base changes, refresh delta_vs_base for all its existing modifier rows.
+        q("""update market_research_coarse_modifiers
+             set base_avg_net_pct=%s,
+                 delta_vs_base_net_pct=avg_net_pct-%s,
+                 updated_at=now()
+             where event_type=%s""",(base_avg,base_avg,et))
+
+        meta={"service":STATE["service"],"mode":"EXACT_RECOMPUTE_PER_NEW_OUTCOME","last_event_id":e.get("id"),
               "last_event_type":et,"raw_fine_patterns_preserved":True,"updated_at":iso()}
         q("""insert into market_research_coarse_meta(key,value,updated_at) values('learning_state',%s::jsonb,now())
              on conflict(key) do update set value=market_research_coarse_meta.value || excluded.value,updated_at=now()""",
