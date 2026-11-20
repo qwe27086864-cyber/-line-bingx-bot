@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: market-research-recorder-final
+    runtime: python
+    plan: 0.5c-512mb
+    region: singapore
+    branch: historical-router-v1
+    autoDeployTrigger: off
+    buildCommand: pip install 'psycopg[binary]'
+    startCommand: python market_research_recorder_v2.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bingx-bot-db
+          property: connectionString
+      - key: TICK_SEC
+        value: "15"
+      - key: SIM_FEE_PER_SIDE_PCT
+        value: "0.05"
+      - key: MAX_ACTIVE
+        value: "1200"
+      - key: DEEP_PER_MIN
+        value: "5"
+      - key: NEGATIVE_PER_MIN
+        value: "3"
+      - key: WICK_PER_MIN
+        value: "20"
+      - key: COARSE_CACHE_SEC
+        value: "60"
