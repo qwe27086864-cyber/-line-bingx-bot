@@ -148,6 +148,49 @@ def coarse_tables():
     ]:
         q(sql)
 
+def coarse_backfill_full():
+    if not DBURL:return
+    try:
+        c=q("""select event_type,count(*)::int n,
+                    sum(case when success then 1 else 0 end)::int wins,
+                    avg(case when success then 1.0 else 0.0 end)*100.0 win_pct,
+                    avg(net_pct) avg_net_pct,sum(net_pct) sum_net_pct
+             from market_research_v8_outcomes
+             where event_type<>'NORMAL_CONTROL'
+             group by event_type""")
+        rows=c.fetchall() if c else []
+        for et,n,w,wr,av,sn in rows:
+            q("""insert into market_research_coarse_stats(event_type,n,wins,win_pct,avg_net_pct,sum_net_pct,updated_at)
+                 values(%s,%s,%s,%s,%s,%s,now())
+                 on conflict(event_type) do update set n=excluded.n,wins=excluded.wins,win_pct=excluded.win_pct,
+                 avg_net_pct=excluded.avg_net_pct,sum_net_pct=excluded.sum_net_pct,updated_at=now()""",
+              (et,n,w,wr,av,sn))
+        base={r[0]:float(r[4] or 0) for r in rows}
+        dims={"trend":2,"volume":3,"spread":4,"regime":5,"atr":6,"session":7}
+        for dim,pos in dims.items():
+            c=q(f"""select event_type,split_part(pattern_key,'|',{pos}) value,count(*)::int n,
+                         sum(case when success then 1 else 0 end)::int wins,
+                         avg(case when success then 1.0 else 0.0 end)*100.0 win_pct,
+                         avg(net_pct) avg_net_pct
+                  from market_research_v8_outcomes
+                  where event_type<>'NORMAL_CONTROL'
+                  group by event_type,split_part(pattern_key,'|',{pos})""")
+            if not c:continue
+            for et,val,n,w,wr,av in c.fetchall():
+                bav=base.get(et,0.0); avf=float(av or 0); delta=avf-bav
+                q("""insert into market_research_coarse_modifiers(event_type,dimension,value,n,wins,win_pct,avg_net_pct,base_avg_net_pct,delta_vs_base_net_pct,updated_at)
+                     values(%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                     on conflict(event_type,dimension,value) do update set n=excluded.n,wins=excluded.wins,win_pct=excluded.win_pct,
+                     avg_net_pct=excluded.avg_net_pct,base_avg_net_pct=excluded.base_avg_net_pct,
+                     delta_vs_base_net_pct=excluded.delta_vs_base_net_pct,updated_at=now()""",
+                  (et,dim,val,n,w,wr,avf,bav,delta))
+        q("""insert into market_research_coarse_meta(key,value,updated_at)
+             values('learning_state',%s::jsonb,now())
+             on conflict(key) do update set value=market_research_coarse_meta.value || excluded.value,updated_at=now()""",
+          (json.dumps({"backfill":"ALL_HISTORY_COMPLETE","backfilled_at":iso(),"mode":"FULL_BACKFILL_THEN_INCREMENTAL","raw_fine_patterns_preserved":True},separators=(",",":")),))
+        log("COARSE_BACKFILL",{"main":len(rows),"status":"ok"})
+    except Exception as ex:error("coarse_backfill_full",ex)
+
 def coarse_reload(force=False):
     if not DBURL:return
     if not force and time.time()-COARSE["loaded"]<COARSE_CACHE_SEC:return
@@ -258,6 +301,7 @@ def dbinit():
       """create table if not exists market_research_v8_heartbeat(ts timestamptz default now(),service text,active integer,payload jsonb)"""]:
         if q(x) is None:return
     coarse_tables()
+    coarse_backfill_full()
     c=q("select pattern_key,n,wins,sum_net,sum_mfe,sum_mae from market_research_v8_pattern_stats")
     if c:
         for k,n,w,sn,sm,sa in c.fetchall():PAT[k]={"n":n,"wins":w,"sum_net":sn,"sum_mfe":sm,"sum_mae":sa}
